@@ -1,5 +1,7 @@
 # Beam
 
+<img src="icon.svg" alt="Beam icon" width="128">
+
 A native macOS app, written entirely in arm64 assembly, that plays YouTube audio on any speaker. Paste a link or type a search, pick a speaker, press Return.
 
 ## Where it plays
