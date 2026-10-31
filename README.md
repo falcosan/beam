@@ -33,18 +33,26 @@ It opens in about 0.15 s; a 4K YouTube link plays in about 0.8 s, and in about 0
 
 ## Keyboard shortcuts
 
-| Action                     | Keys                            |
-| -------------------------- | ------------------------------- |
-| Play / Pause               | Space                           |
-| Back / forward 10 seconds  | ← / →, or ⌘← / ⌘→               |
-| Volume up / down           | ↑ / ↓, or ⌘↑ / ⌘↓               |
-| Mute                       | M, or ⌥⌘↓                       |
-| Full screen                | F, ⌃⌘F or a double click; Esc   |
-| Picture in Picture         | ⌥⌘P                             |
-| Open a file                | ⌘O                              |
-| Open from URL              | ⌘L                              |
-| Audio Only                 | ⌥⌘A                             |
-| Stop                       | ⌘.                              |
-| Find devices again         | ⌘R                              |
+| Action                    | Keys                          |
+| ------------------------- | ----------------------------- |
+| Play / Pause              | Space                         |
+| Back / forward 10 seconds | ← / →, or ⌘← / ⌘→             |
+| Volume up / down          | ↑ / ↓, or ⌘↑ / ⌘↓             |
+| Mute                      | M, or ⌥⌘↓                     |
+| Full screen               | F, ⌃⌘F or a double click; Esc |
+| Picture in Picture        | ⌥⌘P                           |
+| Open a file               | ⌘O                            |
+| Open from URL             | ⌘L                            |
+| Audio Only                | ⌥⌘A                           |
+| Stop                      | ⌘.                            |
+| Find devices again        | ⌘R                            |
 
 While a video plays, the controls and the pointer step aside after three still seconds; moving the mouse brings them back.
+
+## Test
+
+```sh
+./test/run.sh
+```
+
+It runs the media server and everything that reads what comes from the network (requests and their ranges, YouTube's segment indexes and player answers, live AAC segments) against malformed input, under Guard Malloc, so a read past any buffer stops the run. Nothing plays, no window opens and no device is contacted.

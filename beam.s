@@ -159,6 +159,7 @@ Lc\@:	.asciz	"\text"
 .equ SIGPIPE,                    13
 .equ SIG_IGN,                    1
 .equ QOS_CLASS_USER_INITIATED,   0x19
+.equ DISPATCH_TIME_FOREVER,      -1
 .equ IFA_NAME,                   8
 .equ IFA_FLAGS,                  16
 .equ IFA_ADDR,                   24
@@ -181,6 +182,7 @@ Lc\@:	.asciz	"\text"
 .equ CHUNK,                      0xa00000 ; 10 MiB: larger upstream ranges are throttled to realtime
 .equ CLIENT_TIMEOUT_S,           10
 .equ ACCEPT_BACKOFF_US,          10000
+.equ MAX_CONNS,                  32
 .equ LIVE_TRIES,                 3        ; failed segment fetches in a row before a live stream ends
 .equ SLOTS,                      32       ; a video on This Mac takes five: picture, sound and their playlists
 .equ TOKEN_STRIDE,               40       ; 32 hex + NUL; the last byte flags a live stream
@@ -434,7 +436,8 @@ Lc\@:	.asciz	"\text"
 .equ G_TV,                       G_PIP + 8 ; the selected device's DEV_VIDEO
 .equ G_SHARE,                    G_TV + 8 ; the libcurl pool
 .equ G_SHLOCKS,                  G_SHARE + 8 ; its locks, one per kind of data (os_unfair_lock[8])
-.equ G_SIZE,                     G_SHLOCKS + 32
+.equ G_CONNS,                    G_SHLOCKS + 32
+.equ G_SIZE,                     G_CONNS + 8
 
 ; ---- Data ----
 
@@ -510,6 +513,9 @@ Lxml_entities:
 	FN	curl_slist_append
 	FN	curl_slist_free_all
 	FN	dispatch_async_f
+	FN	dispatch_semaphore_create
+	FN	dispatch_semaphore_signal
+	FN	dispatch_semaphore_wait
 	FN	dispatch_sync_f
 	FN	free
 	FN	freeifaddrs
@@ -3716,6 +3722,8 @@ Lhc_reply2:
 Lhc_close:
 	mov	w0, w19
 	bl	_close
+	ldr	x0, [x28, #G_CONNS]
+	bl	_dispatch_semaphore_signal
 	mov	x0, #0
 	b	Lret4
 
@@ -3723,6 +3731,10 @@ Lhc_close:
 	ENTRY	server_run
 	FRAME	2, 48
 	mov	w19, w0
+Lsr_slot:
+	ldr	x0, [x28, #G_CONNS]
+	mov	x1, #DISPATCH_TIME_FOREVER
+	bl	_dispatch_semaphore_wait
 Lsr_accept:
 	mov	w9, #16
 	str	w9, [sp, #32]
@@ -3739,9 +3751,11 @@ Lsr_peer:
 	ldr	w9, [sp, #20]             ; the peer, network order like G_LAN
 	ldr	x10, [x28, #G_LAN]        ; one atomic load: address and mask agree
 	lsr	x11, x10, #32
+	cbz	w11, Lsr_loopback
 	eor	w12, w9, w10
 	tst	w12, w11
 	b.eq	Lsr_ok                    ; same subnet
+Lsr_loopback:
 	and	w12, w9, #0xff            ; the first octet
 	cmp	w12, #127
 	b.eq	Lsr_ok                    ; loopback
@@ -3769,7 +3783,7 @@ Lsr_ok:
 	cbnz	w0, Lsr_drop
 	ldr	x0, [sp, #40]
 	bl	_pthread_detach
-	b	Lsr_accept
+	b	Lsr_slot
 Lsr_drop:
 	mov	w0, w20
 	bl	_close
@@ -3778,6 +3792,9 @@ Lsr_drop:
 ; server_start() — listen on an OS-assigned port and start the accept thread; w0 = 1 if listening.
 server_start:
 	FRAME	1, 48
+	mov	x0, #MAX_CONNS
+	bl	_dispatch_semaphore_create
+	str	x0, [x28, #G_CONNS]
 	mov	w0, #AF_INET
 	mov	w1, #SOCK_STREAM
 	mov	w2, #0
@@ -4409,9 +4426,9 @@ Lpp_thumb:
 	b.hs	Lpp_tpick
 	add	x21, x0, #1
 	add	x24, x0, #6
-	add	x0, x0, #27               ; past "url":"https://i.ytimg.com/
-	CSTR	x1, "vi_webp"
-	mov	x2, #7
+	mov	x0, x24
+	CSTR	x1, "\"https://i.ytimg.com/vi_webp"
+	mov	x2, #28
 	bl	_strncmp
 	cbz	w0, Lpp_thumb             ; WebP: not every speaker shows it
 	mov	x22, x24
