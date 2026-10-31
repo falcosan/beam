@@ -84,10 +84,11 @@ L\name:
 
 ; CSTR reg, text — a C string literal, kept after G.
 .macro CSTR reg, text
-	.pushsection __DATA,__data
+	.pushsection __TEXT,__cstring,cstring_literals
 Lc\@:	.asciz	"\text"
 	.popsection
-	GADDR	\reg, Lc\@
+	adrp	\reg, Lc\@@PAGE
+	add	\reg, \reg, Lc\@@PAGEOFF
 .endm
 
 ; LOCK / UNLOCK — the lock guarding the snapshot, the device list and the stream slots.
@@ -4021,181 +4022,6 @@ Lrf_path:
 	bl	url_title
 	b	Lret2
 
-; Video sites: the link markers (the id follows, up to '_', '?', '/', '#' or '&'; an empty string ends them), the address of the player's metadata, then five pairs of JSON keys (a key, then one inside it, or "") for the HLS stream, title, author, artwork and length; an empty marker list ends the table.
-	.pushsection __DATA,__data
-Lsites:
-	.asciz	"dailymotion.com/video/", "dai.ly/", ""
-	.asciz	"https://www.dailymotion.com/player/metadata/video/%s"
-	.asciz	"\"auto\":", "\"url\":"
-	.asciz	"\"title\":", ""
-	.asciz	"\"screenname\":", ""
-	.asciz	"\"thumbnails\":", "\"1080\":"
-	.asciz	"\"duration\":", ""
-	.byte	0
-	.popsection
-
-; site_value(json, keys) — x0 = the value a pair of keys finds (or NULL), x1 = the next pair.
-site_value:
-	FRAME	2
-	mov	x19, x1
-	bl	jfind
-	mov	x20, x0
-	mov	x0, x19
-	bl	nextstr
-	mov	x21, x0                   ; the inner key
-	bl	nextstr
-	mov	x22, x0
-	ldrb	w9, [x21]
-	cbz	w9, Lsv_one
-	mov	x0, x20
-	mov	x1, x21
-	bl	jfind
-	mov	x20, x0
-Lsv_one:
-	mov	x0, x20
-	mov	x1, x22
-	b	Lret2
-
-; resolve_site(job) -> PLAY_OK or PLAY_FAILED for a video on a site in Lsites (its HLS stream played as it is), -1 for any other address.
-	.equ SR_ID,	16                ; char[48]
-	.equ SR_URL,	64                ; char[256], the metadata's address
-	.equ SR_BUF,	320               ; {data, len}
-	.equ SR_SIZE,	336
-resolve_site:
-	FRAME	4, SR_SIZE
-	mov	x25, x0
-	ldr	x26, [x25, #JOB_QUERY]
-	ADDR	x20, Lsites
-Lsi_site:
-	ldrb	w9, [x20]
-	cbz	w9, Lsi_none              ; the end of the table
-Lsi_mark:
-	ldrb	w9, [x20]
-	cbz	w9, Lsi_skip
-	mov	x0, x26
-	mov	x1, x20
-	bl	_strstr
-	mov	x22, x0
-	mov	x0, x20
-	bl	_strlen
-	add	x23, x22, x0              ; where the id starts
-	mov	x0, x20
-	bl	nextstr
-	mov	x20, x0
-	cbz	x22, Lsi_mark
-Lsi_fields:
-	ldrb	w9, [x20]                 ; past the other markers
-	cbz	w9, Lsi_id
-	mov	x0, x20
-	bl	nextstr
-	mov	x20, x0
-	b	Lsi_fields
-Lsi_skip:
-	add	x20, x20, #1              ; no marker matched: the next site, past this one's 11 strings
-	mov	w22, #11
-Lsi_skip1:
-	mov	x0, x20
-	bl	nextstr
-	mov	x20, x0
-	subs	w22, w22, #1
-	b.ne	Lsi_skip1
-	b	Lsi_site
-Lsi_id:
-	add	x20, x20, #1
-	mov	x0, x23
-	CSTR	x1, "_?/#&"
-	bl	_strcspn
-	mov	w21, #PLAY_FAILED
-	cbz	x0, Lsi_bad
-	cmp	x0, #40
-	b.hs	Lsi_bad
-	add	x2, x0, #1
-	add	x0, sp, #SR_ID
-	mov	x1, x23
-	bl	_strlcpy
-	add	x9, sp, #SR_ID
-	str	x9, [sp]
-	add	x0, sp, #SR_URL
-	mov	x1, #256
-	mov	x2, x20
-	bl	_snprintf
-	mov	x0, x20
-	bl	nextstr
-	mov	x20, x0                   ; the key pairs
-	bl	curl_new
-	mov	x19, x0
-	cbz	x0, Lsi_bad
-	ADDR	x2, Lclients + 2          ; Safari's User-Agent
-	mov	w1, #CURLOPT_USERAGENT
-	bl	copt
-	GADDR	x2, Ls_slash+1            ; every encoding curl decodes
-	mov	w1, #CURLOPT_ACCEPT_ENCODING
-	bl	copt
-	add	x0, sp, #SR_URL
-	mov	x1, #0
-	mov	x2, #0
-	add	x3, sp, #SR_BUF
-	mov	x4, #API_TIMEOUT_MS
-	bl	http
-	mov	w22, w0
-	mov	x0, x19
-	bl	_curl_easy_cleanup
-	cbz	w22, Lsi_bad
-	ldr	x0, [sp, #SR_BUF]         ; the stream
-	mov	x1, x20
-	bl	site_value
-	mov	x20, x1
-	add	x1, x25, #JOB_URL
-	mov	x2, #4096
-	bl	jstr
-	ldr	x0, [sp, #SR_BUF]         ; title, author, artwork
-	mov	x1, x20
-	bl	site_value
-	mov	x20, x1
-	add	x1, x25, #(JOB_TRACK + T_TITLE)
-	mov	x2, #512
-	bl	jstr
-	ldr	x0, [sp, #SR_BUF]
-	mov	x1, x20
-	bl	site_value
-	mov	x20, x1
-	add	x1, x25, #(JOB_TRACK + T_ARTIST)
-	mov	x2, #256
-	bl	jstr
-	ldr	x0, [sp, #SR_BUF]
-	mov	x1, x20
-	bl	site_value
-	mov	x20, x1
-	add	x1, x25, #(JOB_TRACK + T_ART)
-	mov	x2, #2048
-	bl	jstr
-	ldr	x0, [sp, #SR_BUF]         ; length
-	mov	x1, x20
-	bl	site_value
-	cbz	x0, Lsi_free
-	mov	x1, #0
-	mov	w2, #10
-	bl	_strtol
-	str	x0, [x25, #JOB_DUR]
-Lsi_free:
-	ldr	x0, [sp, #SR_BUF]
-	bl	_free
-	mov	w9, #KIND_WEB
-	str	w9, [x25, #JOB_KIND]
-	ldrb	w9, [x25, #JOB_URL]
-	mov	w21, #PLAY_OK
-	cbnz	w9, Lsi_done
-Lsi_bad:
-	mov	w21, #PLAY_FAILED
-	CSTR	x9, "this video cannot be played here"
-	str	x9, [x25, #JOB_ERR]
-Lsi_done:
-	mov	w0, w21
-	b	Lret4
-Lsi_none:
-	mov	w0, #-1
-	b	Lret4
-
 ; resolve_web(job) -> PLAY_OK for any other web address (https when it has no scheme), played as it is; PLAY_FAILED if it is not one.
 resolve_web:
 	FRAME	2, 16
@@ -4654,11 +4480,7 @@ resolve:
 	CSTR	x1, "youtu"
 	bl	_strstr
 	cbnz	x0, Lrs_tube
-	mov	x0, x20                   ; a site Beam knows, else the address as it is
-	bl	resolve_site
-	cmn	w0, #1
-	b.ne	Lrs_named
-	mov	x0, x20
+	mov	x0, x20                   ; any other address plays as it is
 	bl	resolve_web
 	b	Lrs_named
 Lrs_file:

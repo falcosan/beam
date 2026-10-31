@@ -7,7 +7,7 @@ A native macOS media player, written entirely in arm64 assembly. It plays audio 
 ## What it plays
 
 - **Files**: any audio or video macOS plays. Open one with ⌘O, drop it on the window, or use Open With in the Finder.
-- **From a URL** (⌘L): a YouTube or Dailymotion link, or words to search YouTube for; any other web address of a media file or HLS stream plays as it is.
+- **From a URL** (⌘L): a YouTube link, or words to search YouTube for; any other web address of a media file or HLS stream plays as it is.
 - **YouTube** plays up to 4K, in AV1 where the chip decodes it in hardware and H.264 otherwise; live streams play with their picture.
 - **Audio Only** (⌥⌘A, or the headphones): the picture is neither downloaded nor decoded.
 - **Subtitles and audio tracks** of files and streams that have them, in the View menu; **speed** from 0.5× to 2× in the Playback menu; **Picture in Picture** (⌥⌘P).
