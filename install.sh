@@ -6,7 +6,7 @@ app=Beam.app
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
 
-cc -o "$app/Contents/MacOS/Beam" beam.s -framework AppKit -framework AVFoundation -lcurl \
+cc -o "$app/Contents/MacOS/Beam" beam.s -framework AppKit -framework AVFoundation -framework AVKit -lcurl \
   -Wl,-objc_stubs_small,-no_data_const,-x,-no_function_starts,-no_data_in_code_info,-no_source_version
 
 icons=$app/Contents/Resources/Beam.iconset
@@ -23,6 +23,21 @@ cat > "$app/Contents/Info.plist" <<'EOF'
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Audio and video</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.audiovisual-content</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleExecutable</key>
 	<string>Beam</string>
 	<key>CFBundleIconFile</key>

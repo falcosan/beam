@@ -70,6 +70,18 @@ L\name:
 	.endif
 .endm
 
+; ADDO reg, base, off — reg = base + off, for offsets past an immediate's 4 KiB.
+.macro ADDO reg, base, off
+	.if (\off) < 4096
+	add	\reg, \base, #(\off)
+	.else
+	add	\reg, \base, #((\off) >> 12), lsl #12
+	.if (\off) & 4095
+	add	\reg, \reg, #((\off) & 4095)
+	.endif
+	.endif
+.endm
+
 ; CSTR reg, text — a C string literal, kept after G.
 .macro CSTR reg, text
 	.pushsection __DATA,__data
@@ -124,6 +136,14 @@ Lc\@:	.asciz	"\text"
 .equ CURL_GLOBAL_ALL,            3
 .equ CURLINFO_RESPONSE_CODE,     0x200002
 .equ CURLINFO_CONTENT_TYPE,      0x100012
+.equ CURLINFO_EFFECTIVE_URL,     0x100001
+.equ CURLOPT_SHARE,              10100
+.equ CURLSHOPT_SHARE,            1
+.equ CURLSHOPT_LOCKFUNC,         3
+.equ CURLSHOPT_UNLOCKFUNC,       4
+.equ CURL_LOCK_DATA_DNS,         3
+.equ CURL_LOCK_DATA_SSL_SESSION, 4
+.equ CURL_LOCK_DATA_CONNECT,     5
 .equ CURLH_HEADER,               1
 
 ; BSD sockets, signals and GCD.
@@ -161,8 +181,14 @@ Lc\@:	.asciz	"\text"
 .equ CLIENT_TIMEOUT_S,           10
 .equ ACCEPT_BACKOFF_US,          10000
 .equ LIVE_TRIES,                 3        ; failed segment fetches in a row before a live stream ends
-.equ SLOTS,                      8
+.equ SLOTS,                      32       ; a video on This Mac takes five: picture, sound and their playlists
 .equ TOKEN_STRIDE,               40       ; 32 hex + NUL; the last byte flags a live stream
+.equ SLOT_SOUND,                 0        ; what a stream slot serves
+.equ SLOT_LIVE,                  1        ; a live broadcast, as ADTS
+.equ SLOT_VIDEO,                 2
+.equ MYURI_SIZE,                 4096
+.equ HIDE_TICKS,                 3        ; idle seconds before the controls leave a playing video
+.equ VIDEO_MAX_H,                2160     ; the tallest video stream picked
 .equ SKIP_SECONDS,               10
 .equ VOLUME_STEP,                5
 
@@ -193,17 +219,37 @@ Lc\@:	.asciz	"\text"
 .equ T_ART,                      768      ; char[2048]
 .equ T_SIZE,                     2816
 
+; Fmt: what HLS needs of a YouTube stream.
+.equ FMT_INIT,                   0        ; last byte of the init segment
+.equ FMT_IDX0,                   8        ; first and last byte of the segment index (sidx)
+.equ FMT_IDX1,                   16
+.equ FMT_RATE,                   24       ; bits per second
+.equ FMT_CODECS,                 32       ; char[64], e.g. "avc1.640028"
+.equ FMT_SIZE,                   96
+
 ; Play job: main -> worker -> device queue -> main.
-.equ JOB_QUERY,                  0        ; char*, link or search text (owned)
+.equ JOB_QUERY,                  0        ; char*, a link, search text or file path (owned)
 .equ JOB_RESULT,                 8        ; int, PLAY_*
 .equ JOB_LIVE,                   12       ; int
-.equ JOB_DUR,                    16       ; seconds, 0 when live
+.equ JOB_DUR,                    16       ; seconds, 0 when live or unknown
 .equ JOB_ERR,                    24       ; char*, why it failed, or NULL
-.equ JOB_TRACK,                  32       ; Track
-.equ JOB_LOCAL,                  JOB_TRACK + T_SIZE ; char[256], This Mac's stream URL of a live broadcast
-.equ JOB_MSG,                    JOB_LOCAL + 256    ; char[128], an error message
+.equ JOB_KIND,                   32       ; int, KIND_*
+.equ JOB_ITEM,                   40       ; AVPlayerItem for This Mac, retained, or nil
+.equ JOB_TRACK,                  48       ; Track
+.equ JOB_AFMT,                   JOB_TRACK + T_SIZE ; Fmt of the sound stream
+.equ JOB_VFMT,                   JOB_AFMT + FMT_SIZE ; and of the picture stream
+.equ JOB_MSG,                    JOB_VFMT + FMT_SIZE ; char[128], an error message
 .equ JOB_URL,                    JOB_MSG + 128      ; char[4096], the media URL
-.equ JOB_SIZE,                   JOB_URL + 4096
+.equ JOB_VURL,                   JOB_URL + 4096     ; char[4096], the video stream's URL, or ""
+.equ JOB_MURL,                   JOB_VURL + 4096    ; char[4096], picture and sound in one MP4 (for TVs), or ""
+.equ JOB_LOCAL,                  JOB_MURL + 4096    ; char[256], This Mac's URL of the sound
+.equ JOB_VLOCAL,                 JOB_LOCAL + 256    ; char[256], and of the picture, or ""
+.equ JOB_HLS,                    JOB_VLOCAL + 256   ; char[256], the HLS presentation of both, or ""
+.equ JOB_HLSA,                   JOB_HLS + 256      ; char[256], its sound alone, or ""
+.equ JOB_SIZE,                   JOB_HLSA + 256
+.equ KIND_YOUTUBE,               0        ; a YouTube link or search
+.equ KIND_WEB,                   1        ; any other web address, played as it is
+.equ KIND_FILE,                  2        ; a file on this Mac (JOB_QUERY is its path)
 .equ PLAY_OK,                    0
 .equ PLAY_FAILED,                1
 .equ PLAY_REJECTED,              2
@@ -213,7 +259,8 @@ Lc\@:	.asciz	"\text"
 .equ DEV_BASE,                   128
 .equ DEV_AVT,                    256
 .equ DEV_RC,                     512
-.equ DEV_SIZE,                   768
+.equ DEV_VIDEO,                  768      ; byte: 1 it renders video (a TV), 2 it plays HLS
+.equ DEV_SIZE,                   776
 .equ MAX_DEVS,                   16
 .equ AVPLAYER_WAITING,           1
 .equ AVPLAYER_PLAYING,           2
@@ -231,49 +278,62 @@ Lc\@:	.asciz	"\text"
 .equ PX_SIZE,                    48
 
 ; AppKit.
-.equ WIN_STYLE,                  0x8007   ; titled|closable|miniaturizable|fullSizeContentView
+.equ WIN_STYLE,                  0x800f   ; titled|closable|miniaturizable|resizable|fullSizeContentView
 .equ NSEventTypeLeftMouseDown,   1
 .equ NSEventTypeLeftMouseDragged, 6
+.equ FULL_SCREEN_PRIMARY,        128
+.equ TRACK_OPTIONS,              0x282    ; mouse moved, always active, in the visible rect
+.equ PLAYER_ITEM_FAILED,         2
 
-; Window layout in points from the top-left of the content.
-.equ WIN_W,                      360
-.equ WIN_H,                      696
-.equ PAD,                        28
-.equ CONTENT_W,                  WIN_W - 2 * PAD
-.equ FIELD_T,                    52
-.equ FIELD_H,                    28
-.equ ART_T,                      104
-.equ ART_S,                      232
-.equ ART_X,                      (WIN_W - ART_S) / 2
-.equ ART_RADIUS,                 16
+; Autoresizing: which margins or sizes follow the window.
+.equ AR_LEFT,                    1
+.equ AR_WIDTH,                   2
+.equ AR_RIGHT,                   4
+.equ AR_BOTTOM,                  8
+.equ AR_HEIGHT,                  16
+.equ AR_TOP,                     32
+
+; Window layout in points: views are built for the smallest window (from the content's top-left; inside a container, from its bottom-left), then follow it.
+.equ WIN_W,                      640
+.equ WIN_H,                      400
+.equ START_W,                    880
+.equ START_H,                    560
+.equ BAR_M,                      12       ; the control bar floats this far from the edges
+.equ BAR_W,                      WIN_W - 2 * BAR_M
+.equ BAR_H,                      96
+.equ STAGE_B,                    BAR_M + BAR_H + 16 ; artwork and empty state sit between the bar
+.equ STAGE_T,                    40       ; and the title bar
+.equ ART_RADIUS,                 14
+.equ ART_MAX,                    720
 .equ SPIN_S,                     32
-.equ TITLE_T,                    356
-.equ TEXT_BAND,                  66
-.equ TEXT_GAP,                   4
-.equ TITLE_MAX_H,                44
-.equ ARTIST_H,                   18
-.equ SEEK_T,                     440
-.equ TIME_T,                     464
-.equ TIME_W,                     64
+.equ EMPTY_W,                    420
+.equ EMPTY_H,                    196
+.equ PILL_W,                     132
+.equ PILL_H,                     32
+.equ URL_W,                      520
+.equ URL_H,                      48
+.equ STATUS_T,                   36
 .equ LABEL_H,                    16
 .equ SLIDER_H,                   20
-.equ PLAY_T,                     496
-.equ PLAY_S,                     60
-.equ BTN_S,                      44
-.equ BTN_GAP,                    32
-.equ PLAY_X,                     (WIN_W - PLAY_S) / 2
+.equ TIME_W,                     52
+.equ ROW1_Y,                     BAR_H - 12 - SLIDER_H ; position slider
+.equ ROW2_C,                     34       ; middle of the second row
+.equ PLAY_S,                     44
+.equ BTN_S,                      32
+.equ ICON_S,                     24
+.equ BTN_GAP,                    14
+.equ PLAY_X,                     BAR_W / 2 - PLAY_S / 2
 .equ BACK_X,                     PLAY_X - BTN_GAP - BTN_S
 .equ FWD_X,                      PLAY_X + PLAY_S + BTN_GAP
-.equ SMALL_T,                    PLAY_T + (PLAY_S - BTN_S) / 2
-.equ VOL_T,                      580
-.equ VOL_ICON_S,                 22
-.equ VOL_X,                      PAD + VOL_ICON_S + 8
-.equ VOL_W,                      CONTENT_W - 2 * (VOL_ICON_S + 8)
-.equ VMAX_X,                     WIN_W - PAD - VOL_ICON_S
-.equ DEV_T,                      620
-.equ DEV_H,                      24
-.equ STATUS_T,                   660
-.equ PICKER_AIR,                 4
+.equ DEV_W,                      40
+.equ DEV_X,                      BAR_W - 12 - DEV_W
+.equ AIR_W,                      28
+.equ AIR_X,                      DEV_X - 4 - AIR_W
+.equ VOL_W,                      64
+.equ VOL_X,                      AIR_X - 8 - VOL_W
+.equ MUTE_X,                     VOL_X - 4 - ICON_S
+.equ AO_X,                       MUTE_X - 12 - ICON_S
+.equ TEXT_W,                     BACK_X - 32
 
 ; UI timing, in timer ticks (one per second).
 .equ STATUS_TICKS,               6
@@ -311,9 +371,10 @@ Lc\@:	.asciz	"\text"
 .equ G_SEEKDRAG,                 168
 .equ G_VOLDRAG,                  172
 .equ G_MSGERR,                   176      ; the status message is an error
+.equ G_AONLY,                    180      ; Audio Only: no picture is fetched or shown
 .equ G_WIN,                      184      ; views and images (main thread)
 .equ G_CONTENT,                  192
-.equ G_FIELD,                    200
+.equ G_FIELD,                    200      ; the link field of Open from URL
 .equ G_SPIN,                     208
 .equ G_ART,                      216
 .equ G_TITLE,                    224
@@ -326,36 +387,60 @@ Lc\@:	.asciz	"\text"
 .equ G_PP,                       280      ; enabled when the device answers: play, mute, volume
 .equ G_MUTE,                     288
 .equ G_VOL,                      296
-.equ G_BGART,                    304
+.equ G_VIDEO,                    304      ; the view of This Mac's picture
 .equ G_STATUS,                   312
 .equ G_DEV,                      320
 .equ G_IMGPLAY,                  328
 .equ G_IMGPAUSE,                 336
 .equ G_IMGMUTED,                 344
 .equ G_IMGUNMUTED,               352
-.equ G_SLOTURL,                  360      ; char*[SLOTS], media URLs (lock)
-.equ G_SECOND,                   424      ; the secondary label color (main)
-.equ G_T0,                       432      ; scratch objects of the UI programs
-.equ G_T1,                       440
-.equ G_T2,                       448
-.equ G_WORKQ,                    456      ; the global user-initiated queue
-.equ G_SIZE,                     464
+.equ G_SLOTURL,                  360      ; char*[SLOTS], media URLs or file paths (lock)
+.equ G_SECOND,                   G_SLOTURL + 8 * SLOTS ; colors (main)
+.equ G_TEXT,                     G_SECOND + 8
+.equ G_YEL,                      G_TEXT + 8
+.equ G_RED,                      G_YEL + 8
+.equ G_BGC,                      G_RED + 8
+.equ G_SURF,                     G_BGC + 8
+.equ G_SURF2,                    G_SURF + 8
+.equ G_T0,                       G_SURF2 + 8 ; scratch objects of the UI programs
+.equ G_T1,                       G_T0 + 8
+.equ G_T2,                       G_T1 + 8
+.equ G_T3,                       G_T2 + 8
+.equ G_WORKQ,                    G_T3 + 8 ; the global user-initiated queue
+.equ G_BAR,                      G_WORKQ + 8 ; the control bar
+.equ G_EMPTY,                    G_BAR + 8 ; what shows when nothing is playing
+.equ G_URLBOX,                   G_EMPTY + 8 ; Open from URL's floating field
+.equ G_AOBTN,                    G_URLBOX + 8 ; the Audio Only button and menu item
+.equ G_AOITEM,                   G_AOBTN + 8
+.equ G_IMGDEV,                   G_AOITEM + 8 ; the picker's face: This Mac, then a device
+.equ G_IMGDEVON,                 G_IMGDEV + 8
+.equ G_ARTASP,                   G_IMGDEVON + 8 ; the artwork's height / width (double)
+.equ G_IDLE,                     G_ARTASP + 8 ; ticks since the mouse last moved
+.equ G_HASVIDEO,                 G_IDLE + 4 ; This Mac's media has a picture
+.equ G_BARHID,                   G_HASVIDEO + 4 ; the bar is faded out
+.equ G_HOVER,                    G_BARHID + 4 ; the mouse is over the bar
+.equ G_ARTOK,                    G_HOVER + 4 ; the artwork has an image
+.equ G_FAILED,                   G_ARTOK + 4 ; This Mac's item failed and it was reported
+.equ G_DEVON,                    G_FAILED + 4 ; the picker's face shows a device
+.equ G_AV1,                      G_DEVON + 4 ; AV1 decodes in hardware
+.equ G_NOTE,                     G_AV1 + 4 ; the artwork card's music note, shown without an image
+.equ G_RESUMEMS,                 G_NOTE + 8 ; Audio Only's swap: the moment to return to
+.equ G_RESUMET,                  G_RESUMEMS + 8 ; and the timer waiting for the new item, or nil
+.equ G_RESUMEPLAY,               G_RESUMET + 8 ; it was playing
+.equ G_RATE,                     G_RESUMEPLAY + 8 ; Playback > Speed (float)
+.equ G_SUBMENU,                  G_RATE + 8 ; View > Subtitles
+.equ G_PIP,                      G_SUBMENU + 8 ; the Picture in Picture controller, made on first use
+.equ G_TV,                       G_PIP + 8 ; the selected device's DEV_VIDEO
+.equ G_SHARE,                    G_TV + 8 ; the libcurl pool
+.equ G_SHLOCKS,                  G_SHARE + 8 ; its locks, one per kind of data (os_unfair_lock[8])
+.equ G_SIZE,                     G_SHLOCKS + 32
 
 ; ---- Data ----
 
 	.section __DATA,__data
 	.p2align 3
 G:	.space	G_SIZE
-	.if (CONTENT_W != 304) || (PICKER_AIR != 4) || (DEV_H != 24) || (WIN_W != 360) || (WIN_H - DEV_T - DEV_H != 52)
-	.error "the UI doubles below follow the layout"
-	.endif
-Ld_cw:	.double	304.0                     ; CONTENT_W: UI doubles, 8-aligned after G
-Ld_1000:	.double	1000.0
-Ld_air:	.double	1004.0                    ; 1000 + PICKER_AIR
-Ld_devh:	.double	24.0                      ; DEV_H
-Ld_winw:	.double	360.0                     ; WIN_W
-Ld_devy:	.double	52.0                      ; WIN_H - DEV_T - DEV_H
-Lf_100:	.float	100.0                     ; volume percent
+Lf_100:	.float	100.0                     ; volume percent, 8-aligned after G
 	.float	0.0
 
 ; XML entities, 8 bytes each: the character, then its name after '&' (zero-padded).
@@ -371,18 +456,23 @@ Lxml_entities:
 ; B: the large buffers, at fixed offsets from x27.
 .equ B_LANIP,                    0        ; char[16], LAN address as text (device queue)
 .equ B_CUR,                      16       ; selected device (device queue)
-.equ B_NOW,                      784      ; snapshot (lock)
-.equ B_MYURI,                    3776     ; char[256], what we last sent to the device (device queue)
+.equ B_NOW,                      B_CUR + DEV_SIZE + 8 ; snapshot (lock)
 .equ B_MYTRACK,                  4096     ; and its track
+	.if B_NOW + NOW_SIZE > B_MYTRACK
+	.error "B_NOW overlaps"
+	.endif
 .equ B_SLOTTOK,                  6912     ; stream tokens (lock)
-.equ B_UIMSG,                    7232     ; char[256], status message (main)
-.equ B_UIWTITLE,                 7488     ; char[128], last rendered window title (main)
-.equ B_UIARTIST,                 7616     ; char[256], last rendered artist (main)
-.equ B_UIART,                    8192     ; char[2048], artwork shown or loading (main)
-.equ B_UITITLE,                  10240    ; char[512], last rendered title (main)
+.equ B_UIMSG,                    B_SLOTTOK + SLOTS * TOKEN_STRIDE ; char[256], status message (main)
+.equ B_UIARTIST,                 B_UIMSG + 256 ; char[256], last rendered artist (main)
+.equ B_UIART,                    B_UIARTIST + 256 ; char[2048], artwork shown or loading (main)
+.equ B_UITITLE,                  B_UIART + 2048 ; char[512], last rendered title (main)
+.equ B_LTAURL,                   B_UITITLE + 512 ; char[256], This Mac's sound stream (main)
 .equ B_LTTRACK,                  12288    ; This Mac's track (main)
-.equ B_DEVS,                     16384    ; device list (lock)
-.equ B_REG,                      B_DEVS + MAX_DEVS * DEV_SIZE ; the registry
+	.if B_LTAURL + 256 > B_LTTRACK
+	.error "B buffers overlap"
+	.endif
+.equ B_DEVS,                     B_LTTRACK + T_SIZE ; device list (lock)
+.equ B_REG,                      (B_DEVS + MAX_DEVS * DEV_SIZE + 4095) & ~4095 ; the registry, 4 KiB-aligned: one add reaches it
 
 ; A search's handoff from its worker to the device queue, one per kind, after the registry.
 .equ SC_MODE,                    0        ; 0 rebuilds the list, 1 only adds to it
@@ -414,6 +504,8 @@ Lxml_entities:
 	FN	curl_easy_perform
 	FN	curl_easy_reset
 	FN	curl_easy_setopt
+	FN	curl_share_init
+	FN	curl_share_setopt
 	FN	curl_slist_append
 	FN	curl_slist_free_all
 	FN	dispatch_async_f
@@ -425,11 +517,13 @@ Lxml_entities:
 	FN	getsockname
 	FN	inet_ntop
 	FN	listen
+	FN	lseek
 	FN	malloc
 	FN	memcpy
 	FN	objc_autoreleasePoolPop
 	FN	objc_autoreleasePoolPush
 	FN	objc_msgSend
+	FN	open
 	FN	os_unfair_lock_lock
 	FN	os_unfair_lock_unlock
 	FN	pthread_create
@@ -437,11 +531,13 @@ Lxml_entities:
 	FN	realloc
 	FN	recv
 	FN	sel_registerName
+	FN	sendfile
 	FN	sendto
 	FN	setsockopt
 	FN	snprintf
 	FN	socket
 	FN	sscanf
+	FN	strcasecmp
 	FN	strcasestr
 	FN	strchr
 	FN	strcmp
@@ -450,14 +546,15 @@ Lxml_entities:
 	FN	strlcpy
 	FN	strlen
 	FN	strncmp
+	FN	strrchr
 	FN	strstr
 	FN	strtol
 	FN	usleep
 	FN	write
-	SYM	NSFontAttributeName
 	SYM	NSFontWeightMedium
 	SYM	NSFontWeightRegular
 	SYM	NSFontWeightSemibold
+	SYM	VTIsHardwareDecodeSupported
 	SYM	_dispatch_main_q
 	SYM	class_addMethod
 	SYM	curl_global_init
@@ -469,15 +566,18 @@ Lxml_entities:
 	SYM	signal
 	OBJC	AVPlayer
 	OBJC	AVPlayerItem
+	OBJC	AVPictureInPictureController
+	OBJC	AVPlayerLayer
+	OBJC	AVRoutePickerView
 	OBJC	CALayer
 	OBJC	NSAppearance
 	OBJC	NSApplication
-	OBJC	NSBox
+	OBJC	NSArray
 	OBJC	NSButton
 	OBJC	NSCharacterSet
 	OBJC	NSColor
+	OBJC	NSCursor
 	OBJC	NSData
-	OBJC	NSDictionary
 	OBJC	NSFont
 	OBJC	NSImage
 	OBJC	NSImageSymbolConfiguration
@@ -486,88 +586,122 @@ Lxml_entities:
 	OBJC	NSMenu
 	OBJC	NSMenuItem
 	OBJC	NSObject
+	OBJC	NSOpenPanel
 	OBJC	NSPopUpButton
 	OBJC	NSProgressIndicator
-	OBJC	NSSearchField
 	OBJC	NSSlider
 	OBJC	NSString
 	OBJC	NSTextField
 	OBJC	NSTimer
+	OBJC	NSTrackingArea
 	OBJC	NSURL
 	OBJC	NSView
-	OBJC	NSVisualEffectView
 	OBJC	NSWindow
+	OBJC	UTType
 	REGSEL
 	REG	S_systemFontOfSize_weight_, "systemFontOfSize:weight:"
 	REG	S_monospacedDigitSystemFontOfSize_weight_, "monospacedDigitSystemFontOfSize:weight:"
 	REG	S_JSONObjectWithData_options_error_, "JSONObjectWithData:options:error:"
 	REG	S_URLWithString_, "URLWithString:"
 	REG	S_UTF8String, "UTF8String"
+	REG	S_CGColor, "CGColor"
+	REG	S_URL, "URL"
+	REG	S_URLByDeletingPathExtension, "URLByDeletingPathExtension"
+	REG	S_absoluteString, "absoluteString"
 	REG	S_activate, "activate"
 	REG	S_addItem_, "addItem:"
 	REG	S_addItemWithTitle_action_keyEquivalent_, "addItemWithTitle:action:keyEquivalent:"
 	REG	S_addSubview_, "addSubview:"
+	REG	S_addTrackingArea_, "addTrackingArea:"
 	REG	S_alloc, "alloc"
+	REG	S_animator, "animator"
 	REG	S_appearanceNamed_, "appearanceNamed:"
+	REG	S_arrayWithObject_, "arrayWithObject:"
+	REG	S_assetTrack, "assetTrack"
+	REG	S_bounds, "bounds"
 	REG	S_buttonWithImage_target_action_, "buttonWithImage:target:action:"
+	REG	S_buttonWithTitle_target_action_, "buttonWithTitle:target:action:"
+	REG	S_cancelOperation_, "cancelOperation:"
 	REG	S_cell, "cell"
 	REG	S_center, "center"
+	REG	S_clickCount, "clickCount"
+	REG	S_colorWithSRGBRed_green_blue_alpha_, "colorWithSRGBRed:green:blue:alpha:"
+	REG	S_componentsSeparatedByString_, "componentsSeparatedByString:"
+	REG	S_configurationWithPaletteColors_, "configurationWithPaletteColors:"
 	REG	S_configurationWithPointSize_weight_, "configurationWithPointSize:weight:"
-	REG	S_contentView, "contentView"
 	REG	S_currentEvent, "currentEvent"
 	REG	S_currentItem, "currentItem"
 	REG	S_currentTime, "currentTime"
 	REG	S_dataWithBytes_length_, "dataWithBytes:length:"
 	REG	S_dataWithBytesNoCopy_length_freeWhenDone_, "dataWithBytesNoCopy:length:freeWhenDone:"
-	REG	S_dictionaryWithObject_forKey_, "dictionaryWithObject:forKey:"
 	REG	S_doubleValue, "doubleValue"
-	REG	S_font, "font"
+	REG	S_draggingPasteboard, "draggingPasteboard"
+	REG	S_duration, "duration"
+	REG	S_fileURLWithPath_, "fileURLWithPath:"
+	REG	S_firstObject, "firstObject"
+	REG	S_host, "host"
 	REG	S_imageViewWithImage_, "imageViewWithImage:"
+	REG	S_imageWithSymbolConfiguration_, "imageWithSymbolConfiguration:"
 	REG	S_imageWithSystemSymbolName_accessibilityDescription_, "imageWithSystemSymbolName:accessibilityDescription:"
 	REG	S_indexOfSelectedItem, "indexOfSelectedItem"
 	REG	S_initWithContentRect_styleMask_backing_defer_, "initWithContentRect:styleMask:backing:defer:"
 	REG	S_initWithData_, "initWithData:"
 	REG	S_initWithFrame_, "initWithFrame:"
+	REG	S_initWithFrame_pullsDown_, "initWithFrame:pullsDown:"
+	REG	S_initWithRect_options_owner_userInfo_, "initWithRect:options:owner:userInfo:"
 	REG	S_initWithTitle_, "initWithTitle:"
 	REG	S_intValue, "intValue"
 	REG	S_isEnabled, "isEnabled"
+	REG	S_isEqualToString_, "isEqualToString:"
+	REG	S_isFileURL, "isFileURL"
 	REG	S_isMuted, "isMuted"
-	REG	S_itemTitleAtIndex_, "itemTitleAtIndex:"
-	REG	S_labelColor, "labelColor"
+	REG	S_itemAtIndex_, "itemAtIndex:"
 	REG	S_labelWithString_, "labelWithString:"
+	REG	S_lastPathComponent, "lastPathComponent"
 	REG	S_layer, "layer"
+	REG	S_locationInWindow, "locationInWindow"
 	REG	S_makeFirstResponder_, "makeFirstResponder:"
 	REG	S_makeKeyAndOrderFront_, "makeKeyAndOrderFront:"
 	REG	S_maxValue, "maxValue"
+	REG	S_mediaType, "mediaType"
 	REG	S_menu, "menu"
 	REG	S_new, "new"
 	REG	S_numberOfItems, "numberOfItems"
+	REG	S_openPanel, "openPanel"
+	REG	S_path, "path"
 	REG	S_pause, "pause"
 	REG	S_play, "play"
 	REG	S_playerItemWithURL_, "playerItemWithURL:"
-	REG	S_quaternarySystemFillColor, "quaternarySystemFillColor"
+	REG	S_playerLayerWithPlayer_, "playerLayerWithPlayer:"
+	REG	S_presentationSize, "presentationSize"
+	REG	S_readObjectsForClasses_options_, "readObjectsForClasses:options:"
+	REG	S_registerForDraggedTypes_, "registerForDraggedTypes:"
+	REG	S_release, "release"
 	REG	S_removeItemAtIndex_, "removeItemAtIndex:"
 	REG	S_replaceCurrentItemWithPlayerItem_, "replaceCurrentItemWithPlayerItem:"
-	REG	S_release, "release"
 	REG	S_retain, "retain"
 	REG	S_run, "run"
+	REG	S_runModal, "runModal"
 	REG	S_scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_, "scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"
-	REG	S_secondaryLabelColor, "secondaryLabelColor"
-	REG	S_seekToTime_, "seekToTime:"
-	REG	S_selectItemAtIndex_, "selectItemAtIndex:"
+	REG	S_seekToTime_toleranceBefore_toleranceAfter_, "seekToTime:toleranceBefore:toleranceAfter:"
 	REG	S_selectText_, "selectText:"
 	REG	S_separatorItem, "separatorItem"
 	REG	S_setAction_, "setAction:"
 	REG	S_setActivationPolicy_, "setActivationPolicy:"
 	REG	S_setAlignment_, "setAlignment:"
+	REG	S_setAllowedContentTypes_, "setAllowedContentTypes:"
+	REG	S_setAlphaValue_, "setAlphaValue:"
 	REG	S_setAppearance_, "setAppearance:"
-	REG	S_setBlendingMode_, "setBlendingMode:"
-	REG	S_setBorderWidth_, "setBorderWidth:"
+	REG	S_setArrowPosition_, "setArrowPosition:"
+	REG	S_setAutoresizingMask_, "setAutoresizingMask:"
+	REG	S_setBackgroundColor_, "setBackgroundColor:"
+	REG	S_setBezeled_, "setBezeled:"
 	REG	S_setBordered_, "setBordered:"
-	REG	S_setBoxType_, "setBoxType:"
 	REG	S_setClipsToBounds_, "setClipsToBounds:"
+	REG	S_setCollectionBehavior_, "setCollectionBehavior:"
+	REG	S_setContentMinSize_, "setContentMinSize:"
+	REG	S_setContentSize_, "setContentSize:"
 	REG	S_setContentTintColor_, "setContentTintColor:"
-	REG	S_setContentView_, "setContentView:"
 	REG	S_setContents_, "setContents:"
 	REG	S_setContentsGravity_, "setContentsGravity:"
 	REG	S_setContentsRect_, "setContentsRect:"
@@ -577,25 +711,24 @@ Lxml_entities:
 	REG	S_setDelegate_, "setDelegate:"
 	REG	S_setDisplayedWhenStopped_, "setDisplayedWhenStopped:"
 	REG	S_setDoubleValue_, "setDoubleValue:"
+	REG	S_setDrawsBackground_, "setDrawsBackground:"
 	REG	S_setEnabled_, "setEnabled:"
-	REG	S_setFillColor_, "setFillColor:"
 	REG	S_setFocusRingType_, "setFocusRingType:"
 	REG	S_setFont_, "setFont:"
 	REG	S_setFrame_, "setFrame:"
+	REG	S_setFrameOrigin_, "setFrameOrigin:"
 	REG	S_setHidden_, "setHidden:"
+	REG	S_setHiddenUntilMouseMoves_, "setHiddenUntilMouseMoves:"
 	REG	S_setImage_, "setImage:"
 	REG	S_setKeyEquivalentModifierMask_, "setKeyEquivalentModifierMask:"
 	REG	S_setLayer_, "setLayer:"
 	REG	S_setLineBreakMode_, "setLineBreakMode:"
 	REG	S_setMainMenu_, "setMainMenu:"
-	REG	S_setMaterial_, "setMaterial:"
 	REG	S_setMaxValue_, "setMaxValue:"
-	REG	S_setMaximumNumberOfLines_, "setMaximumNumberOfLines:"
 	REG	S_setMovableByWindowBackground_, "setMovableByWindowBackground:"
 	REG	S_setMuted_, "setMuted:"
 	REG	S_setPlaceholderString_, "setPlaceholderString:"
-	REG	S_setSelectable_, "setSelectable:"
-	REG	S_setSendsWholeSearchString_, "setSendsWholeSearchString:"
+	REG	S_setScrollable_, "setScrollable:"
 	REG	S_setState_, "setState:"
 	REG	S_setStringValue_, "setStringValue:"
 	REG	S_setStyle_, "setStyle:"
@@ -604,34 +737,61 @@ Lxml_entities:
 	REG	S_setTarget_, "setTarget:"
 	REG	S_setTextColor_, "setTextColor:"
 	REG	S_setTitle_, "setTitle:"
-	REG	S_setTitlePosition_, "setTitlePosition:"
 	REG	S_setTitleVisibility_, "setTitleVisibility:"
 	REG	S_setTitlebarAppearsTransparent_, "setTitlebarAppearsTransparent:"
 	REG	S_setTolerance_, "setTolerance:"
 	REG	S_setToolTip_, "setToolTip:"
-	REG	S_setTruncatesLastVisibleLine_, "setTruncatesLastVisibleLine:"
+	REG	S_setTrackFillColor_, "setTrackFillColor:"
+	REG	S_setUsesSingleLineMode_, "setUsesSingleLineMode:"
 	REG	S_setVolume_, "setVolume:"
 	REG	S_setWantsLayer_, "setWantsLayer:"
 	REG	S_setWindowsMenu_, "setWindowsMenu:"
 	REG	S_sharedApplication, "sharedApplication"
-	REG	S_size, "size"
-	REG	S_sizeThatFits_, "sizeThatFits:"
-	REG	S_sizeWithAttributes_, "sizeWithAttributes:"
-	REG	S_sliderWithTarget_action_, "sliderWithTarget:action:"
 	REG	S_startAnimation_, "startAnimation:"
+	REG	S_status, "status"
 	REG	S_stopAnimation_, "stopAnimation:"
 	REG	S_stringByTrimmingCharactersInSet_, "stringByTrimmingCharactersInSet:"
+	REG	S_stringForType_, "stringForType:"
 	REG	S_stringValue, "stringValue"
 	REG	S_stringWithUTF8String_, "stringWithUTF8String:"
-	REG	S_systemRedColor, "systemRedColor"
-	REG	S_tertiaryLabelColor, "tertiaryLabelColor"
 	REG	S_timeControlStatus, "timeControlStatus"
-	REG	S_titleOfSelectedItem, "titleOfSelectedItem"
-	REG	S_titleRectForBounds_, "titleRectForBounds:"
+	REG	S_toggleFullScreen_, "toggleFullScreen:"
+	REG	S_tracks, "tracks"
 	REG	S_type, "type"
+	REG	S_typeWithIdentifier_, "typeWithIdentifier:"
 	REG	S_volume, "volume"
 	REG	S_whitespaceAndNewlineCharacterSet, "whitespaceAndNewlineCharacterSet"
-	REG	S_wrappingLabelWithString_, "wrappingLabelWithString:"
+	REG	S_count, "count"
+	REG	S_isHidden, "isHidden"
+	REG	S_setPlayer_, "setPlayer:"
+	REG	S_setRoutePickerButtonBordered_, "setRoutePickerButtonBordered:"
+	REG	S_setRoutePickerButtonColor_forState_, "setRoutePickerButtonColor:forState:"
+	REG	S_initWithPlayerLayer_, "initWithPlayerLayer:"
+	REG	S_isPictureInPictureActive, "isPictureInPictureActive"
+	REG	S_startPictureInPicture, "startPictureInPicture"
+	REG	S_stopPictureInPicture, "stopPictureInPicture"
+	REG	S_keyCode, "keyCode"
+	REG	S_styleMask, "styleMask"
+	REG	S_tag, "tag"
+	REG	S_setTag_, "setTag:"
+	REG	S_itemArray, "itemArray"
+	REG	S_removeAllItems, "removeAllItems"
+	REG	S_options, "options"
+	REG	S_displayName, "displayName"
+	REG	S_asset, "asset"
+	REG	S_mediaSelectionGroupForMediaCharacteristic_, "mediaSelectionGroupForMediaCharacteristic:"
+	REG	S_currentMediaSelection, "currentMediaSelection"
+	REG	S_selectedMediaOptionInMediaSelectionGroup_, "selectedMediaOptionInMediaSelectionGroup:"
+	REG	S_selectMediaOption_inMediaSelectionGroup_, "selectMediaOption:inMediaSelectionGroup:"
+	REG	S_setDefaultRate_, "setDefaultRate:"
+	REG	S_setRate_, "setRate:"
+	REG	S_act_option_, "act_option:"
+	REG	S_invalidate, "invalidate"
+	REG	S_itemTitleAtIndex_, "itemTitleAtIndex:"
+	REG	S_objectAtIndex_, "objectAtIndex:"
+	REG	S_setContentView_, "setContentView:"
+	REG	S_size, "size"
+	REG	S_sliderWithTarget_action_, "sliderWithTarget:action:"
 .endm
 .set Lnreg, 0
 .macro REG sym, name
@@ -654,7 +814,10 @@ _\name:
 	.purgem	REGSEL
 	.purgem	FN
 .equ B_SCAN,                     B_REG + 8 * Lnreg
-.equ B_SIZE,                     B_SCAN + 2 * SC_SIZE
+.equ B_MYURI,                    B_SCAN + 2 * SC_SIZE ; char[MYURI_SIZE], what we last sent to the device (device queue)
+.equ B_LTVURL,                   B_MYURI + MYURI_SIZE ; char[4096], This Mac's picture: our HLS or a broadcast's own, or "" (main)
+.equ B_VISITOR,                  B_LTVURL + 4096 ; char[288], the visitorData member once YouTube gave it (worker)
+.equ B_SIZE,                     B_VISITOR + 288
 	.lcomm	B, B_SIZE, 4
 
 	.text
@@ -726,7 +889,10 @@ Ls_setmute:	.asciz	"SetMute"
 Ls_stream:	.asciz	"/stream/"
 Ls_mp4:	.asciz	"audio/mp4"
 Ls_aac:	.asciz	"audio/aac"
+Ls_hls:	.asciz	"application/vnd.apple.mpegurl"
 Ls_range:	.asciz	"%lld-%lld"
+Ls_200:	.asciz	"HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lld\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+Ls_206:	.asciz	"HTTP/1.1 206 Partial Content\r\nContent-Type: %s\r\nContent-Length: %lld\r\nContent-Range: bytes %lld-%lld/%lld\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
 Ls_404:	.asciz	"404 Not Found"
 Ls_nothing:	.asciz	"Nothing playing"
 Ls_dashes:	.asciz	"--:--"
@@ -742,6 +908,60 @@ copt:
 	bl	_curl_easy_setopt
 	ldp	x2, x30, [sp], #16
 	ret
+
+; curl_new() -> a libcurl handle in the shared pool: connections, TLS sessions and DNS answers carry over between requests and threads.
+curl_new:
+	FRAME	1
+	bl	_curl_easy_init
+	mov	x19, x0
+	cbz	x0, Lret1
+	ldr	x2, [x28, #G_SHARE]
+	mov	w1, #CURLOPT_SHARE
+	bl	copt
+	mov	x0, x19
+	b	Lret1
+
+; shopt(option, value) — curl_share_setopt on the pool in x19 (the variadic value goes on the stack).
+shopt:
+	stp	x2, x30, [sp, #-16]!
+	mov	x0, x19
+	bl	_curl_share_setopt
+	ldp	x2, x30, [sp], #16
+	ret
+
+; share_init() — the pool, with a lock per kind of shared data so any thread can use it.
+share_init:
+	FRAME	1
+	bl	_curl_share_init
+	mov	x19, x0
+	str	x0, [x28, #G_SHARE]
+	cbz	x0, Lret1
+	adr	x2, share_lock
+	mov	w1, #CURLSHOPT_LOCKFUNC
+	bl	shopt
+	adr	x2, share_unlock
+	mov	w1, #CURLSHOPT_UNLOCKFUNC
+	bl	shopt
+	mov	x2, #CURL_LOCK_DATA_DNS
+	mov	w1, #CURLSHOPT_SHARE
+	bl	shopt
+	mov	x2, #CURL_LOCK_DATA_SSL_SESSION
+	mov	w1, #CURLSHOPT_SHARE
+	bl	shopt
+	mov	x2, #CURL_LOCK_DATA_CONNECT
+	mov	w1, #CURLSHOPT_SHARE
+	bl	shopt
+	b	Lret1
+
+; share_lock / share_unlock(handle, data) — the pool's lock for that kind of data.
+	ENTRY	share_lock
+	add	x0, x28, #G_SHLOCKS
+	add	x0, x0, w1, uxtw #2
+	b	_os_unfair_lock_lock
+	ENTRY	share_unlock
+	add	x0, x28, #G_SHLOCKS
+	add	x0, x0, w1, uxtw #2
+	b	_os_unfair_lock_unlock
 
 ; copt1(option) — set an option of the handle in x19 to 1.
 copt1:
@@ -1284,7 +1504,7 @@ Lcl_no:
 
 ; describe(location, dev) — fill a device entry from its UPnP description; w0 = 1 if it plays media.
 describe:
-	FRAME	3, 144
+	FRAME	3, 400                    ; +144: the ConnectionManager's control URL
 	mov	x19, x0
 	mov	x20, x1
 	mov	x1, #0
@@ -1322,6 +1542,17 @@ describe:
 	add	x2, x20, #DEV_BASE
 	add	x3, x20, #DEV_RC
 	bl	control_url
+	strb	wzr, [x20, #DEV_VIDEO]    ; a TV if its sink takes video
+	mov	x0, x21
+	CSTR	x1, "urn:schemas-upnp-org:service:ConnectionManager:1"
+	add	x2, x20, #DEV_BASE
+	add	x3, sp, #144
+	bl	control_url
+	cbz	w0, Lde_named
+	add	x0, sp, #144
+	bl	sink_video
+	strb	w0, [x20, #DEV_VIDEO]
+Lde_named:
 	mov	x0, x21                   ; "Room · Model" (Sonos), else friendlyName
 	CSTR	x1, "roomName"
 	add	x2, sp, #16
@@ -1363,6 +1594,43 @@ Lde_free:
 Lde_ret:
 	mov	w0, w22
 	b	Lret3
+
+; sink_video(control) -> what the renderer's ConnectionManager says it can play beyond sound: 1 = video, 2 = HLS, or both.
+sink_video:
+	FRAME	2
+	mov	x19, x0
+	mov	x0, #0
+	CSTR	x1, "Content-Type: text/xml; charset=\"utf-8\""
+	bl	_curl_slist_append
+	CSTR	x1, "SOAPACTION: \"urn:schemas-upnp-org:service:ConnectionManager:1#GetProtocolInfo\""
+	bl	_curl_slist_append
+	mov	x20, x0
+	mov	x0, x19
+	CSTR	x1, "<?xml version=\"1.0\" encoding=\"utf-8\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:GetProtocolInfo xmlns:u=\"urn:schemas-upnp-org:service:ConnectionManager:1\"/></s:Body></s:Envelope>"
+	mov	x2, x20
+	mov	x3, #DESC_TIMEOUT_MS
+	bl	dev_http
+	mov	x21, x0
+	mov	x0, x20
+	bl	_curl_slist_free_all
+	mov	w22, #0
+	cbz	x21, Lsv_answer
+	mov	x0, x21
+	CSTR	x1, ":video/"
+	bl	_strcasestr
+	cmp	x0, #0
+	cset	w22, ne
+	mov	x0, x21
+	CSTR	x1, "mpegurl"
+	bl	_strcasestr
+	cmp	x0, #0
+	cset	w9, ne
+	orr	w22, w22, w9, lsl #1
+	mov	x0, x21
+	bl	_free
+Lsv_answer:
+	mov	w0, w22
+	b	Lret2
 
 ; header_value(text, pattern, out[256]) — copy the value of the header that pattern ("\nName:") finds; NULL if absent.
 header_value:
@@ -1659,6 +1927,8 @@ select_apply:
 	mov	x2, #128
 	bl	_strlcpy
 	str	wzr, [x21, #NOW_STATE]    ; unknown until polled
+	ldrb	w9, [x20, #DEV_VIDEO]
+	str	w9, [x28, #G_TV]          ; a TV gets H.264, which every TV decodes
 	stp	xzr, xzr, [x21, #NOW_POS]
 	strb	wzr, [x21, #NOW_TITLE]
 	strb	wzr, [x21, #NOW_ARTIST]
@@ -2006,10 +2276,13 @@ Lsk_poll:
 
 ; ---- Playing a link: main -> worker -> device queue -> main ----
 
-; play_resolve(job) — resolve the link, hand it to the device or to This Mac, report to main.
+; play_resolve(job) — resolve the link, hand it to the device or prepare This Mac's item, report to main.
 	ENTRY	play_resolve
-	FRAME	1
+	FRAME	2
 	mov	x19, x0
+	bl	_objc_autoreleasePoolPush
+	mov	x21, x0
+	mov	x0, x19
 	bl	resolve
 	str	w0, [x19, #JOB_RESULT]
 	cbnz	w0, Lpr_done
@@ -2018,12 +2291,8 @@ Lsk_poll:
 	ldr	w20, [x9, #NOW_SEL]
 	UNLOCK
 	cbnz	w20, Lpr_device
-	ldr	w9, [x19, #JOB_LIVE]
-	cbz	w9, Lpr_done              ; This Mac plays the media URL itself
-	mov	x0, x19                   ; a live broadcast goes through the proxy, as AAC
-	CSTR	x1, "127.0.0.1"
-	add	x2, x19, #JOB_LOCAL
-	bl	stream_uri
+	mov	x0, x19
+	bl	local_prepare
 	b	Lpr_done
 Lpr_device:
 	ldr	x0, [x28, #G_QUEUE]
@@ -2031,17 +2300,305 @@ Lpr_device:
 	adr	x2, play_upnp
 	bl	_dispatch_sync_f          ; keeps the job alive until the device answers
 Lpr_done:
+	mov	x0, x21
+	bl	_objc_autoreleasePoolPop
 	adr	x0, ui_play_done
 	mov	x1, x19
 	bl	post_main
-	b	Lret1
+	b	Lret2
 
-; stream_uri(job, host, out[256]) — serve the job's media under a fresh random token; out = its URL on host.
-stream_uri:
+; local_prepare(job) — This Mac's item: YouTube through the proxy at loopback (full-speed reads), its picture as HLS; anything else as it is.
+local_prepare:
+	FRAME	2
+	mov	x20, x0
+	ldr	w9, [x20, #JOB_KIND]
+	add	x0, x20, #JOB_URL
+	cbnz	w9, Llp_item
+	ldr	w1, [x20, #JOB_LIVE]
+	CSTR	x2, "127.0.0.1"
+	ADDO	x3, x20, JOB_LOCAL
+	bl	slot_uri
+	ADDO	x9, x20, JOB_VURL
+	ldrb	w9, [x9]
+	cbz	w9, Llp_hls
+	ldr	w10, [x20, #JOB_LIVE]
+	cbz	w10, Llp_vslot
+	ldr	w10, [x28, #G_AONLY]      ; a broadcast's picture: its HLS, straight from YouTube
+	cbnz	w10, Llp_sound
+	ADDO	x0, x20, JOB_VURL
+	b	Llp_item
+Llp_vslot:
+	ADDO	x0, x20, JOB_VURL
+	mov	w1, #SLOT_VIDEO
+	CSTR	x2, "127.0.0.1"
+	ADDO	x3, x20, JOB_VLOCAL
+	bl	slot_uri
+Llp_hls:
+	ldr	w9, [x20, #JOB_LIVE]
+	cbnz	w9, Llp_sound             ; a broadcast has no index: it plays as it comes
+	mov	x0, x20                   ; the picture's too, even for Audio Only, which can be turned off later
+	CSTR	x1, "127.0.0.1"
+	bl	hls_master
+	ldr	w9, [x28, #G_AONLY]
+	cbnz	w9, Llp_sound
+	ADDO	x9, x20, JOB_HLS
+	ldrb	w9, [x9]
+	ADDO	x0, x20, JOB_HLS
+	cbnz	w9, Llp_item
+Llp_sound:
+	ADDO	x9, x20, JOB_HLSA
+	ldrb	w9, [x9]
+	ADDO	x0, x20, JOB_HLSA
+	cbnz	w9, Llp_item
+	ADDO	x0, x20, JOB_LOCAL
+Llp_item:
+	bl	make_item
+	str	x0, [x20, #JOB_ITEM]
+	b	Lret2
+
+; mkurl(cstr) -> an autoreleased NSURL, or nil.
+mkurl:
+	FRAME	0
+	bl	mkstr
+	mov	x2, x0
+	CLASS	x0, NSURL
+	SEND	S_URLWithString_
+	b	Lret0
+
+; make_item(url) -> a retained AVPlayerItem for a URL string, or nil if it is not one.
+make_item:
+	FRAME	0
+	bl	mkurl
+	cbz	x0, Lret0
+	mov	x2, x0
+	CLASS	x0, AVPlayerItem
+	SEND	S_playerItemWithURL_
+	SEND	S_retain
+	b	Lret0
+
+; hls_master(job, host) — JOB_HLSA: the sound as HLS, segmented by its index; then, with a picture (JOB_VLOCAL), JOB_HLS: a master playlist with the picture as its one variant and that sound as its audio. Each stays "" if its index did not come.
+	.equ HX_V,	48                ; char[256], the picture's playlist
+	.equ HX_TEXT,	304               ; char*
+	.equ HX_SIZE,	320
+hls_master:
+	FRAME	3, HX_SIZE
+	mov	x20, x0
+	mov	x23, x1
+	bl	curl_new
+	mov	x19, x0
+	cbz	x0, Lret2
+	add	x0, x20, #JOB_URL
+	ADDO	x1, x20, JOB_LOCAL
+	add	x2, x20, #JOB_AFMT
+	ADDO	x3, x20, JOB_HLSA
+	mov	x4, x23
+	bl	hls_media
+	cbz	w0, Lhx_done
+	ADDO	x9, x20, JOB_VLOCAL
+	ldrb	w9, [x9]
+	cbz	w9, Lhx_done              ; sound only
+	ADDO	x0, x20, JOB_VURL
+	ADDO	x1, x20, JOB_VLOCAL
+	add	x2, x20, #JOB_VFMT
+	add	x3, sp, #HX_V
+	mov	x4, x23
+	bl	hls_media
+	cbz	w0, Lhx_done
+	ADDO	x9, x20, JOB_HLSA
+	ldr	x10, [x20, #(JOB_VFMT + FMT_RATE)]
+	ldr	x11, [x20, #(JOB_AFMT + FMT_RATE)]
+	add	x10, x10, x11
+	stp	x9, x10, [sp]
+	add	x9, x20, #(JOB_VFMT + FMT_CODECS)
+	add	x10, x20, #(JOB_AFMT + FMT_CODECS)
+	stp	x9, x10, [sp, #16]
+	add	x9, sp, #HX_V
+	str	x9, [sp, #32]
+	add	x0, sp, #HX_TEXT
+	CSTR	x1, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"Sound\",DEFAULT=YES,AUTOSELECT=YES,URI=\"%s\"\n#EXT-X-STREAM-INF:BANDWIDTH=%llu,CODECS=\"%s,%s\",AUDIO=\"a\"\n%s\n"
+	bl	_asprintf
+	tbnz	w0, #31, Lhx_done
+	ldr	x0, [sp, #HX_TEXT]
+	mov	w1, #SLOT_SOUND
+	mov	x2, x23
+	ADDO	x3, x20, JOB_HLS
+	bl	slot_uri
+	ldr	x0, [sp, #HX_TEXT]
+	bl	_free
+Lhx_done:
+	mov	x0, x19
+	bl	_curl_easy_cleanup
+	b	Lret3
+
+; hls_media(upstream, local, fmt, out[256], host) — an HLS playlist of one fragmented MP4 stream, its segments read from the stream's sidx (fetched with the handle in x19); out = where it is served on host; w0 = 1 if built.
+	.equ HM_BUF,	48                ; {data, len}: the sidx
+	.equ HM_RANGE,	64                ; char[48]
+	.equ HM_TEXT,	112               ; char*, the playlist
+	.equ HM_CAP,	120               ; its size
+	.equ HM_SCALE,	128               ; sidx timescale
+	.equ HM_INIT,	136               ; init segment length
+	.equ HM_HOST,	144               ; char *, where the playlist is served
+	.equ HM_SIZE,	160
+hls_media:
+	FRAME	4, HM_SIZE
+	mov	x20, x0
+	mov	x21, x1
+	mov	x23, x3
+	str	x4, [sp, #HM_HOST]
+	ldr	x9, [x2, #FMT_INIT]
+	add	x9, x9, #1
+	str	x9, [sp, #HM_INIT]
+	ldp	x9, x10, [x2, #FMT_IDX0]
+	add	x26, x10, #1              ; where the sidx ends
+	mov	x22, #0                   ; built
+	stp	xzr, xzr, [sp, #HM_BUF]
+	cbz	x10, Lhl_free             ; no index
+	stp	x9, x10, [sp]
+	add	x0, sp, #HM_RANGE
+	mov	x1, #48
+	GADDR	x2, Ls_range
+	bl	_snprintf
+	add	x2, sp, #HM_RANGE
+	mov	w1, #CURLOPT_RANGE
+	bl	copt
+	mov	x0, x20
+	mov	x1, #0
+	mov	x2, #0
+	add	x3, sp, #HM_BUF
+	mov	x4, #API_TIMEOUT_MS
+	bl	http
+	mov	w24, w0
+	mov	x2, #0
+	mov	w1, #CURLOPT_RANGE
+	bl	copt
+	cbz	w24, Lhl_free
+	ldp	x24, x9, [sp, #HM_BUF]
+	add	x25, x24, x9              ; the data's end
+	cmp	x9, #32
+	b.lo	Lhl_free
+	ldr	w9, [x24, #4]
+	mov	w10, #0x6973
+	movk	w10, #0x7864, lsl #16     ; "sidx"
+	cmp	w9, w10
+	b.ne	Lhl_free
+	ldr	w9, [x24, #16]
+	rev	w9, w9
+	cbz	w9, Lhl_free
+	str	x9, [sp, #HM_SCALE]
+	ldrb	w9, [x24, #8]             ; version: 32- or 64-bit times and offset
+	cbnz	w9, Lhl_v1
+	ldr	w10, [x24, #24]
+	rev	w10, w10
+	ldrh	w20, [x24, #30]
+	add	x24, x24, #32
+	b	Lhl_refs
+Lhl_v1:
+	add	x9, x24, #40
+	cmp	x9, x25
+	b.hi	Lhl_free
+	ldr	x10, [x24, #28]
+	rev	x10, x10
+	ldrh	w20, [x24, #38]
+	add	x24, x24, #40
+Lhl_refs:
+	rev16	w20, w20                  ; references
+	add	x26, x26, x10             ; the first segment's offset
+	mov	x9, #12
+	madd	x9, x20, x9, x24
+	cmp	x9, x25
+	b.hi	Lhl_free                  ; cut short
+	mov	x25, x24                  ; the references
+	mov	x0, x21                   ; room: 80 bytes and the URL per segment
+	bl	_strlen
+	add	x9, x0, #80
+	mul	x9, x9, x20
+	add	x0, x9, x0
+	add	x0, x0, #512
+	str	x0, [sp, #HM_CAP]
+	bl	_malloc
+	cbz	x0, Lhl_free
+	str	x0, [sp, #HM_TEXT]
+	mov	x9, #0                    ; the longest segment, for the target duration
+	mov	x10, #0
+Lhl_max:
+	cmp	x10, x20
+	b.hs	Lhl_head
+	mov	x11, #12
+	madd	x11, x10, x11, x25
+	ldr	w11, [x11, #4]
+	rev	w11, w11
+	cmp	x11, x9
+	csel	x9, x11, x9, hi
+	add	x10, x10, #1
+	b	Lhl_max
+Lhl_head:
+	ldr	x10, [sp, #HM_SCALE]
+	add	x9, x9, x10
+	sub	x9, x9, #1
+	udiv	x9, x9, x10               ; rounded up
+	stp	x9, x21, [sp]
+	ldr	x9, [sp, #HM_INIT]
+	str	x9, [sp, #16]
+	ldr	x0, [sp, #HM_TEXT]
+	ldr	x1, [sp, #HM_CAP]
+	CSTR	x2, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:%llu\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI=\"%s\",BYTERANGE=\"%llu@0\"\n"
+	bl	_snprintf
+	ldr	x24, [sp, #HM_TEXT]
+	add	x24, x24, w0, sxtw        ; the write cursor
+Lhl_seg:
+	cbz	x20, Lhl_end
+	sub	x20, x20, #1
+	ldp	w9, w10, [x25], #12
+	rev	w9, w9
+	and	w9, w9, #0x7fffffff       ; referenced size
+	rev	w10, w10                  ; duration, in timescale units
+	mov	x11, #1000
+	mul	x10, x10, x11
+	ldr	x11, [sp, #HM_SCALE]
+	udiv	x10, x10, x11             ; milliseconds
+	mov	x11, #1000
+	udiv	x12, x10, x11
+	msub	x13, x12, x11, x10
+	stp	x12, x13, [sp]
+	stp	x9, x26, [sp, #16]
+	str	x21, [sp, #32]
+	add	x26, x26, x9
+	mov	x0, x24
+	ldp	x9, x10, [sp, #HM_TEXT]
+	add	x1, x9, x10
+	sub	x1, x1, x24               ; room left
+	CSTR	x2, "#EXTINF:%llu.%03llu,\n#EXT-X-BYTERANGE:%llu@%llu\n%s\n"
+	bl	_snprintf
+	add	x24, x24, w0, sxtw
+	b	Lhl_seg
+Lhl_end:
+	mov	x0, x24
+	ldp	x9, x10, [sp, #HM_TEXT]
+	add	x1, x9, x10
+	sub	x1, x1, x24
+	CSTR	x2, "#EXT-X-ENDLIST\n"
+	bl	_snprintf
+	ldr	x0, [sp, #HM_TEXT]
+	mov	w1, #SLOT_SOUND
+	ldr	x2, [sp, #HM_HOST]
+	mov	x3, x23
+	bl	slot_uri
+	ldr	x0, [sp, #HM_TEXT]
+	bl	_free
+	mov	x22, #1
+Lhl_free:
+	ldr	x0, [sp, #HM_BUF]
+	bl	_free
+	mov	w0, w22
+	b	Lret4
+
+; slot_uri(source, kind, host, out[256]) — serve a media URL or file path under a fresh random token; out = its URL on host.
+slot_uri:
 	FRAME	3, 96
 	mov	x19, x0
-	mov	x20, x1
-	mov	x21, x2
+	mov	w22, w1
+	mov	x20, x2
+	mov	x21, x3
 	mov	x0, sp                    ; 128 random bits, printed as 32 hex digits
 	mov	x1, #16
 	bl	_arc4random_buf
@@ -2049,8 +2606,9 @@ stream_uri:
 	mov	x1, #TOKEN_STRIDE
 	CSTR	x2, "%016llx%016llx"
 	bl	_snprintf
-	ldr	w22, [x19, #JOB_LIVE]
-	strb	w22, [sp, #(48 + TOKEN_STRIDE - 1)] ; a slot's last byte flags a live broadcast
+	cmp	w22, #SLOT_LIVE
+	cset	w9, eq
+	strb	w9, [sp, #(48 + TOKEN_STRIDE - 1)] ; a slot's last byte flags a live broadcast
 	LOCK
 	ldr	w23, [x28, #G_SLOTI]
 	add	w9, w23, #1
@@ -2065,16 +2623,32 @@ stream_uri:
 	add	x24, x28, #G_SLOTURL
 	ldr	x0, [x24, x23, lsl #3]
 	bl	_free                     ; the oldest stream is retired
-	add	x0, x19, #JOB_URL
+	mov	x0, x19
 	bl	_strdup
 	str	x0, [x24, x23, lsl #3]
 	UNLOCK
+	CSTR	x10, "m4a"                ; a name the device can tell the format from
+	CSTR	x11, "aac"
+	cmp	w22, #SLOT_LIVE
+	csel	x10, x11, x10, eq
+	CSTR	x11, "mp4"
+	cmp	w22, #SLOT_VIDEO
+	csel	x10, x11, x10, eq
+	ldrb	w9, [x19]
+	CSTR	x11, "m3u8"
+	cmp	w9, #'#'
+	csel	x10, x11, x10, eq         ; a playlist made here
+	cmp	w9, #'/'
+	b.ne	Lsl_print
+	mov	x0, x19                   ; a file keeps its own extension
+	mov	w1, #'.'
+	bl	_strrchr
+	CSTR	x10, "bin"
+	cbz	x0, Lsl_print
+	add	x10, x0, #1
+Lsl_print:
 	ldr	w9, [x28, #G_PORT]
 	stp	x20, x9, [sp]
-	CSTR	x10, "m4a"
-	CSTR	x11, "aac"
-	cmp	w22, #0
-	csel	x10, x10, x11, eq
 	add	x9, sp, #48
 	stp	x9, x10, [sp, #16]
 	mov	x0, x21
@@ -2083,13 +2657,78 @@ stream_uri:
 	bl	_snprintf
 	b	Lret3
 
-; play_upnp(job) — serve the media and play it on the device with DIDL-Lite metadata.
+; play_upnp(job) — serve the media (a web address goes as it is) and play it on the device with DIDL-Lite metadata.
 	ENTRY	play_upnp
-	FRAME	3, 48
+	FRAME	4, 64
 	mov	x19, x0
+	ldr	w25, [x19, #JOB_KIND]
+	cmp	w25, #KIND_WEB
+	b.ne	Lps_serve
+	BADDR	x0, B_MYURI
+	add	x1, x19, #JOB_URL
+	mov	x2, #MYURI_SIZE
+	bl	_strlcpy
+	CSTR	x26, "*"
+	b	Lps_track
+Lps_serve:
+	add	x0, x19, #JOB_URL
+	ldr	w1, [x19, #JOB_LIVE]
+	GADDR	x26, Ls_mp4
+	cbz	w1, Lps_tv
+	GADDR	x26, Ls_aac
+	b	Lps_kind
+Lps_tv:
+	BADDR	x9, B_CUR
+	ldrb	w20, [x9, #DEV_VIDEO]
+	tbz	w20, #1, Lps_mp4          ; a TV that plays HLS gets Beam's presentation, at full quality
+	ADDO	x9, x19, JOB_VURL
+	ldrb	w9, [x9]
+	cbz	w9, Lps_mp4
+	add	x0, x19, #JOB_URL
+	mov	w1, #SLOT_SOUND
+	BADDR	x2, B_LANIP
+	ADDO	x3, x19, JOB_LOCAL
+	bl	slot_uri
+	ADDO	x0, x19, JOB_VURL
+	mov	w1, #SLOT_VIDEO
+	BADDR	x2, B_LANIP
+	ADDO	x3, x19, JOB_VLOCAL
+	bl	slot_uri
+	mov	x0, x19
 	BADDR	x1, B_LANIP
-	BADDR	x2, B_MYURI
-	bl	stream_uri
+	bl	hls_master
+	ADDO	x1, x19, JOB_HLS
+	ldrb	w9, [x1]
+	cbz	w9, Lps_mp4
+	BADDR	x0, B_MYURI
+	mov	x2, #MYURI_SIZE
+	bl	_strlcpy
+	GADDR	x26, Ls_hls
+	b	Lps_track
+Lps_mp4:
+	add	x0, x19, #JOB_URL         ; the sound, unless a TV gets picture and sound in one MP4 (when YouTube offers it)
+	mov	w1, #SLOT_SOUND
+	tbz	w20, #0, Lps_kind
+	ADDO	x9, x19, JOB_MURL
+	ldrb	w10, [x9]
+	cbz	w10, Lps_kind
+	mov	x0, x9
+	mov	w1, #SLOT_VIDEO
+	CSTR	x26, "video/mp4"
+	b	Lps_slot
+Lps_kind:
+	cmp	w25, #KIND_FILE
+	b.ne	Lps_slot
+	ldr	x0, [x19, #JOB_QUERY]     ; a file: the proxy reads it from disk
+	bl	mime_of
+	mov	x26, x0
+	ldr	x0, [x19, #JOB_QUERY]
+	mov	w1, #SLOT_SOUND
+Lps_slot:
+	BADDR	x2, B_LANIP
+	BADDR	x3, B_MYURI
+	bl	slot_uri
+Lps_track:
 	BADDR	x0, B_MYTRACK
 	add	x1, x19, #JOB_TRACK
 	mov	x2, #T_SIZE
@@ -2105,17 +2744,22 @@ stream_uri:
 	add	x0, x19, #(JOB_TRACK + T_ART)
 	bl	xml_escape
 	mov	x22, x0
+	BADDR	x0, B_MYURI
+	bl	xml_escape
+	mov	x23, x0
 	stp	x20, x21, [sp]
-	ldr	w9, [x19, #JOB_LIVE]
-	GADDR	x10, Ls_mp4
-	GADDR	x11, Ls_aac
-	cmp	w9, #0
-	csel	x10, x10, x11, eq
-	stp	x22, x10, [sp, #16]
-	BADDR	x9, B_MYURI
-	str	x9, [sp, #32]
-	add	x0, sp, #40
-	CSTR	x1, "<DIDL-Lite xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" xmlns:r=\"urn:schemas-rinconnetworks-com:metadata-1-0/\" xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\"><item id=\"-1\" parentID=\"-1\" restricted=\"true\"><dc:title>%s</dc:title><dc:creator>%s</dc:creator><upnp:albumArtURI>%s</upnp:albumArtURI><upnp:class>object.item.audioItem.musicTrack</upnp:class><res protocolInfo=\"http-get:*:%s:*\">%s</res></item></DIDL-Lite>"
+	str	x22, [sp, #16]
+	CSTR	x9, "audio"               ; a picture plays as a video item (TVs)
+	CSTR	x10, "video"
+	ldrb	w11, [x26]
+	cmp	w11, #'v'
+	GADDR	x11, Ls_hls
+	ccmp	x26, x11, #4, ne
+	csel	x9, x10, x9, eq
+	stp	x9, x26, [sp, #24]
+	str	x23, [sp, #40]
+	add	x0, sp, #48
+	CSTR	x1, "<DIDL-Lite xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" xmlns:r=\"urn:schemas-rinconnetworks-com:metadata-1-0/\" xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\"><item id=\"-1\" parentID=\"-1\" restricted=\"true\"><dc:title>%s</dc:title><dc:creator>%s</dc:creator><upnp:albumArtURI>%s</upnp:albumArtURI><upnp:class>object.item.%sItem</upnp:class><res protocolInfo=\"http-get:*:%s:*\">%s</res></item></DIDL-Lite>"
 	bl	_asprintf
 	mov	x0, x20
 	bl	_free
@@ -2124,7 +2768,7 @@ stream_uri:
 	mov	x0, x22
 	bl	_free
 	mov	w22, #PLAY_REJECTED
-	ldr	x20, [sp, #40]
+	ldr	x20, [sp, #48]
 	cbz	x20, Lps_done
 	mov	x0, x20
 	bl	xml_escape                ; the DIDL travels as text inside SOAP
@@ -2132,14 +2776,13 @@ stream_uri:
 	mov	x0, x20
 	bl	_free
 	cbz	x21, Lps_done
-	BADDR	x9, B_MYURI
-	stp	x9, x21, [sp]
-	add	x0, sp, #40
+	stp	x23, x21, [sp]
+	add	x0, sp, #48
 	CSTR	x1, "<CurrentURI>%s</CurrentURI><CurrentURIMetaData>%s</CurrentURIMetaData>"
 	bl	_asprintf
 	mov	x0, x21
 	bl	_free
-	ldr	x20, [sp, #40]
+	ldr	x20, [sp, #48]
 	cbz	x20, Lps_done
 	CSTR	x0, "SetAVTransportURI"
 	mov	x1, x20
@@ -2153,9 +2796,11 @@ stream_uri:
 	bl	avcmd
 	mov	w22, #PLAY_OK
 Lps_done:
+	mov	x0, x23
+	bl	_free
 	str	w22, [x19, #JOB_RESULT]
 	bl	poll_now                  ; show the new track right away
-	b	Lret3
+	b	Lret4
 
 ; ---- Audio proxy: streams the media to the speaker ----
 
@@ -2237,7 +2882,7 @@ proxy_reply:
 	ldr	w11, [x19, #PX_RANGED]
 	cbnz	w11, Lpy_partial
 	stp	x9, x10, [sp]
-	CSTR	x2, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lld\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+	GADDR	x2, Ls_200
 	b	Lpy_print
 Lpy_partial:
 	ldp	x11, x12, [x19, #PX_POS]
@@ -2246,7 +2891,7 @@ Lpy_partial:
 	stp	x9, x13, [sp]
 	stp	x11, x12, [sp, #16]
 	str	x10, [sp, #32]
-	CSTR	x2, "HTTP/1.1 206 Partial Content\r\nContent-Type: %s\r\nContent-Length: %lld\r\nContent-Range: bytes %lld-%lld/%lld\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+	GADDR	x2, Ls_206
 Lpy_print:
 	add	x0, sp, #PR_HEAD
 	mov	x1, #512
@@ -2302,19 +2947,22 @@ Lpb_stop:
 	mov	x0, #0
 	b	Lret2
 
-; vod_stream(fd, url, range, head) — proxy a media file in chunks the CDN serves at full speed, honoring the speaker's range.
+; vod_stream(fd, url, range, head, slot) — proxy a media file in chunks the CDN serves at full speed, honoring the speaker's range; the slot then keeps the address the CDN redirected to, so later requests go straight there.
 	.equ VS_PX,	16                ; proxy state
 	.equ VS_RANGE,	VS_PX + PX_SIZE   ; char[32], upstream range
 	.equ VS_A,	VS_RANGE + 32     ; the speaker's first byte
 	.equ VS_B,	VS_A + 8          ; and last byte
-	.equ VS_SIZE,	VS_B + 8
+	.equ VS_SLOT,	VS_B + 8          ; char **, the slot's URL
+	.equ VS_EFF,	VS_SLOT + 8       ; char *, where the CDN sent us
+	.equ VS_SIZE,	VS_EFF + 8
 vod_stream:
 	FRAME	4, VS_SIZE
 	mov	w20, w0
 	mov	x21, x1
 	mov	x22, x2
 	mov	w24, w3
-	bl	_curl_easy_init
+	str	x4, [sp, #VS_SLOT]
+	bl	curl_new
 	mov	x19, x0
 	cbz	x0, Lret4                 ; out of memory: the speaker sees the connection close
 	add	x25, sp, #VS_PX
@@ -2326,22 +2974,11 @@ vod_stream:
 	str	x19, [x25, #PX_CURL]
 	mov	x9, #0x7fffffffffffffff
 	str	x9, [x25, #PX_END]        ; open-ended until the first answer gives the size
-	ldrb	w9, [x22]
-	cbz	w9, Lvs_setup             ; no Range: the whole file from byte 0
 	mov	x0, x22
-	CSTR	x1, "bytes="
-	bl	_strcasestr
-	add	x9, x22, #6
-	cmp	x0, x22
-	csel	x22, x9, x22, eq          ; "bytes=a-b", or a bare "a-b"
-	add	x9, sp, #VS_A
-	add	x10, sp, #VS_B
-	stp	x9, x10, [sp]
-	mov	x0, x22
-	GADDR	x1, Ls_range
-	bl	_sscanf
+	add	x1, sp, #VS_A
+	bl	range_of
 	cmp	w0, #1
-	b.lt	Lvs_setup                 ; unreadable: send it all
+	b.lt	Lvs_setup                 ; none or unreadable: the whole file from byte 0
 	mov	w9, #1
 	str	w9, [x25, #PX_RANGED]
 	ldr	x9, [sp, #VS_A]
@@ -2352,6 +2989,10 @@ vod_stream:
 	str	x10, [x25, #PX_END]
 Lvs_suffix:
 	tbz	x9, #63, Lvs_setup
+	mov	x0, x22
+	mov	w1, #'-'
+	bl	_strchr
+	mov	x22, x0                   ; "-n", as libcurl takes it
 	mov	x0, x21                   ; the CDN refuses suffixes: count back from the size in the URL
 	CSTR	x1, "clen="
 	bl	_strstr
@@ -2411,6 +3052,44 @@ Lvs_range:
 	bl	_curl_easy_perform
 	ldr	w9, [x25, #PX_SENT]
 	cbz	w9, Lvs_refused
+	ldr	x9, [sp, #VS_SLOT]        ; the first good answer: keep the CDN's final address in the slot
+	cbz	x9, Lvs_known
+	str	xzr, [sp, #VS_EFF]
+	add	x9, sp, #VS_EFF
+	str	x9, [sp]
+	mov	x0, x19
+	mov	w1, #(CURLINFO_EFFECTIVE_URL & 0xffff)
+	movk	w1, #(CURLINFO_EFFECTIVE_URL >> 16), lsl #16
+	bl	_curl_easy_getinfo
+	ldr	x0, [sp, #VS_EFF]
+	cbz	x0, Lvs_once
+	mov	x1, x21
+	bl	_strcmp
+	cbz	w0, Lvs_once              ; not redirected
+	ldr	x0, [sp, #VS_EFF]
+	bl	_strdup
+	str	x0, [sp, #VS_EFF]
+	LOCK
+	ldr	x9, [sp, #VS_SLOT]
+	ldr	x0, [x9]
+	cbz	x0, Lvs_moved
+	mov	x1, x21
+	bl	_strcmp
+	cbnz	w0, Lvs_moved             ; the slot serves another stream now
+	ldr	x9, [sp, #VS_SLOT]
+	ldr	x0, [x9]
+	bl	_free
+	ldr	x9, [sp, #VS_SLOT]
+	ldr	x10, [sp, #VS_EFF]
+	str	x10, [x9]
+	str	xzr, [sp, #VS_EFF]
+Lvs_moved:
+	UNLOCK
+	ldr	x0, [sp, #VS_EFF]
+	bl	_free
+Lvs_once:
+	str	xzr, [sp, #VS_SLOT]
+Lvs_known:
 	ldr	w9, [x25, #PX_BROKEN]
 	orr	w9, w9, w24
 	cbnz	w9, Lvs_done
@@ -2434,6 +3113,192 @@ Lvs_reply:
 Lvs_done:
 	mov	x0, x19
 	bl	_curl_easy_cleanup
+	b	Lret4
+
+; range_of(header, out[2]) -> how many of first and last byte a Range value gives ("bytes=a-b", "a-", "-n", or a bare "a-b"); a suffix reads as a negative first byte.
+range_of:
+	FRAME	1, 16
+	mov	x19, x1
+	mov	x20, x0
+	ldrb	w9, [x0]
+	cbz	w9, Lro_none
+	CSTR	x1, "bytes="
+	bl	_strcasestr
+	add	x9, x20, #6
+	cmp	x0, x20
+	csel	x0, x9, x20, eq
+	add	x9, x19, #8
+	stp	x19, x9, [sp]
+	GADDR	x1, Ls_range
+	bl	_sscanf
+	cmp	w0, #0
+	csel	w0, w0, wzr, gt           ; EOF reads as none
+	b	Lret1
+Lro_none:
+	mov	w0, #0
+	b	Lret1
+
+; mime_of(path) -> the media type of a file name's extension.
+	.pushsection __DATA,__data
+Lmimes:	                                  ; extension, then its type
+	.asciz	"mp3", "audio/mpeg"
+	.asciz	"m4a", "audio/mp4"
+	.asciz	"m4b", "audio/mp4"
+	.asciz	"aac", "audio/aac"
+	.asciz	"flac", "audio/flac"
+	.asciz	"wav", "audio/wav"
+	.asciz	"aif", "audio/aiff"
+	.asciz	"aiff", "audio/aiff"
+	.asciz	"ogg", "audio/ogg"
+	.asciz	"opus", "audio/ogg"
+	.asciz	"mp4", "video/mp4"
+	.asciz	"m4v", "video/mp4"
+	.asciz	"mov", "video/quicktime"
+	.byte	0
+	.popsection
+mime_of:
+	FRAME	2
+	mov	w1, #'.'
+	bl	_strrchr
+	cbz	x0, Lmo_none
+	add	x19, x0, #1
+	GADDR	x20, Lmimes
+Lmo_next:
+	ldrb	w9, [x20]
+	cbz	w9, Lmo_none
+	mov	x0, x19
+	mov	x1, x20
+	bl	_strcasecmp
+	mov	w21, w0
+	mov	x0, x20
+	bl	nextstr
+	cbz	w21, Lret2                ; its type
+	bl	nextstr
+	mov	x20, x0
+	b	Lmo_next
+Lmo_none:
+	CSTR	x0, "application/octet-stream"
+	b	Lret2
+
+; text_stream(fd, text, head) — a playlist made here.
+text_stream:
+	FRAME	2, 160
+	mov	w19, w0
+	mov	x20, x1
+	mov	w21, w2
+	mov	x0, x20
+	bl	_strlen
+	mov	x22, x0
+	str	x0, [sp]
+	add	x0, sp, #16
+	mov	x1, #144
+	CSTR	x2, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: %zu\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+	bl	_snprintf
+	mov	w2, w0
+	mov	w0, w19
+	add	x1, sp, #16
+	bl	send_all
+	cbz	w0, Lret2
+	cbnz	w21, Lret2                ; HEAD
+	mov	w0, w19
+	mov	x1, x20
+	mov	x2, x22
+	bl	send_all
+	b	Lret2
+
+; file_stream(fd, path, range, head) — serve a file on this Mac, honoring the speaker's range, straight from disk to the socket.
+	.equ FS_AB,	48                ; first and last byte asked; then sendfile's count (after snprintf's five arguments)
+	.equ FS_HEAD,	64                ; char[512]
+	.equ FS_SIZE,	FS_HEAD + 512
+file_stream:
+	FRAME	4, FS_SIZE
+	mov	w19, w0
+	mov	x20, x1
+	mov	x21, x2
+	mov	w22, w3
+	mov	x0, x20
+	mov	w1, #0                    ; O_RDONLY
+	bl	_open
+	mov	w23, w0
+	tbnz	w0, #31, Lfs_gone
+	mov	x1, #0
+	mov	w2, #2                    ; SEEK_END: the size
+	bl	_lseek
+	mov	x24, x0
+	mov	x0, x21
+	add	x1, sp, #FS_AB
+	bl	range_of
+	mov	w25, w0                   ; asked for a range
+	mov	x26, #0                   ; first byte
+	sub	x21, x24, #1              ; last byte
+	cbz	w25, Lfs_span
+	ldp	x9, x10, [sp, #FS_AB]
+	mov	x26, x9
+	tbz	x9, #63, Lfs_last
+	adds	x26, x24, x9              ; a suffix: the last n bytes
+	csel	x26, x26, xzr, gt
+	b	Lfs_span
+Lfs_last:
+	cmp	w25, #2
+	b.ne	Lfs_span
+	cmp	x10, x21
+	csel	x21, x10, x21, lt
+Lfs_span:
+	cmp	x26, x21
+	b.gt	Lfs_416                   ; past the end (or an empty file)
+	mov	x0, x20
+	bl	mime_of
+	sub	x9, x21, x26
+	add	x9, x9, #1                ; bytes to send
+	stp	x0, x9, [sp]
+	GADDR	x2, Ls_200
+	cbz	w25, Lfs_print
+	stp	x26, x21, [sp, #16]
+	str	x24, [sp, #32]
+	GADDR	x2, Ls_206
+Lfs_print:
+	add	x0, sp, #FS_HEAD
+	mov	x1, #512
+	bl	_snprintf
+	cmp	w0, #512
+	b.hs	Lfs_close
+	mov	w2, w0
+	mov	w0, w19
+	add	x1, sp, #FS_HEAD
+	bl	send_all
+	cbz	w0, Lfs_close
+	cbnz	w22, Lfs_close            ; HEAD: the response head was all it wanted
+Lfs_send:
+	sub	x9, x21, x26
+	add	x9, x9, #1
+	str	x9, [sp, #FS_AB]          ; in: how many, out: how many went
+	mov	w0, w23
+	mov	w1, w19
+	mov	x2, x26
+	add	x3, sp, #FS_AB
+	mov	x4, #0
+	mov	w5, #0
+	bl	_sendfile
+	ldr	x9, [sp, #FS_AB]
+	add	x26, x26, x9
+	cmp	x26, x21
+	b.gt	Lfs_close                 ; all sent
+	cbnz	x9, Lfs_send              ; part of it: the rest
+	b	Lfs_close                 ; none: the speaker went away
+Lfs_416:
+	mov	w0, w19
+	CSTR	x1, "416 Range Not Satisfiable"
+	GADDR	x2, Ls_slash+1
+	bl	respond
+Lfs_close:
+	mov	w0, w23
+	bl	_close
+	b	Lret4
+Lfs_gone:
+	mov	w0, w19
+	GADDR	x1, Ls_404
+	CSTR	x2, "file not found"
+	bl	respond
 	b	Lret4
 
 ; box_find(p, end, type) — x0 = the payload of the first box of that type in [p, end), x1 = its end; x0 = 0 if none.
@@ -2673,7 +3538,7 @@ live_stream:
 	bl	send_all
 	cbz	w0, Lret4
 	cbnz	w22, Lret4                ; HEAD: the response head was all it wanted
-	bl	_curl_easy_init
+	bl	curl_new
 	mov	x19, x0
 	cbz	x0, Lret4
 	mov	x23, #0                   ; segment number, 0 until the newest one is known
@@ -2821,7 +3686,20 @@ Lhc_unlock:
 	mov	x1, x23
 	add	x2, sp, #H_RANGE
 	cbnz	w25, Lhc_live
+	ldrb	w9, [x23]
+	cmp	w9, #'/'
+	b.eq	Lhc_file
+	cmp	w9, #'#'
+	b.eq	Lhc_text
+	mov	x4, x24                   ; its slot, to learn the CDN's redirect
 	bl	vod_stream
+	b	Lhc_free
+Lhc_file:
+	bl	file_stream
+	b	Lhc_free
+Lhc_text:
+	mov	w2, w3
+	bl	text_stream
 	b	Lhc_free
 Lhc_live:
 	bl	live_stream
@@ -3103,6 +3981,278 @@ Lhs_end:
 	add	x1, x20, #1
 	b	Lret2
 
+; resolve_file(job) -> PLAY_OK: a file on this Mac, by path or file URL; its name is the title.
+resolve_file:
+	FRAME	2
+	mov	x19, x0
+	mov	w9, #KIND_FILE
+	str	w9, [x19, #JOB_KIND]
+	ldr	x20, [x19, #JOB_QUERY]
+	ldrb	w9, [x20]
+	cmp	w9, #'/'
+	b.eq	Lrf_path
+	mov	x0, x20                   ; a file URL: its path becomes the query
+	bl	mkurl
+	SEND	S_path
+	SEND	S_UTF8String
+	cbz	x0, Lrf_path
+	bl	_strdup
+	cbz	x0, Lrf_path
+	mov	x21, x0
+	mov	x0, x20
+	bl	_free
+	str	x21, [x19, #JOB_QUERY]
+	mov	x20, x21
+Lrf_path:
+	mov	x0, x20
+	bl	mkstr
+	mov	x2, x0
+	CLASS	x0, NSURL
+	SEND	S_fileURLWithPath_
+	mov	x21, x0
+	SEND	S_absoluteString
+	SEND	S_UTF8String
+	mov	x1, x0
+	add	x0, x19, #JOB_URL
+	mov	x2, #4096
+	bl	_strlcpy
+	mov	x0, x21
+	mov	x1, x19
+	bl	url_title
+	b	Lret2
+
+; Video sites: the link markers (the id follows, up to '_', '?', '/', '#' or '&'; an empty string ends them), the address of the player's metadata, then five pairs of JSON keys (a key, then one inside it, or "") for the HLS stream, title, author, artwork and length; an empty marker list ends the table.
+	.pushsection __DATA,__data
+Lsites:
+	.asciz	"dailymotion.com/video/", "dai.ly/", ""
+	.asciz	"https://www.dailymotion.com/player/metadata/video/%s"
+	.asciz	"\"auto\":", "\"url\":"
+	.asciz	"\"title\":", ""
+	.asciz	"\"screenname\":", ""
+	.asciz	"\"thumbnails\":", "\"1080\":"
+	.asciz	"\"duration\":", ""
+	.byte	0
+	.popsection
+
+; site_value(json, keys) — x0 = the value a pair of keys finds (or NULL), x1 = the next pair.
+site_value:
+	FRAME	2
+	mov	x19, x1
+	bl	jfind
+	mov	x20, x0
+	mov	x0, x19
+	bl	nextstr
+	mov	x21, x0                   ; the inner key
+	bl	nextstr
+	mov	x22, x0
+	ldrb	w9, [x21]
+	cbz	w9, Lsv_one
+	mov	x0, x20
+	mov	x1, x21
+	bl	jfind
+	mov	x20, x0
+Lsv_one:
+	mov	x0, x20
+	mov	x1, x22
+	b	Lret2
+
+; resolve_site(job) -> PLAY_OK or PLAY_FAILED for a video on a site in Lsites (its HLS stream played as it is), -1 for any other address.
+	.equ SR_ID,	16                ; char[48]
+	.equ SR_URL,	64                ; char[256], the metadata's address
+	.equ SR_BUF,	320               ; {data, len}
+	.equ SR_SIZE,	336
+resolve_site:
+	FRAME	4, SR_SIZE
+	mov	x25, x0
+	ldr	x26, [x25, #JOB_QUERY]
+	ADDR	x20, Lsites
+Lsi_site:
+	ldrb	w9, [x20]
+	cbz	w9, Lsi_none              ; the end of the table
+Lsi_mark:
+	ldrb	w9, [x20]
+	cbz	w9, Lsi_skip
+	mov	x0, x26
+	mov	x1, x20
+	bl	_strstr
+	mov	x22, x0
+	mov	x0, x20
+	bl	_strlen
+	add	x23, x22, x0              ; where the id starts
+	mov	x0, x20
+	bl	nextstr
+	mov	x20, x0
+	cbz	x22, Lsi_mark
+Lsi_fields:
+	ldrb	w9, [x20]                 ; past the other markers
+	cbz	w9, Lsi_id
+	mov	x0, x20
+	bl	nextstr
+	mov	x20, x0
+	b	Lsi_fields
+Lsi_skip:
+	add	x20, x20, #1              ; no marker matched: the next site, past this one's 11 strings
+	mov	w22, #11
+Lsi_skip1:
+	mov	x0, x20
+	bl	nextstr
+	mov	x20, x0
+	subs	w22, w22, #1
+	b.ne	Lsi_skip1
+	b	Lsi_site
+Lsi_id:
+	add	x20, x20, #1
+	mov	x0, x23
+	CSTR	x1, "_?/#&"
+	bl	_strcspn
+	mov	w21, #PLAY_FAILED
+	cbz	x0, Lsi_bad
+	cmp	x0, #40
+	b.hs	Lsi_bad
+	add	x2, x0, #1
+	add	x0, sp, #SR_ID
+	mov	x1, x23
+	bl	_strlcpy
+	add	x9, sp, #SR_ID
+	str	x9, [sp]
+	add	x0, sp, #SR_URL
+	mov	x1, #256
+	mov	x2, x20
+	bl	_snprintf
+	mov	x0, x20
+	bl	nextstr
+	mov	x20, x0                   ; the key pairs
+	bl	curl_new
+	mov	x19, x0
+	cbz	x0, Lsi_bad
+	ADDR	x2, Lclients + 2          ; Safari's User-Agent
+	mov	w1, #CURLOPT_USERAGENT
+	bl	copt
+	GADDR	x2, Ls_slash+1            ; every encoding curl decodes
+	mov	w1, #CURLOPT_ACCEPT_ENCODING
+	bl	copt
+	add	x0, sp, #SR_URL
+	mov	x1, #0
+	mov	x2, #0
+	add	x3, sp, #SR_BUF
+	mov	x4, #API_TIMEOUT_MS
+	bl	http
+	mov	w22, w0
+	mov	x0, x19
+	bl	_curl_easy_cleanup
+	cbz	w22, Lsi_bad
+	ldr	x0, [sp, #SR_BUF]         ; the stream
+	mov	x1, x20
+	bl	site_value
+	mov	x20, x1
+	add	x1, x25, #JOB_URL
+	mov	x2, #4096
+	bl	jstr
+	ldr	x0, [sp, #SR_BUF]         ; title, author, artwork
+	mov	x1, x20
+	bl	site_value
+	mov	x20, x1
+	add	x1, x25, #(JOB_TRACK + T_TITLE)
+	mov	x2, #512
+	bl	jstr
+	ldr	x0, [sp, #SR_BUF]
+	mov	x1, x20
+	bl	site_value
+	mov	x20, x1
+	add	x1, x25, #(JOB_TRACK + T_ARTIST)
+	mov	x2, #256
+	bl	jstr
+	ldr	x0, [sp, #SR_BUF]
+	mov	x1, x20
+	bl	site_value
+	mov	x20, x1
+	add	x1, x25, #(JOB_TRACK + T_ART)
+	mov	x2, #2048
+	bl	jstr
+	ldr	x0, [sp, #SR_BUF]         ; length
+	mov	x1, x20
+	bl	site_value
+	cbz	x0, Lsi_free
+	mov	x1, #0
+	mov	w2, #10
+	bl	_strtol
+	str	x0, [x25, #JOB_DUR]
+Lsi_free:
+	ldr	x0, [sp, #SR_BUF]
+	bl	_free
+	mov	w9, #KIND_WEB
+	str	w9, [x25, #JOB_KIND]
+	ldrb	w9, [x25, #JOB_URL]
+	mov	w21, #PLAY_OK
+	cbnz	w9, Lsi_done
+Lsi_bad:
+	mov	w21, #PLAY_FAILED
+	CSTR	x9, "this video cannot be played here"
+	str	x9, [x25, #JOB_ERR]
+Lsi_done:
+	mov	w0, w21
+	b	Lret4
+Lsi_none:
+	mov	w0, #-1
+	b	Lret4
+
+; resolve_web(job) -> PLAY_OK for any other web address (https when it has no scheme), played as it is; PLAY_FAILED if it is not one.
+resolve_web:
+	FRAME	2, 16
+	mov	x19, x0
+	mov	w9, #KIND_WEB
+	str	w9, [x19, #JOB_KIND]
+	ldr	x20, [x19, #JOB_QUERY]
+	mov	x0, x20
+	GADDR	x1, Ls_sep
+	bl	_strstr
+	CSTR	x9, "https://"
+	GADDR	x10, Ls_slash+1
+	cmp	x0, #0
+	csel	x9, x10, x9, ne
+	stp	x9, x20, [sp]
+	add	x0, x19, #JOB_URL
+	mov	x1, #4096
+	CSTR	x2, "%s%s"
+	bl	_snprintf
+	add	x0, x19, #JOB_URL
+	bl	mkurl
+	cbz	x0, Lrw_bad
+	mov	x20, x0
+	SEND	S_host                    ; the site, where an artist would be
+	SEND	S_UTF8String
+	cbz	x0, Lrw_title
+	mov	x1, x0
+	add	x0, x19, #(JOB_TRACK + T_ARTIST)
+	mov	x2, #256
+	bl	_strlcpy
+Lrw_title:
+	mov	x0, x20
+	mov	x1, x19
+	bl	url_title
+	b	Lret2
+Lrw_bad:
+	CSTR	x9, "this is not a web address"
+	str	x9, [x19, #JOB_ERR]
+	mov	w0, #PLAY_FAILED
+	b	Lret2
+
+; url_title(url, job) -> PLAY_OK, with the URL's last path component, without its extension, as the job's title.
+url_title:
+	FRAME	1
+	mov	x19, x1
+	SEND	S_URLByDeletingPathExtension
+	SEND	S_lastPathComponent
+	SEND	S_UTF8String
+	cbz	x0, Lut_ok
+	mov	x1, x0
+	add	x0, x19, #(JOB_TRACK + T_TITLE)
+	mov	x2, #512
+	bl	_strlcpy
+Lut_ok:
+	mov	w0, #PLAY_OK
+	b	Lret1
+
 ; resolve's frame, which api fills.
 	.equ RS_BUF,	16                ; {data, len}
 	.equ RS_VIS,	32                ; char[288], the visitorData member, or ""
@@ -3181,14 +4331,85 @@ within:
 	csel	x0, x0, xzr, lo
 	ret
 
+; jnum(json, key) -> the number after key, quoted or not (0 if absent).
+jnum:
+	FRAME	0
+	bl	jfind
+	cbz	x0, Lret0
+	ldrb	w9, [x0]
+	cmp	w9, #'"'
+	cinc	x0, x0, eq
+	mov	x1, #0
+	mov	w2, #10
+	bl	_strtol
+	b	Lret0
+
+; fmt_info(start, end, fmt) — a format's init and index byte ranges, bitrate and codecs, from its JSON [start, end).
+	.pushsection __DATA,__data
+Lk_start:	.asciz	"\"start\":"
+Lk_end:	.asciz	"\"end\":"
+	.popsection
+fmt_info:
+	FRAME	4
+	mov	x21, x0
+	mov	x25, x1
+	mov	x19, x2
+	CSTR	x0, "\"initRange\":"
+	bl	within
+	cbz	x0, Lfi_rate
+	GADDR	x1, Lk_end
+	bl	jnum
+	str	x0, [x19, #FMT_INIT]
+	CSTR	x0, "\"indexRange\":"
+	bl	within
+	cbz	x0, Lfi_rate
+	mov	x20, x0
+	GADDR	x1, Lk_start
+	bl	jnum
+	str	x0, [x19, #FMT_IDX0]
+	mov	x0, x20
+	GADDR	x1, Lk_end
+	bl	jnum
+	str	x0, [x19, #FMT_IDX1]
+Lfi_rate:
+	CSTR	x0, "\"bitrate\":"
+	bl	within
+	cbz	x0, Lfi_codecs
+	add	x0, x0, #10
+	mov	x1, #0
+	mov	w2, #10
+	bl	_strtol
+	str	x0, [x19, #FMT_RATE]
+Lfi_codecs:
+	CSTR	x0, "codecs=\\\""            ; in the JSON text: codecs=\"...\"
+	bl	within
+	cbz	x0, Lret4
+	add	x20, x0, #9
+	mov	x0, x20
+	mov	w1, #92                   ; backslash
+	bl	_strchr
+	cbz	x0, Lret4
+	sub	x2, x0, x20
+	cmp	x2, #63
+	b.hs	Lret4
+	add	x0, x19, #FMT_CODECS
+	mov	x1, x20
+	add	x2, x2, #1
+	bl	_strlcpy
+	b	Lret4
+
 ; parse_player(job, response) — the best AAC stream, then title, channel, length and live flag; w0 = 1 if there is a stream.
 	.pushsection __DATA,__data
 Lk_itag:	.asciz	"\"itag\":"
 	.popsection
 parse_player:
-	FRAME	4
+	FRAME	4, 64                     ; the best picture's "url" value and score, its JSON span, the sound's span, then the best muxed stream
 	mov	x19, x0
 	mov	x20, x1
+	stp	xzr, xzr, [sp]
+	stp	xzr, xzr, [sp, #16]
+	stp	xzr, xzr, [sp, #32]
+	stp	xzr, xzr, [sp, #48]
 	mov	x0, x1
 	CSTR	x1, "\"streamingData\":"
 	bl	_strstr
@@ -3222,7 +4443,23 @@ Lpp_one:
 	add	x26, x0, #6
 	CSTR	x0, "mp4a"
 	bl	within
-	cbz	x0, Lpp_fmt               ; not AAC: not every speaker plays it
+	cbz	x0, Lpp_video             ; not AAC: not every speaker plays it
+	CSTR	x0, "\"video/mp4"
+	bl	within
+	cbz	x0, Lpp_sound
+	CSTR	x0, "\"height\":"         ; picture and sound in one: the tallest, for TVs
+	bl	within
+	cbz	x0, Lpp_fmt
+	add	x0, x0, #9
+	mov	x1, #0
+	mov	w2, #10
+	bl	_strtol
+	ldr	x9, [sp, #56]
+	cmp	x0, x9
+	b.le	Lpp_fmt
+	stp	x26, x0, [sp, #48]
+	b	Lpp_fmt
+Lpp_sound:
 	cmp	x24, #140                 ; score: itag 140 4, audio only 2, no loudness compression 1
 	cset	w24, eq
 	lsl	w24, w24, #2
@@ -3240,8 +4477,72 @@ Lpp_score:
 	b.le	Lpp_fmt
 	mov	w23, w24
 	mov	x22, x26
+	stp	x21, x25, [sp, #32]
+	b	Lpp_fmt
+Lpp_video:
+	CSTR	x0, "\"video/mp4"         ; a picture: MP4, SDR, H.264 (or AV1 where it decodes in hardware)
+	bl	within
+	cbz	x0, Lpp_fmt
+	CSTR	x0, "HDR"
+	bl	within
+	cbnz	x0, Lpp_fmt
+	mov	x24, #0
+	CSTR	x0, "avc1"
+	bl	within
+	cbnz	x0, Lpp_height
+	ldr	w9, [x28, #G_AV1]
+	ldr	w10, [x28, #G_TV]
+	bic	w9, w9, w10               ; (any TV flag clears it)
+	cbz	w9, Lpp_fmt
+	CSTR	x0, "av01"
+	bl	within
+	cbz	x0, Lpp_fmt
+	mov	x24, #1                   ; AV1: the same picture in fewer bytes
+Lpp_height:
+	CSTR	x0, "\"height\":"
+	bl	within
+	cbz	x0, Lpp_fmt
+	add	x0, x0, #9
+	mov	x1, #0
+	mov	w2, #10
+	bl	_strtol
+	cmp	x0, #VIDEO_MAX_H
+	b.gt	Lpp_fmt
+	add	x24, x24, x0, lsl #2      ; score: height, then 60 fps, then the codec
+	CSTR	x0, "\"fps\":"
+	bl	within
+	cbz	x0, Lpp_vscore
+	add	x0, x0, #6
+	mov	x1, #0
+	mov	w2, #10
+	bl	_strtol
+	cmp	x0, #30
+	cset	x9, gt
+	add	x24, x24, x9, lsl #1
+Lpp_vscore:
+	ldr	x9, [sp, #8]
+	cmp	x24, x9
+	b.le	Lpp_fmt
+	stp	x26, x24, [sp]
+	stp	x21, x25, [sp, #16]
 	b	Lpp_fmt
 Lpp_picked:
+	ldp	x0, x1, [sp, #32]
+	add	x2, x19, #JOB_AFMT
+	cbz	x0, 1f
+	bl	fmt_info
+1:	ldp	x0, x1, [sp, #16]
+	add	x2, x19, #JOB_VFMT
+	cbz	x0, 1f
+	bl	fmt_info
+1:	ldr	x0, [sp]
+	ADDO	x1, x19, JOB_VURL
+	mov	x2, #4096
+	bl	jstr
+	ldr	x0, [sp, #48]
+	ADDO	x1, x19, JOB_MURL
+	mov	x2, #4096
+	bl	jstr
 	mov	x0, x22
 	add	x1, x19, #JOB_URL
 	mov	x2, #4096
@@ -3263,6 +4564,38 @@ Lpp_picked:
 	add	x1, x19, #(JOB_TRACK + T_ARTIST)
 	mov	x2, #256
 	bl	jstr
+	mov	x0, x20                   ; artwork: the largest JPEG thumbnail YouTube lists (they grow along the list)
+	CSTR	x1, "\"thumbnails\":["
+	bl	jfind
+	cbz	x0, Lpp_thumbed
+	mov	x21, x0
+	mov	w1, #']'
+	bl	_strchr
+	cbz	x0, Lpp_thumbed
+	mov	x25, x0
+	mov	x22, #0
+Lpp_thumb:
+	mov	x0, x21
+	CSTR	x1, "\"url\":"
+	bl	_strstr
+	cbz	x0, Lpp_tpick
+	cmp	x0, x25
+	b.hs	Lpp_tpick
+	add	x21, x0, #1
+	add	x24, x0, #6
+	add	x0, x0, #27               ; past "url":"https://i.ytimg.com/
+	CSTR	x1, "vi_webp"
+	mov	x2, #7
+	bl	_strncmp
+	cbz	w0, Lpp_thumb             ; WebP: not every speaker shows it
+	mov	x22, x24
+	b	Lpp_thumb
+Lpp_tpick:
+	mov	x0, x22
+	add	x1, x19, #(JOB_TRACK + T_ART)
+	mov	x2, #2048
+	bl	jstr
+Lpp_thumbed:
 	mov	x0, x20
 	CSTR	x1, "\"lengthSeconds\":\""
 	bl	jfind
@@ -3280,6 +4613,12 @@ Lpp_live:
 	str	w9, [x19, #JOB_LIVE]
 	cbz	w9, Lpp_yes
 	str	xzr, [x19, #JOB_DUR]      ; a live broadcast has no length
+	mov	x0, x20                   ; its picture: YouTube's own HLS, when offered
+	CSTR	x1, "\"hlsManifestUrl\":"
+	bl	jfind
+	ADDO	x1, x19, JOB_VURL
+	mov	x2, #4096
+	bl	jstr
 Lpp_yes:
 	mov	w0, #1
 	b	Lret4
@@ -3299,8 +4638,38 @@ resolve:
 	mov	x20, x0
 	bl	_objc_autoreleasePoolPush
 	mov	x26, x0
+	ldr	x22, [x20, #JOB_QUERY]    ; a file or another site needs no lookup
+	ldrb	w9, [x22]
+	cmp	w9, #'/'
+	b.eq	Lrs_file
+	mov	x0, x22
+	CSTR	x1, "file://"
+	mov	x2, #7
+	bl	_strncmp
+	cbz	w0, Lrs_file
+	mov	x0, x22
+	bl	is_link
+	cbz	w0, Lrs_tube              ; search words
+	mov	x0, x22
+	CSTR	x1, "youtu"
+	bl	_strstr
+	cbnz	x0, Lrs_tube
+	mov	x0, x20                   ; a site Beam knows, else the address as it is
+	bl	resolve_site
+	cmn	w0, #1
+	b.ne	Lrs_named
+	mov	x0, x20
+	bl	resolve_web
+	b	Lrs_named
+Lrs_file:
+	mov	x0, x20
+	bl	resolve_file
+Lrs_named:
+	mov	w21, w0
+	b	Lrs_pool
+Lrs_tube:
 	mov	w21, #PLAY_FAILED
-	bl	_curl_easy_init
+	bl	curl_new
 	mov	x19, x0
 	cbz	x0, Lrs_pool
 	mov	x2, #CURL_HTTP_VERSION_1_1
@@ -3312,7 +4681,12 @@ resolve:
 	mov	x2, #API_CONNECT_MS
 	mov	w1, #CURLOPT_CONNECTTIMEOUT_MS
 	bl	copt
-	strb	wzr, [sp, #RS_VIS]        ; a visitorData first, as the WEB client
+	add	x0, sp, #RS_VIS           ; a visitorData first, as the WEB client, once per launch
+	BADDR	x1, B_VISITOR
+	mov	x2, #288
+	bl	_strlcpy
+	ldrb	w9, [sp, #RS_VIS]
+	cbnz	w9, Lrs_id
 	ADDR	x0, Lep_guide
 	ADDR	x1, Lc_web
 	CSTR	x2, "}"
@@ -3332,6 +4706,10 @@ resolve:
 	mov	x1, #288
 	CSTR	x2, ",\"visitorData\":\"%.*s\""
 	bl	_snprintf
+	BADDR	x0, B_VISITOR
+	add	x1, sp, #RS_VIS
+	mov	x2, #288
+	bl	_strlcpy
 Lrs_vfree:
 	ldr	x0, [sp, #RS_BUF]
 	bl	_free
@@ -3414,11 +4792,14 @@ Lrs_client:
 	ldr	x0, [sp, #RS_BUF]
 	bl	_free
 	cbz	w25, Lrs_client           ; the next client may cover what this one refused
-	str	x22, [sp]
+	ldrb	w9, [x20, #(JOB_TRACK + T_ART)]
+	cbnz	w9, Lrs_ok
+	str	x22, [sp]                 ; no thumbnail listed: this one always exists
 	add	x0, x20, #(JOB_TRACK + T_ART)
 	mov	x1, #2048
-	CSTR	x2, "https://i.ytimg.com/vi/%s/maxresdefault.jpg"
+	CSTR	x2, "https://i.ytimg.com/vi/%s/hqdefault.jpg"
 	bl	_snprintf
+Lrs_ok:
 	mov	w21, #PLAY_OK
 	b	Lrs_done
 Lrs_none:
@@ -3489,8 +4870,8 @@ frame_rect:
 
 ; ui_run(program) — run a UI program (written with the OP_END STO LD ADDV CLS CALL MSG macros, argument kinds in Lk_table).
 	.equ VM_INT,	0                 ; x0-x7
-	.equ VM_DBL,	64                ; d0-d3
-	.equ VM_SIZE,	96
+	.equ VM_DBL,	64                ; d0-d5
+	.equ VM_SIZE,	112
 ui_run:
 	FRAME	4, VM_SIZE
 	mov	x19, x0
@@ -3559,10 +4940,31 @@ Lk_ext:
 Lk_rect:
 	ldr	x1, [x19], #8
 	bl	frame_rect
+	b	Lk_rect4
+Lk_raw:
+	ldr	x9, [x19], #8             ; x, y, width, height from the bottom-left
+	sxth	w10, w9
+	scvtf	d0, w10
+	asr	x10, x9, #16
+	sxth	w10, w10
+	scvtf	d1, w10
+	asr	x10, x9, #32
+	sxth	w10, w10
+	scvtf	d2, w10
+	asr	x10, x9, #48
+	scvtf	d3, w10
+Lk_rect4:
 	stp	d0, d1, [sp, #VM_DBL]
 	stp	d2, d3, [sp, #(VM_DBL + 16)]
 	mov	x23, #4
 	b	Lvm_kind
+Lk_unit:
+	ldrb	w9, [x19], #1             ; a color channel: n / 255
+	ucvtf	d0, w9
+	mov	w9, #255
+	ucvtf	d1, w9
+	fdiv	d0, d0, d1
+	b	Lvm_d
 Lk_dbl:
 	ldrh	w9, [x19], #2
 	ucvtf	d0, w9
@@ -3622,6 +5024,7 @@ Lvm_send:
 	ldp	x6, x7, [sp, #(VM_INT + 48)]
 	ldp	d0, d1, [sp, #VM_DBL]
 	ldp	d2, d3, [sp, #(VM_DBL + 16)]
+	ldp	d4, d5, [sp, #(VM_DBL + 32)]
 	blr	x24
 	cmp	w26, #'='
 	csel	x20, x0, x20, eq
@@ -3645,10 +5048,10 @@ Lk_table:
 	KIND	Lk_skip
 	KIND	Lk_byte                   ; I
 	KIND	Lk_skip
-	KIND	Lk_skip
+	KIND	Lk_unit                   ; K
 	KIND	Lk_sel                    ; L
 	KIND	Lk_skip
-	KIND	Lk_skip
+	KIND	Lk_raw                    ; N
 	KIND	Lk_slot                   ; O
 	KIND	Lk_skip
 	KIND	Lk_quad                   ; Q
@@ -3678,59 +5081,9 @@ cache_update:
 	mov	w0, #1
 	b	Lret2
 
-; text_height(field) -> its height at the content width, rounded up.
-text_height:
-	FRAME	0
-	DBL	d0, Ld_cw
-	DBL	d1, Ld_1000
-	SEND	S_sizeThatFits_
-	frintp	d1, d1
-	fcvtzs	w0, d1
-	b	Lret0
-
-; layout_text(has_artist) — size title and artist and center the pair in their band under the artwork.
-layout_text:
-	FRAME	2
-	mov	w22, w0
-	ldr	x0, [x28, #G_TITLE]
-	bl	text_height
-	mov	w19, #TITLE_MAX_H
-	cmp	w0, w19
-	csel	w19, w0, w19, lt          ; two lines at most
-	mov	w20, #0                   ; artist height
-	mov	w21, #0                   ; gap between them
-	cbz	w22, Llx_place
-	ldr	x0, [x28, #G_ARTIST]
-	bl	text_height
-	mov	w20, w0
-	mov	w21, #TEXT_GAP
-Llx_place:
-	add	w9, w19, w20
-	add	w9, w9, w21
-	mov	w10, #(TEXT_BAND + 2 * TITLE_T)
-	sub	w10, w10, w9
-	asr	w22, w10, #1              ; the block's top
-	mov	x1, #PAD
-	bfi	x1, x22, #16, #16
-	movk	x1, #CONTENT_W, lsl #32
-	bfi	x1, x19, #48, #16
-	ldr	x0, [x28, #G_TITLE]
-	bl	frame_rect
-	SEND	S_setFrame_
-	add	w9, w22, w19
-	add	w9, w9, w21
-	mov	x1, #PAD
-	bfi	x1, x9, #16, #16
-	movk	x1, #CONTENT_W, lsl #32
-	bfi	x1, x20, #48, #16
-	ldr	x0, [x28, #G_ARTIST]
-	bl	frame_rect
-	SEND	S_setFrame_
-	b	Lret2
-
-; show_track(title, artist) — render the track text when it changed.
+; show_track(title, artist) — the track in the bar and as the window's title (Window menu, Mission Control), when it changed.
 show_track:
-	FRAME	2
+	FRAME	3
 	mov	x19, x0
 	mov	x20, x1
 	BADDR	x0, B_UITITLE
@@ -3743,29 +5096,39 @@ show_track:
 	mov	x2, #256
 	bl	cache_update
 	orr	w0, w0, w21
-	cbz	w0, Lret2
-	ldr	x0, [x28, #G_TITLE]
+	cbz	w0, Lret3
+	mov	x22, x19
+	ldr	x23, [x28, #G_TEXT]
 	ldrb	w9, [x19]
-	cbz	w9, Ltr_empty
+	cbnz	w9, Ltr_show
+	GADDR	x19, Ls_nothing
+	ldr	x23, [x28, #G_SECOND]
+	CSTR	x22, "Beam"
+Ltr_show:
+	ldr	x0, [x28, #G_TITLE]
 	mov	x1, x19
 	bl	setstr
-	CLASS	x0, NSColor
-	SEND	S_labelColor
-	b	Ltr_color
-Ltr_empty:
-	GADDR	x1, Ls_nothing
-	bl	setstr
-	ldr	x0, [x28, #G_SECOND]
-Ltr_color:
-	mov	x2, x0
 	ldr	x0, [x28, #G_TITLE]
+	mov	x2, x23
 	SEND	S_setTextColor_
 	ldr	x0, [x28, #G_ARTIST]
 	mov	x1, x20
 	bl	setstr
-	ldrb	w0, [x20]
-	bl	layout_text
-	b	Lret2
+	ldrb	w9, [x20]                 ; a lone title sits in the middle of its row
+	mov	w10, #(ROW2_C + 1)
+	mov	w11, #(ROW2_C - 9)
+	cmp	w9, #0
+	csel	w9, w10, w11, ne
+	scvtf	d1, w9
+	fmov	d0, #16.0
+	ldr	x0, [x28, #G_TITLE]
+	SEND	S_setFrameOrigin_
+	mov	x0, x22
+	bl	mkstr
+	mov	x2, x0
+	ldr	x0, [x28, #G_WIN]
+	SEND	S_setTitle_
+	b	Lret3
 
 ; show_art(url) — load new artwork on the worker queue when the URL changed ("" hides it).
 	.equ ART_GEN,	0                 ; request generation
@@ -3812,7 +5175,7 @@ Lsw_hide:
 	ENTRY	art_fetch
 	FRAME	1
 	mov	x20, x0
-	bl	_curl_easy_init
+	bl	curl_new
 	mov	x19, x0
 	cbz	x0, Laf_done
 	add	x0, x20, #ART_URL
@@ -3829,17 +5192,14 @@ Laf_done:
 	bl	post_main
 	b	Lret1
 
-; art_show(image, letterboxed) — show an image in the artwork card and the blurred backdrop (nil hides them), cropping 4:3 bars.
+; art_show(image, letterboxed) — show an image on the artwork card at its own shape (nil leaves the empty card), cropping a 4:3 thumbnail's bars.
 art_show:
-	FRAME	3
+	FRAME	2
 	mov	x19, x0
 	mov	w20, w1
-	mov	x21, #G_ART
-Las_view:
-	ldr	x22, [x28, x21]
-	mov	x0, x22
+	ldr	x0, [x28, #G_ART]
 	SEND	S_layer
-	mov	x23, x0
+	mov	x21, x0
 	fmov	d0, xzr                   ; contentsRect, in unit coordinates
 	fmov	d1, xzr
 	fmov	d2, #1.0
@@ -3849,19 +5209,26 @@ Las_view:
 	fmov	d3, #0.75
 Las_rect:
 	SEND	S_setContentsRect_
-	mov	x0, x23
+	mov	x0, x21
 	mov	x2, x19
 	SEND	S_setContents_
 	cmp	x19, #0
-	cset	w2, eq
-	mov	x0, x22
-	SEND	S_setHidden_
-	cmp	x21, #G_BGART
-	mov	x21, #G_BGART
-	b.ne	Las_view
-	b	Lret3
+	cset	w9, ne
+	str	w9, [x28, #G_ARTOK]
+	fmov	d0, #1.0                  ; the card's height / width: square without an image
+	cbz	x19, Las_aspect
+	fmov	d0, #0.5625               ; 16:9 once the bars are cut
+	cbnz	w20, Las_aspect
+	mov	x0, x19
+	SEND	S_size
+	fdiv	d0, d1, d0
+Las_aspect:
+	str	d0, [x28, #G_ARTASP]
+	bl	layout_stage
+	bl	stage_update
+	b	Lret2
 
-; art_apply(job) — show the downloaded artwork, or hide it if it is not an image.
+; art_apply(job) — show the downloaded artwork, or the empty card if it is not an image.
 	ENTRY	art_apply
 	FRAME	2
 	mov	x19, x0
@@ -3892,7 +5259,7 @@ Las_rect:
 	mov	x0, x20
 	bl	art_show
 	mov	x0, x20
-	SEND	S_release                 ; the layers keep it
+	SEND	S_release                 ; the layer keeps it
 	b	Laa_free
 Laa_hide:
 	mov	x0, #0
@@ -3904,6 +5271,140 @@ Laa_free:
 	mov	x0, x19
 	bl	_free
 	b	Lret2
+
+; layout_stage() — between the bar and the title bar: the artwork card as large as fits (at its shape), with the note, the spinner and the empty state centered on it.
+layout_stage:
+	FRAME	0
+	ldr	x0, [x28, #G_CONTENT]
+	SEND	S_bounds                  ; d2 = width, d3 = height
+	mov	w9, #(STAGE_B + STAGE_T + 32)
+	scvtf	d4, w9
+	fsub	d3, d3, d4                ; the room's height, with some air
+	mov	w9, #96
+	scvtf	d4, w9
+	fsub	d2, d2, d4                ; and width
+	ldr	d5, [x28, #G_ARTASP]
+	fdiv	d1, d3, d5
+	fmin	d0, d2, d1                ; the widest card that fits both
+	mov	w9, #ART_MAX
+	scvtf	d4, w9
+	fmin	d0, d0, d4
+	mov	w9, #64
+	scvtf	d4, w9
+	fmax	d0, d0, d4
+	fmul	d1, d0, d5
+	fcvtzs	x0, d0
+	fcvtzs	x1, d1
+	ldr	x2, [x28, #G_ART]
+	bl	center_box
+	mov	x0, #96
+	mov	x1, #96
+	ldr	x2, [x28, #G_NOTE]
+	bl	center_box
+	mov	x0, #SPIN_S
+	mov	x1, #SPIN_S
+	ldr	x2, [x28, #G_SPIN]
+	bl	center_box
+	mov	x0, #EMPTY_W
+	mov	x1, #EMPTY_H
+	ldr	x2, [x28, #G_EMPTY]
+	bl	center_box
+	b	Lret0
+
+; center_box(width, height, view) — give a view that size in the middle of the stage.
+center_box:
+	FRAME	1, 16
+	mov	x19, x2
+	stp	x0, x1, [sp]
+	ldr	x0, [x28, #G_CONTENT]
+	SEND	S_bounds
+	ldp	x9, x10, [sp]
+	scvtf	d4, x9
+	scvtf	d5, x10
+	fsub	d0, d2, d4
+	mov	w11, #(STAGE_B + STAGE_T)
+	scvtf	d6, w11
+	fsub	d1, d3, d6
+	fsub	d1, d1, d5
+	fmov	d6, #0.5
+	fmul	d0, d0, d6
+	fmul	d1, d1, d6
+	frintm	d0, d0                    ; whole points: crisp edges
+	frintm	d1, d1
+	mov	w11, #STAGE_B
+	scvtf	d6, w11
+	fadd	d1, d1, d6
+	fmov	d2, d4
+	fmov	d3, d5
+	mov	x0, x19
+	SEND	S_setFrame_
+	b	Lret1
+
+; stage_update() — what the stage shows: This Mac's picture, else the artwork card while a track plays or loads, else the empty state.
+stage_update:
+	FRAME	2
+	mov	w19, #0                   ; the picture shows
+	ldr	w9, [x28, #G_SEL]
+	cbnz	w9, Lsu_pic
+	ldr	w9, [x28, #G_AONLY]
+	cbnz	w9, Lsu_pic
+	ldr	w19, [x28, #G_HASVIDEO]
+Lsu_pic:
+	ldr	x0, [x28, #G_VIDEO]
+	cmp	w19, #0
+	cset	w2, eq
+	SEND	S_setHidden_
+	BADDR	x9, B_UITITLE
+	ldrb	w9, [x9]
+	cmp	w9, #0
+	cset	w20, ne                   ; a track, or one on its way
+	ldr	w9, [x28, #G_LOADING]
+	orr	w20, w20, w9
+	cmp	w19, #0
+	csel	w20, wzr, w20, ne         ; the card, unless the picture covers it
+	ldr	x0, [x28, #G_ART]
+	eor	w2, w20, #1
+	SEND	S_setHidden_
+	ldr	w9, [x28, #G_ARTOK]
+	eor	w10, w20, #1
+	orr	w2, w9, w10               ; the note, on a card without an image, unless the spinner is there
+	ldr	w9, [x28, #G_LOADING]
+	orr	w2, w2, w9
+	ldr	x0, [x28, #G_NOTE]
+	SEND	S_setHidden_
+	BADDR	x9, B_UITITLE
+	ldrb	w9, [x9]
+	ldr	w10, [x28, #G_LOADING]
+	orr	w9, w9, w10
+	orr	w9, w9, w19
+	cmp	w9, #0
+	cset	w2, ne
+	ldr	x0, [x28, #G_EMPTY]
+	SEND	S_setHidden_
+	cbz	w19, Lsu_bar
+	ldr	w9, [x28, #G_PPSHOWN]
+	cbnz	w9, Lret2                 ; a playing picture may keep the bar away
+Lsu_bar:
+	bl	bar_show
+	b	Lret2
+
+; bar_show() — bring the control bar back.
+bar_show:
+	ldr	w9, [x28, #G_BARHID]
+	cbz	w9, Lbs_ret
+	str	wzr, [x28, #G_BARHID]
+	fmov	d0, #1.0
+; bar_alpha(alpha) — fade the control bar to an opacity.
+bar_alpha:
+	FRAME	0, 16
+	str	d0, [sp]
+	ldr	x0, [x28, #G_BAR]
+	SEND	S_animator
+	ldr	d0, [sp]
+	SEND	S_setAlphaValue_
+	b	Lret0
+Lbs_ret:
+	ret
 
 ; render_status() — a fresh message, else "not responding" for a silent device.
 render_status:
@@ -3926,56 +5427,12 @@ Lrs_hint:
 Lrs_show:
 	ldr	x0, [x28, #G_STATUS]
 	bl	setstr
-	ldr	x0, [x28, #G_SECOND]
-	cbz	w19, Lrs_color
-	CLASS	x0, NSColor
-	SEND	S_systemRedColor
-Lrs_color:
-	mov	x2, x0
+	ldr	x9, [x28, #G_SECOND]
+	ldr	x10, [x28, #G_RED]
+	cmp	w19, #0
+	csel	x2, x10, x9, ne
 	ldr	x0, [x28, #G_STATUS]
 	SEND	S_setTextColor_
-	b	Lret1
-
-; center_picker() — size the device picker to the selected name and icon, and center it in its row.
-center_picker:
-	FRAME	1
-	ldr	x0, [x28, #G_DEV]
-	SEND	S_cell
-	fmov	d0, xzr
-	fmov	d1, xzr
-	DBL	d2, Ld_1000
-	DBL	d3, Ld_devh
-	SEND	S_titleRectForBounds_
-	DBL	d4, Ld_air
-	fsub	d4, d4, d2                ; room for the icon, insets and arrows
-	frintp	d4, d4
-	fcvtzs	w20, d4
-	ldr	x0, [x28, #G_DEV]
-	SEND	S_titleOfSelectedItem
-	mov	x19, x0
-	ldr	x0, [x28, #G_DEV]
-	SEND	S_font
-	mov	x2, x0
-	ldr	x9, [x27, #F_NSFontAttributeName]
-	ldr	x3, [x9]
-	CLASS	x0, NSDictionary
-	SEND	S_dictionaryWithObject_forKey_
-	mov	x2, x0
-	mov	x0, x19
-	SEND	S_sizeWithAttributes_ ; d0 = the name's width
-	frintp	d0, d0
-	scvtf	d4, w20
-	fadd	d2, d0, d4
-	DBL	d4, Ld_cw
-	fmin	d2, d2, d4                ; long names truncate
-	DBL	d5, Ld_winw
-	fsub	d0, d5, d2
-	fmov	d6, #0.5
-	fmul	d0, d0, d6                ; x = (WIN_W - width) / 2
-	DBL	d1, Ld_devy
-	DBL	d3, Ld_devh
-	ldr	x0, [x28, #G_DEV]
-	SEND	S_setFrame_
 	b	Lret1
 
 ; add_item(menu, title, action, key) -> a new menu item; a nil target uses the responder chain.
@@ -3996,7 +5453,7 @@ add_item:
 	SEND	S_addItemWithTitle_action_keyEquivalent_
 	b	Lret2
 
-; rebuild_devices() — the device picker from the device list; items that still match stay, so an open menu only grows.
+; rebuild_devices() — the picker's items (after its face) from the device list; items that still match stay, so an open menu only grows.
 rebuild_devices:
 	FRAME	3, MAX_DEVS * DEV_SIZE
 	mov	x22, sp                   ; a copy of the list
@@ -4009,14 +5466,14 @@ rebuild_devices:
 	UNLOCK
 	ldr	x0, [x28, #G_DEV]
 	SEND	S_numberOfItems
-	mov	x23, x0                   ; items shown
+	sub	x23, x0, #1               ; devices shown
 	mov	x20, #0
 Lrd_same:
 	cmp	x20, x23
 	ccmp	x20, x19, #2, lo
 	b.hs	Lrd_cut
 	ldr	x0, [x28, #G_DEV]
-	mov	x2, x20
+	add	x2, x20, #1
 	SEND	S_itemTitleAtIndex_
 	SEND	S_UTF8String
 	mov	x9, #DEV_SIZE
@@ -4028,16 +5485,16 @@ Lrd_same:
 Lrd_cut:
 	cmp	x23, x20
 	b.ls	Lrd_add
-	sub	x23, x23, #1
 	ldr	x0, [x28, #G_DEV]
-	mov	x2, x23
+	mov	x2, x23                   ; the last one shown, after the face
 	SEND	S_removeItemAtIndex_
+	sub	x23, x23, #1
 	b	Lrd_cut
 Lrd_add:
 	cmp	x20, x19
 	b.hs	Lret3
 	ldr	x0, [x28, #G_DEV]
-	SEND	S_menu      ; the menu allows duplicate names
+	SEND	S_menu                    ; the menu allows duplicate names
 	mov	x9, #DEV_SIZE
 	madd	x1, x20, x9, x22          ; the name
 	mov	x2, #0
@@ -4055,6 +5512,42 @@ Lrd_add:
 	SEND	S_setImage_
 	add	x20, x20, #1
 	b	Lrd_add
+
+; mark_devices(selected) — the selected device's checkmark, and a lit face while a network device plays.
+mark_devices:
+	FRAME	2
+	mov	w19, w0
+	ldr	x0, [x28, #G_DEV]
+	SEND	S_numberOfItems
+	mov	x20, x0
+Lmk_item:
+	subs	x20, x20, #1
+	b.le	Lmk_face
+	ldr	x0, [x28, #G_DEV]
+	mov	x2, x20
+	SEND	S_itemAtIndex_
+	sub	x9, x20, #1
+	cmp	x9, w19, uxtw
+	cset	w2, eq
+	SEND	S_setState_
+	b	Lmk_item
+Lmk_face:
+	cmp	w19, #0
+	cset	w9, ne
+	ldr	w10, [x28, #G_DEVON]
+	cmp	w9, w10
+	b.eq	Lret2
+	str	w9, [x28, #G_DEVON]
+	ldr	x10, [x28, #G_IMGDEV]
+	ldr	x11, [x28, #G_IMGDEVON]
+	cmp	w9, #0
+	csel	x21, x11, x10, ne
+	ldr	x0, [x28, #G_DEV]
+	mov	x2, #0
+	SEND	S_itemAtIndex_
+	mov	x2, x21
+	SEND	S_setImage_
+	b	Lret2
 
 ; set_status(message, is_error) — show a message for STATUS_TICKS seconds.
 set_status:
@@ -4101,21 +5594,8 @@ set_status:
 	str	w9, [x28, #G_DEVREV]
 	bl	rebuild_devices
 Lur_pick:
-	ldr	x0, [x28, #G_DEV]
-	mov	x2, x20
-	SEND	S_selectItemAtIndex_
-	BADDR	x0, B_UIWTITLE           ; window title (for the Window menu and Mission Control)
-	add	x1, x19, #NOW_NAME
-	mov	x2, #128
-	bl	cache_update
-	cbz	w0, Lur_track
-	BADDR	x0, B_UIWTITLE
-	bl	mkstr
-	mov	x2, x0
-	ldr	x0, [x28, #G_WIN]
-	SEND	S_setTitle_
-	bl	center_picker
-Lur_track:
+	mov	w0, w20
+	bl	mark_devices
 	add	x0, x19, #NOW_TITLE
 	add	x1, x19, #NOW_ARTIST
 	bl	show_track
@@ -4181,6 +5661,7 @@ Lur_mute:
 	SEND	S_setImage_
 Lur_status:
 	bl	render_status
+	bl	stage_update
 	b	Lret4
 
 ; show_time(pos, dur) — position slider, elapsed time and time left.
@@ -4245,9 +5726,6 @@ Lpd_cleared:
 	mov	w1, #0
 	b	Lpd_message
 Lpd_failed:
-	ldr	x0, [x28, #G_FIELD]
-	mov	x2, #0
-	SEND	S_selectText_ ; keep the text so it can be fixed
 	CSTR	x0, "The device rejected the track."
 	cmp	w20, #PLAY_REJECTED
 	b.eq	Lpd_error
@@ -4264,6 +5742,8 @@ Lpd_error:
 	mov	w1, #1
 Lpd_message:
 	bl	set_status
+	ldr	x0, [x19, #JOB_ITEM]      ; unused if the device changed meanwhile
+	SEND	S_release
 	ldr	x0, [x19, #JOB_QUERY]
 	bl	_free
 	mov	x0, x19
@@ -4271,9 +5751,9 @@ Lpd_message:
 	bl	Lui_refresh
 	b	Lret2
 
-; ---- This Mac: AVPlayer; macOS routes it to the chosen output (speakers, Bluetooth, AirPlay) ----
+; ---- This Mac: AVPlayer; macOS routes the sound to the chosen output (speakers, Bluetooth, AirPlay) ----
 
-; local_play(job) — play the resolved media on This Mac.
+; local_play(job) — play the prepared item on This Mac.
 local_play:
 	FRAME	1
 	mov	x19, x0
@@ -4283,36 +5763,87 @@ local_play:
 	bl	_memcpy
 	ldr	x9, [x19, #JOB_DUR]
 	str	x9, [x28, #G_LTDUR]
-	add	x0, x19, #JOB_URL
-	add	x9, x19, #JOB_LOCAL
-	ldr	w10, [x19, #JOB_LIVE]
-	cmp	w10, #0
-	csel	x0, x0, x9, eq            ; a live broadcast plays through the proxy
-	bl	mkstr
-	mov	x2, x0
-	CLASS	x0, NSURL
-	SEND	S_URLWithString_
-	cbz	x0, Lret1
-	mov	x2, x0
-	CLASS	x0, AVPlayerItem
-	SEND	S_playerItemWithURL_
-	mov	x20, x0
+	BADDR	x0, B_LTAURL              ; YouTube's streams, to drop or fetch the picture later
+	ADDO	x1, x19, JOB_HLSA
+	ldrb	w9, [x1]
+	ADDO	x10, x19, JOB_LOCAL
+	cmp	w9, #0
+	csel	x1, x1, x10, ne
+	mov	x2, #256
+	bl	_strlcpy
+	ADDO	x1, x19, JOB_HLS          ; the picture: our HLS, or a broadcast's own
+	ldr	w9, [x19, #JOB_LIVE]
+	cbz	w9, Llp_keep
+	ADDO	x1, x19, JOB_VURL
+Llp_keep:
+	BADDR	x0, B_LTVURL
+	mov	x2, #4096
+	bl	_strlcpy
+	str	wzr, [x28, #G_FAILED]
+	str	wzr, [x28, #G_HASVIDEO]
+	str	wzr, [x28, #G_IDLE]       ; the controls stay a moment on a new track
+	bl	resume_stop
+	ldr	x2, [x19, #JOB_ITEM]
+	cbz	x2, Llp_none
+	str	xzr, [x19, #JOB_ITEM]
+	mov	x20, x2
 	ldr	x0, [x28, #G_PLAYER]
-	mov	x2, x20
 	SEND	S_replaceCurrentItemWithPlayerItem_
+	mov	x0, x20
+	SEND	S_release
 	ldr	x0, [x28, #G_PLAYER]
 	SEND	S_play
 	bl	local_poll
 	b	Lret1
+Llp_none:
+	CSTR	x0, "Could not play this media."
+	mov	w1, #1
+	bl	set_status
+	b	Lret1
 
-; local_poll() — publish This Mac's playback state and re-render.
+; local_poll() — publish This Mac's playback state (its own duration and picture, once known) and re-render.
 local_poll:
-	FRAME	3, 32                     ; room for a CMTime
-	ldr	x0, [x28, #G_PLAYER]
-	mov	x19, x0
+	FRAME	4, 48                     ; a CMTime at sp + 16
+	ldr	x19, [x28, #G_PLAYER]
+	mov	x0, x19
 	SEND	S_currentItem
+	mov	x24, x0
 	mov	w20, #ST_STOPPED
+	mov	w25, #0                   ; a picture
 	cbz	x0, Llq_time              ; nothing loaded
+	SEND	S_status
+	cmp	x0, #PLAYER_ITEM_FAILED
+	b.ne	Llq_item
+	ldr	w9, [x28, #G_FAILED]
+	cbnz	w9, Llq_time
+	mov	w9, #1
+	str	w9, [x28, #G_FAILED]
+	CSTR	x0, "Could not play this media."
+	mov	w1, #1
+	bl	set_status
+	b	Llq_time
+Llq_item:
+	ldr	x9, [x28, #G_LTDUR]
+	cbnz	x9, Llq_size              ; YouTube said it
+	mov	x0, x24
+	add	x8, sp, #16
+	SEND	S_duration
+	ldr	w9, [sp, #28]             ; flags: valid, and not indefinite or infinite
+	mov	w10, #0x1d
+	and	w9, w9, w10
+	cmp	w9, #1
+	b.ne	Llq_size
+	ldr	x9, [sp, #16]
+	ldrsw	x10, [sp, #24]
+	sdiv	x9, x9, x10
+	str	x9, [x28, #G_LTDUR]
+Llq_size:
+	mov	x0, x24
+	SEND	S_presentationSize        ; d0 = width, 0 without a picture
+	fcmp	d0, #0.0
+	cset	w25, gt
+	mov	x0, x24
+	bl	video_tracks
 	mov	x0, x19
 	SEND	S_timeControlStatus
 	mov	w20, #ST_PAUSED
@@ -4324,10 +5855,10 @@ local_poll:
 	csel	w20, w9, w20, eq
 Llq_time:
 	mov	x0, x19
-	mov	x8, sp                    ; a CMTime comes back through x8
+	add	x8, sp, #16               ; a CMTime comes back through x8
 	SEND	S_currentTime
-	ldr	x9, [sp]                  ; value / timescale (0 / 0 with no item gives 0)
-	ldrsw	x10, [sp, #8]
+	ldr	x9, [sp, #16]             ; value / timescale (0 / 0 with no item gives 0)
+	ldrsw	x10, [sp, #24]
 	sdiv	x21, x9, x10
 	mov	x0, x19
 	SEND	S_volume
@@ -4336,23 +5867,57 @@ Llq_time:
 	fcvtns	w22, s0
 	mov	x0, x19
 	SEND	S_isMuted
-	mov	w19, w0
+	mov	w23, w0
 	LOCK
-	BADDR	x23, B_NOW
-	ldr	w9, [x23, #NOW_SEL]
+	BADDR	x26, B_NOW
+	ldr	w9, [x26, #NOW_SEL]
 	cbnz	w9, Llq_unlock            ; a device owns the snapshot now
-	str	w20, [x23, #NOW_STATE]
-	stp	w22, w19, [x23, #NOW_VOL]
+	str	w20, [x26, #NOW_STATE]
+	stp	w22, w23, [x26, #NOW_VOL]
 	ldr	x9, [x28, #G_LTDUR]
-	stp	x21, x9, [x23, #NOW_POS]
-	add	x0, x23, #NOW_TITLE
+	stp	x21, x9, [x26, #NOW_POS]
+	add	x0, x26, #NOW_TITLE
 	BADDR	x1, B_LTTRACK
 	mov	x2, #T_SIZE
 	bl	_memcpy
 Llq_unlock:
 	UNLOCK
+	str	w25, [x28, #G_HASVIDEO]
 	bl	Lui_refresh
-	b	Lret3
+	b	Lret4
+
+; video_tracks(item) — Audio Only turns the item's picture tracks off (nothing is decoded), and back on.
+video_tracks:
+	FRAME	3
+	SEND	S_tracks
+	mov	x19, x0
+	SEND	S_count
+	mov	x20, x0
+	ldr	w9, [x28, #G_AONLY]
+	eor	w21, w9, #1
+	CSTR	x0, "vide"
+	bl	mkstr
+	mov	x22, x0
+Lvt_next:
+	subs	x20, x20, #1
+	b.lt	Lret3
+	mov	x0, x19
+	mov	x2, x20
+	SEND	S_objectAtIndex_
+	mov	x23, x0
+	SEND	S_assetTrack
+	SEND	S_mediaType
+	mov	x2, x22
+	SEND	S_isEqualToString_
+	cbz	w0, Lvt_next
+	mov	x0, x23
+	SEND	S_isEnabled
+	cmp	w0, w21
+	b.eq	Lvt_next
+	mov	x0, x23
+	mov	w2, w21
+	SEND	S_setEnabled_
+	b	Lvt_next
 
 ; local_toggle() — play or pause This Mac.
 local_toggle:
@@ -4370,17 +5935,26 @@ local_toggle:
 
 ; local_seek(seconds) — jump to a position on This Mac.
 local_seek:
-	FRAME	0, 32
+	mov	x9, #1000
+	mul	x0, x0, x9
+; local_seekms(ms) — the same, to the millisecond.
+local_seekms:
+	FRAME	0, 48
 	cmp	x0, #0
 	csel	x0, x0, xzr, gt
 	mov	x9, #1000                 ; CMTime in milliseconds: value, timescale, flags (valid), epoch
-	mul	x0, x0, x9
 	movk	x9, #1, lsl #32
 	stp	x0, x9, [sp]
 	str	xzr, [sp, #16]
+	mov	x9, #1                    ; zero tolerance: the exact moment, not the segment's start
+	movk	x9, #1, lsl #32
+	stp	xzr, x9, [sp, #24]
+	str	xzr, [sp, #40]
 	ldr	x0, [x28, #G_PLAYER]
 	mov	x2, sp                    ; passed by reference
-	SEND	S_seekToTime_
+	add	x3, sp, #24
+	add	x4, sp, #24
+	SEND	S_seekToTime_toleranceBefore_toleranceAfter_
 	bl	local_poll
 	b	Lret0
 
@@ -4433,6 +6007,76 @@ local_mute:
 	SEND	S_setMuted_
 	bl	local_poll
 	b	Lret1
+
+; local_swap() — Audio Only changed on a YouTube video: the item becomes its sound alone (no picture bytes fetched) or its HLS presentation again; act_resume puts it back where it was.
+local_swap:
+	FRAME	1, 32                     ; a CMTime at sp
+	ldr	x0, [x28, #G_PLAYER]
+	mov	x8, sp
+	SEND	S_currentTime
+	ldp	x9, x10, [sp]             ; value, timescale
+	mov	x11, #1000
+	mul	x9, x9, x11
+	sxtw	x10, w10
+	cbz	x10, Lret1
+	sdiv	x9, x9, x10
+	ldr	x10, [x28, #G_LTDUR]
+	cmp	x10, #0
+	csinv	x9, x9, xzr, ne           ; a broadcast (no length) just goes on: -1
+	str	x9, [x28, #G_RESUMEMS]
+	ldr	x0, [x28, #G_PLAYER]
+	SEND	S_timeControlStatus
+	str	w0, [x28, #G_RESUMEPLAY]  ; playing, or about to
+	BADDR	x0, B_LTAURL
+	ldr	w9, [x28, #G_AONLY]
+	cbnz	w9, Lsw_make
+	BADDR	x0, B_LTVURL
+Lsw_make:
+	bl	make_item
+	cbz	x0, Lret1
+	mov	x19, x0
+	ldr	x0, [x28, #G_PLAYER]      ; silent until it is back in place
+	SEND	S_pause
+	ldr	x0, [x28, #G_PLAYER]
+	mov	x2, x19
+	SEND	S_replaceCurrentItemWithPlayerItem_
+	mov	x0, x19
+	SEND	S_release
+	str	wzr, [x28, #G_HASVIDEO]
+	bl	resume_stop
+	ADDR	x0, Lprog_resume
+	bl	ui_run
+	b	Lret1
+
+; act_resume(timer) — every quarter second until the swapped item is ready: then the saved moment, and play if it was playing.
+	ENTRY	act_resume
+	FRAME	1
+	ldr	x0, [x28, #G_PLAYER]
+	SEND	S_currentItem
+	SEND	S_status
+	cbz	x0, Lret1                 ; still loading
+	mov	x19, x0
+	bl	resume_stop
+	cmp	x19, #PLAYER_ITEM_FAILED
+	b.eq	Lret1
+	ldr	x0, [x28, #G_RESUMEMS]
+	tbnz	x0, #63, Lrm_play
+	bl	local_seekms
+Lrm_play:
+	ldr	w9, [x28, #G_RESUMEPLAY]
+	cbz	w9, Lret1
+	ldr	x0, [x28, #G_PLAYER]
+	SEND	S_play
+	bl	local_poll
+	b	Lret1
+
+; resume_stop() — no pending return to a moment (a new track, or it happened).
+resume_stop:
+	FRAME	0
+	ldr	x0, [x28, #G_RESUMET]
+	str	xzr, [x28, #G_RESUMET]
+	SEND	S_invalidate
+	b	Lret0
 
 ; ---- Actions (Objective-C methods: self, _cmd, sender) ----
 
@@ -4532,7 +6176,8 @@ volstep:
 	FRAME	1
 	ldr	x0, [x28, #G_DEV]
 	SEND	S_indexOfSelectedItem
-	mov	x19, x0
+	subs	x19, x0, #1               ; after the face
+	b.lt	Lret1
 	ldr	w9, [x28, #G_SEL]
 	cmp	w9, w19
 	b.eq	Lret1                     ; the same device
@@ -4552,17 +6197,75 @@ dragging:
 	FRAME	0
 	ldr	x0, [x28, #G_APP]
 	SEND	S_currentEvent
-	SEND	S_type      ; a nil event gives 0
+	SEND	S_type                    ; a nil event gives 0
 	cmp	x0, #NSEventTypeLeftMouseDown
 	ccmp	x0, #NSEventTypeLeftMouseDragged, #4, ne
 	cset	w0, eq
 	b	Lret0
 
-; act_play — Return in the search field: resolve and play its link or search.
-	ENTRY	act_play
+; play_text(text) — resolve and play a link, search, web address or file path (copied), one at a time.
+play_text:
 	FRAME	2
+	mov	x19, x0
+	ldrb	w9, [x19]
+	cbz	w9, Lret2                 ; empty
 	ldr	w9, [x28, #G_LOADING]
-	cbnz	w9, Lret2                 ; one link at a time
+	cbnz	w9, Lret2
+	ldr	w9, [x28, #G_READY]
+	cbnz	w9, Lpt_go
+	CSTR	x0, "No device available."
+	mov	w1, #1
+	bl	set_status
+	b	Lret2
+Lpt_go:
+	mov	x0, #1
+	mov	x1, #JOB_SIZE
+	bl	_calloc
+	cbz	x0, Lret2
+	mov	x20, x0
+	mov	x0, x19
+	bl	_strdup                   ; the caller's text dies with its pool
+	str	x0, [x20, #JOB_QUERY]
+	cbz	x0, Lpt_drop
+	mov	w9, #1
+	str	w9, [x28, #G_LOADING]
+	ADDR	x0, Lprog_busy
+	bl	ui_run
+	GADDR	x0, Ls_slash+1
+	mov	w1, #0
+	bl	set_status
+	bl	stage_update
+	WORKQ
+	mov	x1, x20
+	adr	x2, play_resolve
+	bl	_dispatch_async_f
+	b	Lret2
+Lpt_drop:
+	mov	x0, x20
+	bl	_free
+	b	Lret2
+
+; play_url(url) — play an NSURL: a file by its path, anything else by its text.
+play_url:
+	FRAME	1
+	mov	x19, x0
+	SEND	S_isFileURL
+	mov	x9, x0
+	mov	x0, x19
+	cbz	w9, Lpu_web
+	SEND	S_path
+	b	Lpu_text
+Lpu_web:
+	SEND	S_absoluteString
+Lpu_text:
+	SEND	S_UTF8String
+	cbz	x0, Lret1
+	bl	play_text
+	b	Lret1
+
+; act_play — Return in the link field: play what it holds.
+	ENTRY	act_play
+	FRAME	1
 	ldr	x0, [x28, #G_FIELD]
 	SEND	S_stringValue
 	mov	x19, x0
@@ -4572,42 +6275,159 @@ dragging:
 	mov	x0, x19
 	SEND	S_stringByTrimmingCharactersInSet_
 	SEND	S_UTF8String
-	cbz	x0, Lret2
-	ldrb	w9, [x0]
-	cbz	w9, Lret2                 ; empty (also the field's clear button)
 	mov	x19, x0
-	ldr	w9, [x28, #G_READY]
-	cbnz	w9, Lap_go
-	CSTR	x0, "No device available."
-	mov	w1, #1
-	bl	set_status
-	b	Lret2
-Lap_go:
-	mov	x0, #1
-	mov	x1, #JOB_SIZE
-	bl	_calloc
-	cbz	x0, Lret2
-	mov	x20, x0
+	bl	url_hide
+	cbz	x19, Lret1
 	mov	x0, x19
-	bl	_strdup                   ; the NSString's buffer dies with the pool
-	str	x0, [x20, #JOB_QUERY]
-	cbz	x0, Lap_drop
-	mov	w9, #1
-	str	w9, [x28, #G_LOADING]
-	ADDR	x0, Lprog_busy
+	bl	play_text
+	b	Lret1
+
+; act_focus — Open from URL (Cmd-L): the link field floats in, ready to paste.
+	ENTRY	act_focus
+	ADDR	x0, Lprog_focus
+	b	ui_run
+
+; url_hide() — the link field goes away and the window keeps the keyboard.
+url_hide:
+	FRAME	0
+	ldr	x0, [x28, #G_URLBOX]
+	SEND	S_isHidden
+	cbnz	w0, Lret0                 ; already
+	ADDR	x0, Lprog_urlhide
 	bl	ui_run
-	GADDR	x0, Ls_slash+1
-	mov	w1, #0
-	bl	set_status
-	WORKQ
-	mov	x1, x20
-	adr	x2, play_resolve
-	bl	_dispatch_async_f
-	b	Lret2
-Lap_drop:
-	mov	x0, x20
-	bl	_free
-	b	Lret2
+	b	Lret0
+
+; act_urlcmd(control, text view, command) -> YES for Escape, which closes the link field.
+	ENTRY	act_urlcmd
+	FRAME	0
+	ldr	x9, [x27, #S_cancelOperation_]
+	mov	w0, #0
+	cmp	x4, x9
+	b.ne	Lret0
+	bl	url_hide
+	mov	w0, #1
+	b	Lret0
+
+; act_open — Open (Cmd-O): pick an audio or video file.
+	ENTRY	act_open
+	FRAME	1
+	CLASS	x0, NSOpenPanel
+	SEND	S_openPanel
+	mov	x19, x0
+	CSTR	x0, "public.audiovisual-content"
+	bl	mkstr
+	mov	x2, x0
+	CLASS	x0, UTType
+	SEND	S_typeWithIdentifier_
+	mov	x2, x0
+	CLASS	x0, NSArray
+	SEND	S_arrayWithObject_
+	mov	x2, x0
+	mov	x0, x19
+	SEND	S_setAllowedContentTypes_
+	mov	x0, x19
+	SEND	S_runModal
+	cmp	x0, #1                    ; NSModalResponseOK
+	b.ne	Lret1
+	mov	x0, x19
+	SEND	S_URL
+	bl	play_url
+	b	Lret1
+
+; act_openurls(app, urls) — files opened with Beam from the Finder or the Dock.
+	ENTRY	act_openurls
+	FRAME	0
+	mov	x0, x3
+	SEND	S_firstObject
+	cbz	x0, Lret0
+	bl	play_url
+	b	Lret0
+
+; act_drop(drag) -> YES when a dropped file, link or text was taken.
+	ENTRY	act_drop
+	FRAME	1
+	mov	x0, x2
+	SEND	S_draggingPasteboard
+	mov	x19, x0
+	CLASS	x2, NSURL
+	CLASS	x0, NSArray
+	SEND	S_arrayWithObject_
+	mov	x2, x0
+	mov	x0, x19
+	mov	x3, #0
+	SEND	S_readObjectsForClasses_options_
+	SEND	S_firstObject
+	cbz	x0, Ldp_text
+	bl	play_url
+	mov	w0, #1
+	b	Lret1
+Ldp_text:
+	CSTR	x0, "public.utf8-plain-text"
+	bl	mkstr
+	mov	x2, x0
+	mov	x0, x19
+	SEND	S_stringForType_
+	SEND	S_UTF8String
+	cbz	x0, Lret1
+	bl	play_text
+	mov	w0, #1
+	b	Lret1
+
+; act_click(event) — a click on the stage closes the link field; a double click toggles full screen.
+	ENTRY	act_click
+	FRAME	1
+	mov	x19, x2
+	bl	url_hide
+	mov	x0, x19
+	SEND	S_clickCount
+	cmp	x0, #2
+	b.ne	Lret1
+	ldr	x0, [x28, #G_WIN]
+	mov	x2, #0
+	SEND	S_toggleFullScreen_
+	b	Lret1
+
+; act_moved(event) — the mouse moved: the controls come back, and note whether it is over them.
+	ENTRY	act_moved
+	FRAME	0
+	str	wzr, [x28, #G_IDLE]
+	mov	x0, x2
+	SEND	S_locationInWindow        ; d1 = height above the bottom
+	mov	w9, #(BAR_M + BAR_H + 8)
+	scvtf	d2, w9
+	fcmp	d1, d2
+	cset	w9, mi
+	str	w9, [x28, #G_HOVER]
+	bl	bar_show
+	b	Lret0
+
+; act_aonly — Audio Only (the headphones and Opt-Cmd-A): no picture is fetched, decoded or shown.
+	ENTRY	act_aonly
+	FRAME	1
+	ldr	w9, [x28, #G_AONLY]
+	eor	w19, w9, #1
+	str	w19, [x28, #G_AONLY]
+	ldr	x0, [x28, #G_AOITEM]
+	mov	w2, w19
+	SEND	S_setState_
+	ldr	x9, [x28, #G_YEL]
+	ldr	x10, [x28, #G_SECOND]
+	cmp	w19, #0
+	csel	x2, x9, x10, ne
+	ldr	x0, [x28, #G_AOBTN]
+	SEND	S_setContentTintColor_
+	ldr	w9, [x28, #G_SEL]
+	cbnz	w9, Lao_stage             ; speakers play sound only anyway
+	BADDR	x9, B_LTVURL
+	ldrb	w9, [x9]
+	cbz	w9, Lao_poll              ; a file or web media: its picture tracks switch in place
+	bl	local_swap
+Lao_poll:
+	bl	local_poll
+	b	Lret1
+Lao_stage:
+	bl	stage_update
+	b	Lret1
 
 ; act_vol — the volume slider; a device gets at most one queued job, always with the latest value.
 	ENTRY	act_vol
@@ -4640,7 +6460,7 @@ Lav_device:
 	bl	_dispatch_async_f
 	b	Lret1
 
-; act_seek — the position slider; seeks when released.
+; act_seek — the position slider: This Mac follows the drag frame by frame; a device seeks when it is released.
 	ENTRY	act_seek
 	FRAME	1
 	ldr	w9, [x28, #G_READY]
@@ -4655,42 +6475,323 @@ Lav_device:
 	bl	show_time
 	bl	dragging
 	str	w0, [x28, #G_SEEKDRAG]
-	cbnz	w0, Lret1
+	cbz	w0, Lsk_release
+	ldr	w9, [x28, #G_SEL]
+	cbnz	w9, Lret1
+	mov	x0, x19
+	bl	local_seek
+	b	Lret1
+Lsk_release:
 	mov	x1, x19
 	bl	seek_route
 	b	Lret1
 
-; act_tick — the 1 Hz timer: This Mac renders itself; a device is polled, one poll in flight at most.
+; act_tick — the 1 Hz timer: the controls' idle fade; This Mac renders itself; a device is polled, one poll in flight at most.
 	ENTRY	act_tick
+	FRAME	0
 	ldr	x10, [x28, #G_TICK]
 	add	x10, x10, #1
 	str	x10, [x28, #G_TICK]
+	bl	idle_tick
 	ldr	w9, [x28, #G_SEL]
-	cbz	w9, local_poll
+	cbnz	w9, Lat_device
+	bl	local_poll
+	b	Lret0
+Lat_device:
 	add	x9, x28, #G_POLLB
 	mov	w10, #1
 	swpal	w10, w10, [x9]
-	cbnz	w10, Lat_ret              ; the previous poll is still running
+	cbnz	w10, Lret0                ; the previous poll is still running
 	ldr	x0, [x28, #G_QUEUE]
 	mov	x1, #0
 	adr	x2, poll_job
-	b	_dispatch_async_f
-Lat_ret:
-	ret
+	bl	_dispatch_async_f
+	b	Lret0
 
-; act_focus — Cmd-L: bring the window forward and select the search field.
-	ENTRY	act_focus
-	ADDR	x0, Lprog_focus
-	b	ui_run
+; idle_tick() — a picture playing on This Mac: after a few still seconds the controls and the pointer fade away.
+idle_tick:
+	FRAME	0
+	ldr	w9, [x28, #G_IDLE]
+	add	w9, w9, #1
+	str	w9, [x28, #G_IDLE]
+	cmp	w9, #HIDE_TICKS
+	b.lo	Lret0
+	ldr	w9, [x28, #G_BARHID]
+	ldr	w10, [x28, #G_HOVER]
+	orr	w9, w9, w10
+	ldr	w10, [x28, #G_SEL]
+	orr	w9, w9, w10
+	ldr	w10, [x28, #G_AONLY]
+	orr	w9, w9, w10
+	cbnz	w9, Lret0
+	ldr	w9, [x28, #G_HASVIDEO]
+	ldr	w10, [x28, #G_PPSHOWN]
+	and	w9, w9, w10
+	cbz	w9, Lret0
+	ldr	x0, [x28, #G_URLBOX]
+	SEND	S_isHidden
+	cbz	w0, Lret0                 ; a link is being typed
+	mov	w9, #1
+	str	w9, [x28, #G_BARHID]
+	fmov	d0, xzr
+	bl	bar_alpha
+	CLASS	x0, NSCursor
+	mov	w2, #1
+	SEND	S_setHiddenUntilMouseMoves_
+	b	Lret0
+
+; act_key(event) — keys on the stage: Space plays and pauses, arrows skip and change the volume, F toggles full screen (Escape leaves it), M mutes.
+	ENTRY	act_key
+	FRAME	0
+	mov	x0, x2
+	SEND	S_keyCode
+	cmp	x0, #49                   ; Space
+	b.eq	Lak_toggle
+	cmp	x0, #123                  ; left
+	b.eq	Lak_back
+	cmp	x0, #124                  ; right
+	b.eq	Lak_fwd
+	cmp	x0, #126                  ; up
+	b.eq	Lak_up
+	cmp	x0, #125                  ; down
+	b.eq	Lak_down
+	cmp	x0, #46                   ; M
+	b.eq	Lak_mute
+	cmp	x0, #3                    ; F
+	b.eq	Lak_full
+	cmp	x0, #53                   ; Escape
+	b.ne	Lret0
+	ldr	x0, [x28, #G_WIN]
+	SEND	S_styleMask
+	tbz	x0, #14, Lret0            ; not full screen
+Lak_full:
+	ldr	x0, [x28, #G_WIN]
+	mov	x2, #0
+	SEND	S_toggleFullScreen_
+	b	Lret0
+Lak_toggle:
+	bl	Lact_toggle
+	b	Lret0
+Lak_back:
+	bl	Lact_back
+	b	Lret0
+Lak_fwd:
+	bl	Lact_fwd
+	b	Lret0
+Lak_up:
+	bl	Lact_volup
+	b	Lret0
+Lak_down:
+	bl	Lact_voldown
+	b	Lret0
+Lak_mute:
+	bl	Lact_mute
+	b	Lret0
+
+; act_speed(item) — Playback > Speed: This Mac plays at the item's tag / 100, now and after.
+	ENTRY	act_speed
+	FRAME	3
+	mov	x19, x2
+	mov	x0, x19
+	SEND	S_tag
+	mov	x20, x0
+	mov	x0, x19                   ; the checkmark moves to it
+	SEND	S_menu
+	SEND	S_itemArray
+	mov	x21, x0
+	SEND	S_count
+	mov	x22, x0
+Lsp_mark:
+	subs	x22, x22, #1
+	b.lt	Lsp_rate
+	mov	x0, x21
+	mov	x2, x22
+	SEND	S_objectAtIndex_
+	cmp	x0, x19
+	cset	w2, eq
+	SEND	S_setState_
+	b	Lsp_mark
+Lsp_rate:
+	scvtf	s0, w20
+	ldr	s1, [x28, #(Lf_100 - G)]
+	fdiv	s0, s0, s1
+	str	s0, [x28, #G_RATE]
+	ldr	x0, [x28, #G_PLAYER]
+	SEND	S_setDefaultRate_         ; play uses it from now on
+	ldr	x0, [x28, #G_PLAYER]
+	SEND	S_timeControlStatus
+	cbz	x0, Lret3                 ; paused: it stays paused
+	ldr	s0, [x28, #G_RATE]
+	ldr	x0, [x28, #G_PLAYER]
+	SEND	S_setRate_
+	b	Lret3
+
+; media_group(kind) -> This Mac's item's subtitles (0) or sound tracks (1), or nil.
+media_group:
+	FRAME	1
+	CSTR	x9, "AVMediaCharacteristicLegible"
+	CSTR	x10, "AVMediaCharacteristicAudible"
+	cmp	w0, #0
+	csel	x0, x9, x10, eq
+	bl	mkstr
+	mov	x19, x0
+	ldr	x0, [x28, #G_PLAYER]
+	SEND	S_currentItem
+	SEND	S_asset
+	mov	x2, x19
+	SEND	S_mediaSelectionGroupForMediaCharacteristic_
+	b	Lret1
+
+; act_options(menu) — View > Subtitles and Audio Track as they open: the item's options, the chosen one checked.
+	ENTRY	act_options
+	FRAME	4
+	mov	x19, x2
+	mov	x0, x19
+	SEND	S_removeAllItems
+	ldr	x9, [x28, #G_SUBMENU]
+	cmp	x19, x9
+	cset	w20, ne                   ; 0: subtitles, 1: sound tracks
+	mov	w0, w20
+	bl	media_group
+	mov	x21, x0
+	mov	x22, #0                   ; the chosen option
+	cbz	x0, Lop_none
+	ldr	x0, [x28, #G_PLAYER]
+	SEND	S_currentItem
+	SEND	S_currentMediaSelection
+	mov	x2, x21
+	SEND	S_selectedMediaOptionInMediaSelectionGroup_
+	mov	x22, x0
+Lop_none:
+	CSTR	x1, "Off"                 ; subtitles can be off; a sound track cannot
+	CSTR	x9, "Default"
+	cmp	x20, #0
+	csel	x1, x1, x9, eq
+	mov	x0, x19
+	ldr	x2, [x27, #S_act_option_]
+	GADDR	x3, Ls_slash+1
+	bl	add_item
+	mov	x23, x0
+	mov	x2, #-1
+	SEND	S_setTag_
+	mov	x0, x23
+	cmp	x22, #0
+	cset	w2, eq
+	SEND	S_setState_
+	cbz	x20, Lop_list
+	mov	x0, x23                   ; with one sound track there is nothing to choose
+	mov	w2, #0
+	SEND	S_setEnabled_
+Lop_list:
+	cbz	x21, Lret4
+	mov	x0, x21
+	SEND	S_options
+	mov	x24, x0
+	SEND	S_count
+	mov	x25, x0
+	mov	x26, #0
+Lop_each:
+	cmp	x26, x25
+	b.hs	Lret4
+	mov	x0, x24
+	mov	x2, x26
+	SEND	S_objectAtIndex_
+	mov	x20, x0
+	SEND	S_displayName
+	SEND	S_UTF8String
+	mov	x1, x0
+	mov	x0, x19
+	ldr	x2, [x27, #S_act_option_]
+	GADDR	x3, Ls_slash+1
+	bl	add_item
+	mov	x23, x0
+	mov	x2, x26
+	SEND	S_setTag_
+	mov	x0, x23
+	cmp	x20, x22
+	cset	w2, eq
+	SEND	S_setState_
+	add	x26, x26, #1
+	b	Lop_each
+
+; act_option(item) — a subtitle or sound track picked: This Mac's item switches to it (tag -1: subtitles off).
+	ENTRY	act_option
+	FRAME	2
+	mov	x19, x2
+	mov	x0, x19
+	SEND	S_menu
+	ldr	x9, [x28, #G_SUBMENU]
+	cmp	x0, x9
+	cset	w0, ne
+	bl	media_group
+	cbz	x0, Lret2
+	mov	x20, x0
+	mov	x0, x19
+	SEND	S_tag
+	mov	x21, x0
+	mov	x22, #0
+	tbnz	x21, #63, Lot_pick
+	mov	x0, x20
+	SEND	S_options
+	mov	x2, x21
+	SEND	S_objectAtIndex_
+	mov	x22, x0
+Lot_pick:
+	ldr	x0, [x28, #G_PLAYER]
+	SEND	S_currentItem
+	mov	x2, x22
+	mov	x3, x20
+	SEND	S_selectMediaOption_inMediaSelectionGroup_
+	b	Lret2
+
+; act_pip — View > Picture in Picture (Opt-Cmd-P): This Mac's picture floats in its own window, and comes back.
+	ENTRY	act_pip
+	FRAME	1
+	ldr	x19, [x28, #G_PIP]
+	cbnz	x19, Lpi_toggle
+	CLASS	x0, AVPictureInPictureController
+	SEND	S_alloc
+	mov	x19, x0
+	ldr	x0, [x28, #G_VIDEO]
+	SEND	S_layer
+	mov	x2, x0
+	mov	x0, x19
+	SEND	S_initWithPlayerLayer_
+	mov	x19, x0
+	str	x0, [x28, #G_PIP]
+	cbz	x0, Lret1
+Lpi_toggle:
+	mov	x0, x19
+	SEND	S_isPictureInPictureActive
+	ldr	x9, [x27, #S_startPictureInPicture]
+	ldr	x1, [x27, #S_stopPictureInPicture]
+	cmp	w0, #0
+	csel	x1, x9, x1, eq
+	mov	x0, x19
+	bl	_objc_msgSend
+	b	Lret1
+
+; act_layout — the window was resized (or went full screen).
+	ENTRY	act_layout
+	b	layout_stage
 
 ; act_rescan — Cmd-R: search for devices again (e.g. after changing networks); also the first search.
 	ENTRY	act_rescan
 	mov	w0, #0
 	b	search
 
-; act_scan — the picker opens: look for devices that came up since, keeping the listed ones in place.
+; act_scan(menu) — the picker opens: look for devices that came up since, keeping the listed ones in place.
 	ENTRY	act_scan
+	FRAME	1
+	mov	x19, x2
+	ldr	x0, [x28, #G_DEV]
+	SEND	S_menu
+	cmp	x0, x19
+	b.ne	Lret1                     ; another menu of the controller's
 	mov	w0, #1
+	bl	search
+	b	Lret1
+
 ; search(mode) — start a search unless one of its kind is running.
 search:
 	mov	w9, #1
@@ -4698,14 +6799,16 @@ search:
 	add	x11, x28, #G_DISC
 	ldsetal	w9, w10, [x11]
 	tst	w10, w9
-	b.ne	Lat_ret                   ; already running
+	b.ne	Lse_ret                   ; already running
 	mov	x1, x0
 	WORKQ
 	adr	x2, scan_job
 	b	_dispatch_async_f
+Lse_ret:
+	ret
 
-; applicationShouldTerminateAfterLastWindowClosed: -> YES
-imp_quit:
+; imp_yes -> YES: the last window closing quits; the canvas takes the keyboard; a drag is a copy.
+imp_yes:
 	mov	w0, #1
 	ret
 
@@ -4745,16 +6848,28 @@ Lmn_regged:
 	str	w9, [x28, #G_DEVN]        ; the device list starts with This Mac
 	BADDR	x10, B_NOW
 	str	w9, [x10, #NOW_DEVREV]    ; the first render fills the picker
+	fmov	d0, #1.0
+	str	d0, [x28, #G_ARTASP]      ; a square card until artwork arrives
+	fmov	s0, #1.0
+	str	s0, [x28, #G_RATE]
+	ldr	x16, [x27, #F_VTIsHardwareDecodeSupported]
+	cbz	x16, Lmn_build
+	mov	w0, #0x3031               ; 'av01': AV1 streams only where the chip decodes them
+	movk	w0, #0x6176, lsl #16
+	blr	x16
+	and	w0, w0, #0xff
+	str	w0, [x28, #G_AV1]
+Lmn_build:
 	ADDR	x0, Lprog_build
 	bl	ui_run
-	mov	w0, #0                    ; no artist yet
-	bl	layout_text
+	bl	share_init                ; after curl_global_init, before any other thread
 	bl	Lui_refresh
 	ADDR	x0, Lprog_show
 	bl	ui_run
+	bl	layout_stage
 	bl	server_start
 	cbnz	w0, Lmn_discover
-	CSTR	x0, "Could not start the audio server."
+	CSTR	x0, "Could not start the media server."
 	mov	w1, #1
 	bl	set_status
 Lmn_discover:
@@ -4792,8 +6907,11 @@ Lmn_discover:
 	.byte	5, (\fn - B_REG) >> 3
 	.asciz	"\kinds"
 .endm
-.macro RC x, top, w, h
+.macro RC x, top, w, h                ; for 'R': from the content's top-left
 	.short	\x, \top, \w, \h
+.endm
+.macro RN x, y, w, h                  ; for 'N': from the container's bottom-left
+	.short	\x, \y, \w, \h
 .endm
 .macro IMG slot, sym, desc
 	CLS	NSImage
@@ -4806,12 +6924,47 @@ Lmn_discover:
 	MSG	S_retain, "="
 	STO	\slot
 .endm
-.macro NEWV class, x, top, w, h
+.macro NEWV class, x, top, w, h       ; a new view in the content; it stays current
 	CLS	\class
 	MSG	S_alloc, "="
 	MSG	S_initWithFrame_, "=R"
 	RC	\x, \top, \w, \h
 	ADDV
+.endm
+.macro ADDIN parent                   ; add the current view to a container; it stays current
+	STO	G_T3
+	LD	\parent
+	MSG	S_addSubview_, "O"
+	.byte	G_T3 >> 3
+	LD	G_T3
+.endm
+.macro MASKV mask                     ; the current view's autoresizing
+	MSG	S_setAutoresizingMask_, "I"
+	.byte	\mask
+.endm
+.macro COLOR slot, r, g, b, a
+	CLS	NSColor
+	MSG	S_colorWithSRGBRed_green_blue_alpha_, "=KKKK"
+	.byte	\r, \g, \b, \a
+	MSG	S_retain, "="
+	STO	\slot
+.endm
+.macro LAYERBG color, radius          ; a flat fill with continuous corners for the current view
+	MSG	S_setWantsLayer_, "I"
+	.byte	1
+	STO	G_T3
+	LD	\color
+	MSG	S_CGColor, "="
+	STO	G_T2
+	LD	G_T3
+	MSG	S_layer, "="
+	MSG	S_setBackgroundColor_, "O"
+	.byte	G_T2 >> 3
+	MSG	S_setCornerRadius_, "D"
+	.short	(\radius) * 4
+	MSG	S_setCornerCurve_, "S"
+	.asciz	"continuous"
+	LD	G_T3
 .endm
 .macro FONT sel, size, weight
 	CLS	NSFont
@@ -4820,36 +6973,42 @@ Lmn_discover:
 	.byte	\weight
 	STO	G_T0
 .endm
-.macro LABEL slot, text, x, top, w, h, align
+.macro LABELIN slot, parent, text, x, y, w, h, align, color, mask
 	CLS	NSTextField
 	MSG	S_labelWithString_, "=S"
 	.asciz	"\text"
 	STO	\slot
-	MSG	S_setFrame_, "R"
-	RC	\x, \top, \w, \h
+	MSG	S_setFrame_, "N"
+	RN	\x, \y, \w, \h
 	MSG	S_setFont_, "O"
 	.byte	G_T0 >> 3
 	MSG	S_setTextColor_, "O"
-	.byte	G_SECOND >> 3
+	.byte	\color >> 3
 	MSG	S_setAlignment_, "I"
 	.byte	\align
 	MSG	S_setLineBreakMode_, "I"
 	.byte	4                         ; NSLineBreakByTruncatingTail
-	ADDV
+	MASKV	\mask
+	ADDIN	\parent
 .endm
-.macro SLIDER slot, action, x, top, w, max
+.macro SLIDERIN slot, parent, action, x, y, w, max, mask
 	CLS	NSSlider
 	MSG	S_sliderWithTarget_action_, "=OL"
 	.byte	G_CTRL >> 3
 	.asciz	"\action"
 	STO	\slot
-	MSG	S_setFrame_, "R"
-	RC	\x, \top, \w, SLIDER_H
+	MSG	S_setControlSize_, "I"
+	.byte	1                         ; small: a slim track
+	MSG	S_setFrame_, "N"
+	RN	\x, \y, \w, SLIDER_H
 	MSG	S_setMaxValue_, "D"
 	.short	(\max) * 4
-	ADDV
+	MSG	S_setTrackFillColor_, "O"
+	.byte	G_YEL >> 3
+	MASKV	\mask
+	ADDIN	\parent
 .endm
-.macro BUTTON slot, sym, desc, action, tip, bx, btop, bsize, pt
+.macro BTN slot, parent, sym, desc, action, tip, x, y, size, pt, mask, tint
 	CLS	NSImageSymbolConfiguration
 	MSG	S_configurationWithPointSize_weight_, "=DF"
 	.short	(\pt) * 4
@@ -4865,26 +7024,44 @@ Lmn_discover:
 	.byte	0
 	MSG	S_setSymbolConfiguration_, "O"
 	.byte	G_T0 >> 3
-	MSG	S_setFrame_, "R"
-	RC	\bx, \btop, \bsize, \bsize
+	MSG	S_setFrame_, "N"
+	RN	\x, \y, \size, \size
 	MSG	S_setToolTip_, "S"
 	.asciz	"\tip"
-	ADDV
+	MSG	S_setContentTintColor_, "O"
+	.byte	\tint >> 3
+	MASKV	\mask
+	ADDIN	\parent
 .endm
-.macro ARTVIEW slot, x, top, w, h
-	CLS	CALayer
-	MSG	S_layer, "="
-	MSG	S_setContentsGravity_, "S"
-	.asciz	"resizeAspectFill"
-	STO	G_T0
-	NEWV	NSView, \x, \top, \w, \h
+.macro PILL parent, title, action, x, y
+	CLS	NSButton
+	MSG	S_buttonWithTitle_target_action_, "=SOL"
+	.asciz	"\title"
+	.byte	G_CTRL >> 3
+	.asciz	"\action"
+	MSG	S_setBordered_, "I"
+	.byte	0
+	MSG	S_setFrame_, "N"
+	RN	\x, \y, PILL_W, PILL_H
+	MSG	S_setContentTintColor_, "O"
+	.byte	G_TEXT >> 3
+	LAYERBG	G_SURF2, PILL_H / 2
+	ADDIN	\parent
+.endm
+.macro PALETTE slot, sym, color       ; a symbol drawn in one color, kept
+	CLS	NSArray
+	MSG	S_arrayWithObject_, "=O"
+	.byte	\color >> 3
+	STO	G_T1
+	CLS	NSImageSymbolConfiguration
+	MSG	S_configurationWithPaletteColors_, "=O"
+	.byte	G_T1 >> 3
+	STO	G_T1
+	IMG	G_T2, "\sym", "Play on"
+	MSG	S_imageWithSymbolConfiguration_, "=O"
+	.byte	G_T1 >> 3
+	MSG	S_retain, "="
 	STO	\slot
-	MSG	S_setLayer_, "O"
-	.byte	G_T0 >> 3
-	MSG	S_setWantsLayer_, "I"
-	.byte	1
-	MSG	S_setHidden_, "I"
-	.byte	1
 .endm
 .macro SUBMENU title
 	CLS	NSMenu
@@ -4904,6 +7081,28 @@ Lmn_discover:
 	LD	G_T1
 	MSG	S_addItemWithTitle_action_keyEquivalent_, "=SLS"
 	.asciz	"\title", "\action", "\key"
+.endm
+.macro NESTED title                   ; a submenu in the current menu (G_T1); it becomes current, in G_T2
+	CLS	NSMenu
+	MSG	S_alloc, "="
+	MSG	S_initWithTitle_, "=S"
+	.asciz	"\title"
+	STO	G_T2
+	LD	G_T1
+	MSG	S_addItemWithTitle_action_keyEquivalent_, "=SIS"
+	.asciz	"\title"
+	.byte	0
+	.asciz	""
+	MSG	S_setSubmenu_, "O"
+	.byte	G_T2 >> 3
+	LD	G_T2
+.endm
+.macro SPEED title, percent           ; an item of the Speed submenu (G_T2); it stays current
+	LD	G_T2
+	MSG	S_addItemWithTitle_action_keyEquivalent_, "=SLS"
+	.asciz	"\title", "act_speed:", ""
+	MSG	S_setTag_, "I"
+	.byte	\percent
 .endm
 .macro MASK flags                     ; the last item's modifiers, when not Command alone
 	MSG	S_setKeyEquivalentModifierMask_, "X"
@@ -4931,7 +7130,7 @@ Lmn_discover:
 	.asciz	"\types"
 .endm
 
-; Services, the controller (every action's target, the app delegate), the menus (Edit enables Cmd-V), the window and its views.
+; Services, the colors, the controller (every action's target, the app and window delegate), the canvas, the menus (Edit enables Cmd-V), the window and its views.
 Lprog_build:
 	CALL	F_objc_autoreleasePoolPush
 	CALL	F_signal, "II"            ; a vanished speaker must not kill the app
@@ -4956,6 +7155,16 @@ Lprog_build:
 	.short	B_NOW + NOW_NAME
 	.asciz	"This Mac"
 	.byte	128
+
+	; Flat colors: near-black, two surfaces, one yellow accent.
+	COLOR	G_BGC, 21, 21, 21, 255
+	COLOR	G_SURF, 28, 28, 28, 240
+	COLOR	G_SURF2, 39, 39, 39, 255
+	COLOR	G_YEL, 244, 253, 55, 255
+	COLOR	G_TEXT, 229, 229, 229, 255
+	COLOR	G_SECOND, 160, 160, 160, 255
+	COLOR	G_RED, 229, 57, 53, 255
+
 	CLS	NSObject
 	CALL	F_objc_allocateClassPair, "=VCI"
 	.asciz	"BeamController"
@@ -4972,16 +7181,47 @@ Lprog_build:
 	METHOD	"act_mute:", act_mute
 	METHOD	"act_seek:", act_seek
 	METHOD	"act_tick:", act_tick
+	METHOD	"act_resume:", act_resume
 	METHOD	"act_focus:", act_focus
+	METHOD	"act_open:", act_open
+	METHOD	"act_aonly:", act_aonly
 	METHOD	"act_rescan:", act_rescan
 	METHOD	"act_device:", act_device
 	METHOD	"menuWillOpen:", act_scan
-	METHOD	"applicationShouldTerminateAfterLastWindowClosed:", imp_quit, "B@:@"
+	METHOD	"menuNeedsUpdate:", act_options
+	METHOD	"act_speed:", act_speed
+	METHOD	"act_option:", act_option
+	METHOD	"act_pip:", act_pip
+	METHOD	"windowDidResize:", act_layout
+	METHOD	"control:textView:doCommandBySelector:", act_urlcmd, "B@:@@:"
+	METHOD	"application:openURLs:", act_openurls, "v@:@@"
+	METHOD	"applicationShouldTerminateAfterLastWindowClosed:", imp_yes, "B@:@"
 	CALL	F_objc_registerClassPair, "O"
 	.byte	G_T0 >> 3
 	LD	G_T0
 	MSG	S_new, "="
 	STO	G_CTRL
+
+	; The canvas: the window's content; it takes the keyboard, drops and the mouse.
+	CLS	NSView
+	CALL	F_objc_allocateClassPair, "=VCI"
+	.asciz	"BeamView"
+	.byte	0
+	STO	G_T0
+	METHOD	"acceptsFirstResponder", imp_yes, "B@:"
+	METHOD	"mouseMoved:", act_moved
+	METHOD	"mouseDown:", act_click
+	METHOD	"keyDown:", act_key
+	METHOD	"draggingEntered:", imp_yes, "Q@:@"  ; NSDragOperationCopy
+	METHOD	"performDragOperation:", act_drop, "B@:@"
+	CALL	F_objc_registerClassPair, "O"
+	.byte	G_T0 >> 3
+	LD	G_T0
+	MSG	S_alloc, "="
+	MSG	S_initWithFrame_, "=R"
+	RC	0, 0, WIN_W, WIN_H
+	STO	G_CONTENT
+
 	CLS	AVPlayer                  ; This Mac's player
 	MSG	S_new, "="
 	STO	G_PLAYER
@@ -5009,6 +7249,11 @@ Lprog_build:
 	MASK	0
 	SEP
 	ITEM	"Quit Beam", "terminate:", "q"
+	SUBMENU	"File"
+	ITEM	"Open\342\200\246", "act_open:", "o"
+	ITEM	"Open from URL\342\200\246", "act_focus:", "l"
+	SEP
+	ITEM	"Close", "performClose:", "w"
 	SUBMENU	"Edit"
 	ITEM	"Undo", "undo:", "z"
 	ITEM	"Redo", "redo:", "z"
@@ -5018,8 +7263,8 @@ Lprog_build:
 	ITEM	"Copy", "copy:", "c"
 	ITEM	"Paste", "paste:", "v"
 	ITEM	"Select All", "selectAll:", "a"
-	SUBMENU	"Controls"
-	ITEM	"Play/Pause", "act_toggle:", " "  ; Space, only when not typing in the field
+	SUBMENU	"Playback"
+	ITEM	"Play/Pause", "act_toggle:", " "  ; Space, only when not typing a link
 	MASK	0
 	ITEM	"Stop", "act_stop:", "."
 	SEP
@@ -5031,11 +7276,36 @@ Lprog_build:
 	ITEM	"Mute", "act_mute:", "\357\234\201"
 	MASK	0x180000
 	SEP
-	ITEM	"Paste Link or Search\342\200\246", "act_focus:", "l"
+	ITEM	"Audio Only", "act_aonly:", "a"
+	MASK	0x180000
+	STO	G_AOITEM
+	NESTED	"Speed"
+	SPEED	"0.5\303\227", 50
+	SPEED	"0.75\303\227", 75
+	SPEED	"1\303\227", 100
+	MSG	S_setState_, "I"          ; normal speed to begin with
+	.byte	1
+	SPEED	"1.25\303\227", 125
+	SPEED	"1.5\303\227", 150
+	SPEED	"2\303\227", 200
+	SEP
 	ITEM	"Find Devices", "act_rescan:", "r"
+	SUBMENU	"View"
+	ITEM	"Enter Full Screen", "toggleFullScreen:", "f"
+	MASK	0x140000
+	ITEM	"Picture in Picture", "act_pip:", "p"
+	MASK	0x180000
+	SEP
+	NESTED	"Subtitles"
+	STO	G_SUBMENU                 ; the item's legible options; Audio Track lists its audible ones
+	MSG	S_setDelegate_, "O"       ; filled as they open
+	.byte	G_CTRL >> 3
+	NESTED	"Audio Track"
+	MSG	S_setDelegate_, "O"
+	.byte	G_CTRL >> 3
 	SUBMENU	"Window"
 	ITEM	"Minimize", "performMiniaturize:", "m"
-	ITEM	"Close", "performClose:", "w"
+	ITEM	"Zoom", "performZoom:", ""
 	LD	G_APP
 	MSG	S_setWindowsMenu_, "O"
 	.byte	G_T1 >> 3
@@ -5047,177 +7317,271 @@ Lprog_build:
 	.long	WIN_STYLE
 	.byte	2, 0                      ; buffered, not deferred
 	STO	G_WIN
+	MSG	S_setTitle_, "S"          ; for the Window menu and Mission Control
+	.asciz	"Beam"
 	MSG	S_setTitlebarAppearsTransparent_, "I" ; content flows under it
 	.byte	1
 	MSG	S_setMovableByWindowBackground_, "I"
 	.byte	1
 	MSG	S_setTitleVisibility_, "I"
 	.byte	1                         ; hidden: the title bar holds only the window buttons
-	MSG	S_contentView, "="
-	STO	G_CONTENT
-	MSG	S_setWantsLayer_, "I"     ; within-window blur needs layers
-	.byte	1
+	MSG	S_setBackgroundColor_, "O"
+	.byte	G_BGC >> 3
+	MSG	S_setCollectionBehavior_, "I"
+	.byte	FULL_SCREEN_PRIMARY
+	MSG	S_setContentMinSize_, "DD"
+	.short	WIN_W * 4, WIN_H * 4
+	MSG	S_setDelegate_, "O"
+	.byte	G_CTRL >> 3
+	MSG	S_setContentView_, "O"
+	.byte	G_CONTENT >> 3
 	CLS	NSAppearance
 	MSG	S_appearanceNamed_, "=S"
 	.asciz	"NSAppearanceNameDarkAqua"
 	STO	G_T0
 	LD	G_WIN
-	MSG	S_setAppearance_, "O"     ; a dark player, lit by its artwork
+	MSG	S_setAppearance_, "O"
 	.byte	G_T0 >> 3
+	CLS	NSString                  ; drops: files, links and text
+	MSG	S_stringWithUTF8String_, "=C"
+	.asciz	"public.file-url public.url public.utf8-plain-text"
+	MSG	S_componentsSeparatedByString_, "=S"
+	.asciz	" "
+	STO	G_T1
+	LD	G_CONTENT
+	MSG	S_registerForDraggedTypes_, "O"
+	.byte	G_T1 >> 3
+	CLS	NSTrackingArea            ; mouse moves bring the controls back
+	MSG	S_alloc, "="
+	MSG	S_initWithRect_options_owner_userInfo_, "=RXOI"
+	RC	0, 0, WIN_W, WIN_H
+	.long	TRACK_OPTIONS
+	.byte	G_CONTENT >> 3, 0
+	STO	G_T1
+	LD	G_CONTENT
+	MSG	S_addTrackingArea_, "O"
+	.byte	G_T1 >> 3
 
-	; Backdrop: the artwork, aspect-filled behind everything, under frosted glass.
-	ARTVIEW	G_BGART, 0, 0, WIN_W, WIN_H
-	NEWV	NSVisualEffectView, 0, 0, WIN_W, WIN_H
-	MSG	S_setMaterial_, "I"
-	.byte	13                        ; HUD window
-	MSG	S_setBlendingMode_, "I"
-	.byte	1                         ; within the window
-	MSG	S_setState_, "I"
-	.byte	1                         ; active
-
-	; Search field: paste a link or type a search, then Return.
-	NEWV	NSSearchField, PAD, FIELD_T, CONTENT_W, FIELD_H
-	STO	G_FIELD
-	MSG	S_setControlSize_, "I"
-	.byte	3                         ; large
-	MSG	S_setFocusRingType_, "I"
-	.byte	1                         ; none: the caret shows focus
-	MSG	S_setPlaceholderString_, "S"
-	.asciz	"Paste a link or search YouTube"
-	MSG	S_setSendsWholeSearchString_, "I" ; act on Return only
+	; The picture: This Mac's player, fitted to the window.
+	CLS	AVPlayerLayer
+	MSG	S_playerLayerWithPlayer_, "=O"
+	.byte	G_PLAYER >> 3
+	STO	G_T1
+	NEWV	NSView, 0, 0, WIN_W, WIN_H
+	STO	G_VIDEO
+	MSG	S_setLayer_, "O"
+	.byte	G_T1 >> 3
+	MSG	S_setWantsLayer_, "I"
 	.byte	1
-	MSG	S_setTarget_, "O"
-	.byte	G_CTRL >> 3
-	MSG	S_setAction_, "L"
-	.asciz	"act_play:"
+	MASKV	AR_WIDTH | AR_HEIGHT
+	MSG	S_setHidden_, "I"
+	.byte	1
 
-	; Artwork placeholder: a rounded fill with a large music note.
+	; The artwork card (placed by layout_stage), with a music note while it has no image.
+	CLS	CALayer
+	MSG	S_layer, "="
+	MSG	S_setContentsGravity_, "S"
+	.asciz	"resizeAspectFill"
+	STO	G_T0
+	NEWV	NSView, 0, 0, 96, 96
+	STO	G_ART
+	MSG	S_setLayer_, "O"
+	.byte	G_T0 >> 3
+	MSG	S_setWantsLayer_, "I"
+	.byte	1
+	MSG	S_setClipsToBounds_, "I"  ; AppKit mirrors it into masksToBounds
+	.byte	1
+	MSG	S_setHidden_, "I"
+	.byte	1
+	LAYERBG	G_SURF2, ART_RADIUS
 	CLS	NSImageSymbolConfiguration
 	MSG	S_configurationWithPointSize_weight_, "=DF"
-	.short	64 * 4
+	.short	56 * 4
 	.byte	X_REGULAR
 	STO	G_T0
-	CLS	NSColor
-	MSG	S_tertiaryLabelColor, "="
-	STO	G_T1
 	IMG	G_T2, "music.note", "No artwork"
+	CLS	NSImageView
+	MSG	S_imageViewWithImage_, "=O"
+	.byte	G_T2 >> 3
+	STO	G_NOTE
+	MSG	S_setSymbolConfiguration_, "O"
+	.byte	G_T0 >> 3
+	MSG	S_setContentTintColor_, "O"
+	.byte	G_SECOND >> 3
+	MSG	S_setHidden_, "I"
+	.byte	1
+	ADDV
+
+	; Nothing playing: an invitation to drop or open something.
+	NEWV	NSView, 0, 0, EMPTY_W, EMPTY_H
+	STO	G_EMPTY
+	CLS	NSImageSymbolConfiguration
+	MSG	S_configurationWithPointSize_weight_, "=DF"
+	.short	44 * 4
+	.byte	X_REGULAR
+	STO	G_T0
+	IMG	G_T2, "play.circle", ""
 	CLS	NSImageView
 	MSG	S_imageViewWithImage_, "=O"
 	.byte	G_T2 >> 3
 	MSG	S_setSymbolConfiguration_, "O"
 	.byte	G_T0 >> 3
 	MSG	S_setContentTintColor_, "O"
-	.byte	G_T1 >> 3
-	STO	G_T0
-	CLS	NSColor
-	MSG	S_quaternarySystemFillColor, "="
-	STO	G_T1
-	NEWV	NSBox, ART_X, ART_T, ART_S, ART_S
-	MSG	S_setBoxType_, "I"
-	.byte	4                         ; custom
-	MSG	S_setTitlePosition_, "I"
-	.byte	0                         ; no title
-	MSG	S_setBorderWidth_, "D"
-	.short	0
-	MSG	S_setCornerRadius_, "D"
-	.short	ART_RADIUS * 4
-	MSG	S_setFillColor_, "O"
-	.byte	G_T1 >> 3
-	MSG	S_setContentView_, "O"
-	.byte	G_T0 >> 3
+	.byte	G_YEL >> 3
+	MSG	S_setFrame_, "N"
+	RN	(EMPTY_W - 64) / 2, EMPTY_H - 64, 64, 64
+	ADDIN	G_EMPTY
+	FONT	S_systemFontOfSize_weight_, 20, X_SEMIBOLD
+	LABELIN	G_T2, G_EMPTY, "Drop a file or a link", 0, 88, EMPTY_W, 26, 1, G_TEXT, 0
+	FONT	S_systemFontOfSize_weight_, 13, X_REGULAR
+	LABELIN	G_T2, G_EMPTY, "Audio and video, from this Mac or the web.", 0, 64, EMPTY_W, 18, 1, G_SECOND, 0
+	PILL	G_EMPTY, "Open File\342\200\246", "act_open:", EMPTY_W / 2 - PILL_W - 6, 8
+	PILL	G_EMPTY, "Open from URL\342\200\246", "act_focus:", EMPTY_W / 2 + 6, 8
 
-	; Artwork card over the placeholder, clipped to continuous corners.
-	ARTVIEW	G_ART, ART_X, ART_T, ART_S, ART_S
-	MSG	S_setClipsToBounds_, "I"  ; AppKit mirrors it into masksToBounds
-	.byte	1
-	MSG	S_layer, "="
-	MSG	S_setCornerRadius_, "D"
-	.short	ART_RADIUS * 4
-	MSG	S_setCornerCurve_, "S"
-	.asciz	"continuous"
-
-	; Spinner over the artwork while a link resolves.
-	NEWV	NSProgressIndicator, ART_X + (ART_S - SPIN_S) / 2, ART_T + (ART_S - SPIN_S) / 2, SPIN_S, SPIN_S
+	; A spinner while a link resolves.
+	NEWV	NSProgressIndicator, 0, 0, SPIN_S, SPIN_S
 	STO	G_SPIN
 	MSG	S_setStyle_, "I"
 	.byte	1                         ; spinning
 	MSG	S_setDisplayedWhenStopped_, "I"
 	.byte	0
 
-	; Title (two lines, truncated) and artist, centered under the artwork by layout_text.
-	CLS	NSColor
-	MSG	S_secondaryLabelColor, "="
-	MSG	S_retain, "="
-	STO	G_SECOND
-	FONT	S_systemFontOfSize_weight_, 17, X_SEMIBOLD
+	; Status line under the title bar: errors in red, hints in grey.
 	CLS	NSTextField
-	MSG	S_wrappingLabelWithString_, "=S"
-	.asciz	"Nothing playing"
-	STO	G_TITLE
-	MSG	S_setSelectable_, "I"
-	.byte	0
-	MSG	S_setMaximumNumberOfLines_, "I"
-	.byte	2
-	MSG	S_setAlignment_, "I"
-	.byte	1                         ; centered
+	MSG	S_labelWithString_, "=S"
+	.asciz	""
+	STO	G_STATUS
+	MSG	S_setFrame_, "R"
+	RC	80, STATUS_T, WIN_W - 160, LABEL_H
+	FONT	S_systemFontOfSize_weight_, 12, X_REGULAR
+	LD	G_STATUS
 	MSG	S_setFont_, "O"
 	.byte	G_T0 >> 3
-	MSG	S_setTextColor_, "O"
-	.byte	G_SECOND >> 3
+	MSG	S_setAlignment_, "I"
+	.byte	1                         ; centered
+	MSG	S_setLineBreakMode_, "I"
+	.byte	4
+	MASKV	AR_WIDTH | AR_BOTTOM
 	ADDV
-	MSG	S_cell, "="
-	MSG	S_setTruncatesLastVisibleLine_, "I"
-	.byte	1
-	FONT	S_systemFontOfSize_weight_, 13, X_REGULAR
-	LABEL	G_ARTIST, "", PAD, TITLE_T, CONTENT_W, ARTIST_H, 1
 
-	; Progress: slider, then elapsed and remaining time (fixed-width digits).
-	SLIDER	G_POS, "act_seek:", PAD, SEEK_T, CONTENT_W, 1
+	; The control bar, floating at the bottom: progress, then the track, the transport, the sound and where it plays.
+	NEWV	NSView, BAR_M, WIN_H - BAR_M - BAR_H, BAR_W, BAR_H
+	STO	G_BAR
+	MASKV	AR_WIDTH | AR_TOP
+	LAYERBG	G_SURF, 16
 	FONT	S_monospacedDigitSystemFontOfSize_weight_, 11, X_MEDIUM
-	LABEL	G_CUR, "0:00", PAD, TIME_T, TIME_W, LABEL_H, 0
-	LABEL	G_DUR, "--:--", WIN_W - PAD - TIME_W, TIME_T, TIME_W, LABEL_H, 2
+	LABELIN	G_CUR, G_BAR, "0:00", 16, ROW1_Y + 2, TIME_W, LABEL_H, 0, G_SECOND, AR_RIGHT
+	LABELIN	G_DUR, G_BAR, "--:--", BAR_W - 16 - TIME_W, ROW1_Y + 2, TIME_W, LABEL_H, 2, G_SECOND, AR_LEFT
+	SLIDERIN	G_POS, G_BAR, "act_seek:", 24 + TIME_W, ROW1_Y, BAR_W - 2 * (24 + TIME_W), 1, AR_WIDTH
+	FONT	S_systemFontOfSize_weight_, 13, X_SEMIBOLD
+	LABELIN	G_TITLE, G_BAR, "Nothing playing", 16, ROW2_C - 9, TEXT_W, 18, 0, G_SECOND, AR_WIDTH | AR_RIGHT
+	FONT	S_systemFontOfSize_weight_, 12, X_REGULAR
+	LABELIN	G_ARTIST, G_BAR, "", 16, ROW2_C - 17, TEXT_W, 16, 0, G_SECOND, AR_WIDTH | AR_RIGHT
+	BTN	G_BACK, G_BAR, "gobackward.10", "Back 10 seconds", "act_back:", "Back 10 seconds (\342\214\230\342\206\220)", BACK_X, ROW2_C - BTN_S / 2, BTN_S, 16, AR_LEFT | AR_RIGHT, G_TEXT
+	BTN	G_PP, G_BAR, "play.fill", "Play or pause", "act_toggle:", "Play or pause (Space)", PLAY_X, ROW2_C - PLAY_S / 2, PLAY_S, 17, AR_LEFT | AR_RIGHT, G_BGC
+	LAYERBG	G_YEL, PLAY_S / 2
+	BTN	G_FWD, G_BAR, "goforward.10", "Forward 10 seconds", "act_fwd:", "Forward 10 seconds (\342\214\230\342\206\222)", FWD_X, ROW2_C - BTN_S / 2, BTN_S, 16, AR_LEFT | AR_RIGHT, G_TEXT
+	BTN	G_AOBTN, G_BAR, "headphones", "Audio only", "act_aonly:", "Audio Only (\342\214\245\342\214\230A)", AO_X, ROW2_C - ICON_S / 2, ICON_S, 13, AR_LEFT, G_SECOND
+	BTN	G_MUTE, G_BAR, "speaker.wave.2.fill", "Mute", "act_mute:", "Mute (\342\214\245\342\214\230\342\206\223)", MUTE_X, ROW2_C - ICON_S / 2, ICON_S, 13, AR_LEFT, G_SECOND
+	SLIDERIN	G_VOL, G_BAR, "act_vol:", VOL_X, ROW2_C - SLIDER_H / 2, VOL_W, 100, AR_LEFT
 
-	; Transport: -10 s, play/pause, +10 s (Stop lives in the Controls menu).
-	BUTTON	G_BACK, "gobackward.10", "Back 10 seconds", "act_back:", "Back 10 seconds (\342\214\230\342\206\220)", BACK_X, SMALL_T, BTN_S, 22
-	BUTTON	G_PP, "play.fill", "Play or pause", "act_toggle:", "Play or pause (Space)", PLAY_X, PLAY_T, PLAY_S, 34
-	BUTTON	G_FWD, "goforward.10", "Forward 10 seconds", "act_fwd:", "Forward 10 seconds (\342\214\230\342\206\222)", FWD_X, SMALL_T, BTN_S, 22
+	; AirPlay: This Mac's picture and sound to an Apple TV or an AirPlay TV or speaker; lit while it does.
+	CLS	AVRoutePickerView
+	MSG	S_alloc, "="
+	MSG	S_initWithFrame_, "=N"
+	RN	AIR_X, ROW2_C - AIR_W / 2, AIR_W, AIR_W
+	MSG	S_setPlayer_, "O"
+	.byte	G_PLAYER >> 3
+	MSG	S_setRoutePickerButtonBordered_, "I"
+	.byte	0
+	MSG	S_setRoutePickerButtonColor_forState_, "OI"
+	.byte	G_SECOND >> 3, 0          ; normal
+	MSG	S_setRoutePickerButtonColor_forState_, "OI"
+	.byte	G_YEL >> 3, 2             ; active
+	MSG	S_setToolTip_, "S"
+	.asciz	"AirPlay"
+	MASKV	AR_LEFT
+	ADDIN	G_BAR
 
-	; Volume: mute toggle, slider, loud icon.
-	BUTTON	G_MUTE, "speaker.wave.2.fill", "Mute", "act_mute:", "Mute (\342\214\245\342\214\230\342\206\223)", PAD, VOL_T - 1, VOL_ICON_S, 13
-	SLIDER	G_VOL, "act_vol:", VOL_X, VOL_T, VOL_W, 100
-	IMG	G_T2, "speaker.wave.3.fill", "Maximum volume"
-	CLS	NSImageView
-	MSG	S_imageViewWithImage_, "=O"
-	.byte	G_T2 >> 3
-	MSG	S_setContentTintColor_, "O"
-	.byte	G_SECOND >> 3
-	MSG	S_setFrame_, "R"
-	RC	VMAX_X, VOL_T, VOL_ICON_S, SLIDER_H
-	ADDV
-
-	; Playing on: the device picker, centered in its own row by center_picker.
-	FONT	S_systemFontOfSize_weight_, 12, X_MEDIUM
+	; Where it plays: This Mac or a network speaker or TV, a pull-down whose face is lit while a device plays.
+	PALETTE	G_IMGDEV, "hifispeaker.2.fill", G_TEXT
+	PALETTE	G_IMGDEVON, "hifispeaker.2.fill", G_YEL
 	CLS	NSPopUpButton
-	MSG	S_new, "="
+	MSG	S_alloc, "="
+	MSG	S_initWithFrame_pullsDown_, "=NI"
+	RN	DEV_X, ROW2_C - 14, DEV_W, 28
+	.byte	1
 	STO	G_DEV
 	MSG	S_setBordered_, "I"
 	.byte	0
-	MSG	S_setFont_, "O"
-	.byte	G_T0 >> 3
 	MSG	S_setTarget_, "O"
 	.byte	G_CTRL >> 3
 	MSG	S_setAction_, "L"
 	.asciz	"act_device:"
 	MSG	S_setToolTip_, "S"
-	.asciz	"Play on"
-	ADDV
+	.asciz	"Play on a network speaker or TV"
+	MASKV	AR_LEFT
+	ADDIN	G_BAR
+	MSG	S_cell, "="
+	MSG	S_setArrowPosition_, "I"
+	.byte	0                         ; no arrow: the icon says it all
+	LD	G_DEV
 	MSG	S_menu, "="               ; its opening starts a search
 	MSG	S_setDelegate_, "O"
 	.byte	G_CTRL >> 3
+	MSG	S_addItemWithTitle_action_keyEquivalent_, "=SIS"
+	.asciz	""
+	.byte	0
+	.asciz	""
+	MSG	S_setImage_, "O"          ; the face
+	.byte	G_IMGDEV >> 3
 
-	; Status line: errors in red, hints in grey.
-	FONT	S_systemFontOfSize_weight_, 11, X_REGULAR
-	LABEL	G_STATUS, "", PAD, STATUS_T, CONTENT_W, LABEL_H, 1
+	; Open from URL: a field floating under the title bar.
+	NEWV	NSView, (WIN_W - URL_W) / 2, 56, URL_W, URL_H
+	STO	G_URLBOX
+	MASKV	AR_LEFT | AR_RIGHT | AR_BOTTOM
+	LAYERBG	G_SURF2, 12
+	MSG	S_setHidden_, "I"
+	.byte	1
+	IMG	G_T1, "link", "Link"
+	CLS	NSImageView
+	MSG	S_imageViewWithImage_, "=O"
+	.byte	G_T1 >> 3
+	MSG	S_setFrame_, "N"
+	RN	16, 14, 20, 20
+	MSG	S_setContentTintColor_, "O"
+	.byte	G_SECOND >> 3
+	ADDIN	G_URLBOX
+	FONT	S_systemFontOfSize_weight_, 17, X_REGULAR
+	CLS	NSTextField
+	MSG	S_alloc, "="
+	MSG	S_initWithFrame_, "=N"
+	RN	46, 12, URL_W - 62, 24
+	STO	G_FIELD
+	MSG	S_setBezeled_, "I"
+	.byte	0
+	MSG	S_setDrawsBackground_, "I"
+	.byte	0
+	MSG	S_setFocusRingType_, "I"
+	.byte	1                         ; none: the caret shows focus
+	MSG	S_setFont_, "O"
+	.byte	G_T0 >> 3
+	MSG	S_setTextColor_, "O"
+	.byte	G_TEXT >> 3
+	MSG	S_setPlaceholderString_, "S"
+	.asciz	"Paste a link or search YouTube"
+	MSG	S_setTarget_, "O"
+	.byte	G_CTRL >> 3
+	MSG	S_setAction_, "L"
+	.asciz	"act_play:"
+	MSG	S_setDelegate_, "O"       ; Escape closes it
+	.byte	G_CTRL >> 3
+	ADDIN	G_URLBOX
+	MSG	S_cell, "="
+	MSG	S_setScrollable_, "I"     ; one line that scrolls, however long the link
+	.byte	1
+	MSG	S_setUsesSingleLineMode_, "I"
+	.byte	1
 
 	; Images swapped by ui_refresh.
 	IMAGE	G_IMGPLAY, "play.fill", "Play"
@@ -5226,21 +7590,20 @@ Lprog_build:
 	IMAGE	G_IMGUNMUTED, "speaker.wave.2.fill", "Mute"
 	OP_END
 
-; Centered; the position is not saved, so the app writes no preferences.
+; The first size, centered; neither is saved, so the app writes no preferences.
 Lprog_show:
 	LD	G_WIN
+	MSG	S_setContentSize_, "DD"
+	.short	START_W * 4, START_H * 4
 	MSG	S_center
 	MSG	S_makeKeyAndOrderFront_, "I"
 	.byte	0
-	MSG	S_makeFirstResponder_, "O" ; ready to paste right away
-	.byte	G_FIELD >> 3
+	MSG	S_makeFirstResponder_, "O"
+	.byte	G_CONTENT >> 3
 	OP_END
 
-; While a link resolves: the spinner turns and the field waits; then they rest.
+; While a link resolves the spinner turns; then it rests.
 Lprog_busy:
-	LD	G_FIELD
-	MSG	S_setEnabled_, "I"
-	.byte	0
 	LD	G_SPIN
 	MSG	S_startAnimation_, "I"
 	.byte	0
@@ -5249,29 +7612,47 @@ Lprog_idle:
 	LD	G_SPIN
 	MSG	S_stopAnimation_, "I"
 	.byte	0
-	LD	G_FIELD
-	MSG	S_setEnabled_, "I"
-	.byte	1
 	OP_END
 
-; Played: the field empties and gives up focus, so Space plays and pauses again.
+; Played: the link field empties.
 Lprog_played:
 	LD	G_FIELD
 	MSG	S_setStringValue_, "S"
 	.asciz	""
-	LD	G_WIN
-	MSG	S_makeFirstResponder_, "I"
-	.byte	0
 	OP_END
 
-; Cmd-L: the window forward, the search field selected.
+; Open from URL: the window forward, the field shown and focused with its text selected.
 Lprog_focus:
+	LD	G_URLBOX
+	MSG	S_setHidden_, "I"
+	.byte	0
 	LD	G_WIN
 	MSG	S_makeKeyAndOrderFront_, "I"
 	.byte	0
 	LD	G_FIELD
 	MSG	S_selectText_, "I"
 	.byte	0
+	OP_END
+
+; The field goes away and the canvas keeps the keyboard.
+Lprog_urlhide:
+	LD	G_URLBOX
+	MSG	S_setHidden_, "I"
+	.byte	1
+	LD	G_WIN
+	MSG	S_makeFirstResponder_, "O"
+	.byte	G_CONTENT >> 3
+	OP_END
+
+; Audio Only's swap: a quarter-second timer until the new item is ready.
+Lprog_resume:
+	CLS	NSTimer
+	MSG	S_scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_, "=DOLII"
+	.short	1
+	.byte	G_CTRL >> 3
+	.asciz	"act_resume:"
+	.byte	0, 1
+	STO	G_RESUMET
 	OP_END
 
 ; The 1 Hz poll timer (macOS may coalesce its wakeups), then the run loop.
