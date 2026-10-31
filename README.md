@@ -2,13 +2,13 @@
 
 <img src="icon.svg" alt="Beam icon" width="128">
 
-A native macOS media player, written entirely in arm64 assembly. It plays audio and video from your Mac or the web, on your Mac, on AirPlay, or on any speaker or TV on your network.
+A native macOS media player, written entirely in arm64 assembly. It plays audio and video from your Mac or the web, on your Mac or on AirPlay.
 
 ## What it plays
 
-- **Files**: any audio or video macOS plays. Open one with ⌘O, drop it on the window, or use Open With in the Finder.
-- **From a URL** (⌘L): a YouTube link, or words to search YouTube for; any other web address of a media file or HLS stream plays as it is.
-- **YouTube** plays up to 4K, in AV1 where the chip decodes it in hardware and H.264 otherwise; live streams play with their picture.
+- **Files**: any audio or video macOS plays. Open one from the File menu (⌘O), drop it on the window, or use Open With in the Finder.
+- **From a URL** (File > Open from URL, ⌘L): a YouTube link, or words to search YouTube for; any other web address of a media file or HLS stream plays as it is.
+- **YouTube** plays up to 4K, in AV1 where the chip decodes it in hardware and H.264 otherwise, with the original sound rather than a dub; live streams play with their picture.
 - **Audio Only** (⌥⌘A, or the headphones): the picture is neither downloaded nor decoded.
 - **Subtitles and audio tracks** of files and streams that have them, in the View menu; **speed** from 0.5× to 2× in the Playback menu; **Picture in Picture** (⌥⌘P).
 
@@ -16,7 +16,6 @@ A native macOS media player, written entirely in arm64 assembly. It plays audio 
 
 - **This Mac**: the current macOS output: built-in, wired, Bluetooth or AirPlay speakers and headphones.
 - **AirPlay** (the AirPlay button): picture and sound to an Apple TV or an AirPlay TV or speaker.
-- **Network speakers and TVs** (the speaker button, yellow while one plays): any UPnP/DLNA renderer, Sonos included, found automatically; opening the menu also finds the ones turned on since. Speakers get the sound; TVs get the picture too. Files from your Mac play on them as well. Set `BEAM_HOST` to a device's description URL (or a Sonos IP) to use only that one.
 
 ## Build and run
 
@@ -45,14 +44,5 @@ It opens in about 0.15 s; a 4K YouTube link plays in about 0.8 s, and in about 0
 | Open from URL             | ⌘L                            |
 | Audio Only                | ⌥⌘A                           |
 | Stop                      | ⌘.                            |
-| Find devices again        | ⌘R                            |
 
 While a video plays, the controls and the pointer step aside after three still seconds; moving the mouse brings them back.
-
-## Test
-
-```sh
-./test/run.sh
-```
-
-It runs the media server and everything that reads what comes from the network (requests and their ranges, YouTube's segment indexes and player answers, live AAC segments) against malformed input, under Guard Malloc, so a read past any buffer stops the run. Nothing plays, no window opens and no device is contacted.

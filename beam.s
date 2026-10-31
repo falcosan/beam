@@ -91,7 +91,7 @@ Lc\@:	.asciz	"\text"
 	add	\reg, \reg, Lc\@@PAGEOFF
 .endm
 
-; LOCK / UNLOCK — the lock guarding the snapshot, the device list and the stream slots.
+; LOCK / UNLOCK — the lock guarding the stream slots and the libcurl handles.
 .macro LOCK
 	bl	lock
 .endm
@@ -123,7 +123,6 @@ Lc\@:	.asciz	"\text"
 .equ CURLOPT_POSTFIELDS,         10015
 .equ CURLOPT_USERAGENT,          10018
 .equ CURLOPT_HTTPHEADER,         10023
-.equ CURLOPT_INTERFACE,          10062
 .equ CURLOPT_ACCEPT_ENCODING,    10102
 .equ CURLOPT_WRITEFUNCTION,      20011
 .equ CURLOPT_FAILONERROR,        45
@@ -144,15 +143,11 @@ Lc\@:	.asciz	"\text"
 .equ CURLSHOPT_UNLOCKFUNC,       4
 .equ CURL_LOCK_DATA_DNS,         3
 .equ CURL_LOCK_DATA_SSL_SESSION, 4
-.equ CURL_LOCK_DATA_CONNECT,     5
 .equ CURLH_HEADER,               1
 
 ; BSD sockets, signals and GCD.
 .equ AF_INET,                    2
 .equ SOCK_STREAM,                1
-.equ SOCK_DGRAM,                 2
-.equ IPPROTO_IP,                 0
-.equ IP_MULTICAST_IF,            9
 .equ SOL_SOCKET,                 0xffff
 .equ SO_RCVTIMEO,                0x1006
 .equ SOCKADDR_IN_HEAD,           0x0210   ; sin_len = 16, sin_family = AF_INET
@@ -160,19 +155,8 @@ Lc\@:	.asciz	"\text"
 .equ SIG_IGN,                    1
 .equ QOS_CLASS_USER_INITIATED,   0x19
 .equ DISPATCH_TIME_FOREVER,      -1
-.equ IFA_NAME,                   8
-.equ IFA_FLAGS,                  16
-.equ IFA_ADDR,                   24
-.equ IFA_NETMASK,                32
 
 ; Network timeouts and limits.
-.equ SSDP_PORT_BE,               0x6c07   ; htons(1900)
-.equ SSDP_ROUNDS,                3
-.equ SSDP_WAIT_MS,               800
-.equ SSDP_MAX_REPLIES,           32
-.equ SOAP_TIMEOUT_MS,            5000
-.equ DESC_TIMEOUT_MS,            2500
-.equ CONNECT_TIMEOUT_MS,         1500
 .equ ART_TIMEOUT_MS,             10000
 .equ API_TIMEOUT_MS,             30000
 .equ API_CONNECT_MS,             8000
@@ -183,38 +167,34 @@ Lc\@:	.asciz	"\text"
 .equ CLIENT_TIMEOUT_S,           10
 .equ ACCEPT_BACKOFF_US,          10000
 .equ MAX_CONNS,                  32
+.equ HANDLES,                    8
 .equ LIVE_TRIES,                 3        ; failed segment fetches in a row before a live stream ends
 .equ SLOTS,                      32       ; a video on This Mac takes five: picture, sound and their playlists
 .equ TOKEN_STRIDE,               40       ; 32 hex + NUL; the last byte flags a live stream
 .equ SLOT_SOUND,                 0        ; what a stream slot serves
 .equ SLOT_LIVE,                  1        ; a live broadcast, as ADTS
 .equ SLOT_VIDEO,                 2
-.equ MYURI_SIZE,                 4096
 .equ HIDE_TICKS,                 3        ; idle seconds before the controls leave a playing video
 .equ VIDEO_MAX_H,                2160     ; the tallest video stream picked
 .equ SKIP_SECONDS,               10
 .equ VOLUME_STEP,                5
 
 ; Transport states.
-.equ ST_OFFLINE,                 0
 .equ ST_STOPPED,                 1
 .equ ST_PLAYING,                 2
 .equ ST_PAUSED,                  3
 .equ ST_TRANSITIONING,           4
 
-; now: the "now playing" snapshot shared with the main thread.
+; now: This Mac's "now playing" snapshot.
 .equ NOW_STATE,                  0
-.equ NOW_SEL,                    4
 .equ NOW_VOL,                    8
 .equ NOW_MUTE,                   12
 .equ NOW_POS,                    16
 .equ NOW_DUR,                    24       ; 0 = unknown or live
-.equ NOW_NAME,                   32       ; char[128]
-.equ NOW_TITLE,                  160      ; char[512]
-.equ NOW_ARTIST,                 672      ; char[256]
-.equ NOW_ART,                    928      ; char[2048]
-.equ NOW_DEVREV,                 2976
-.equ NOW_SIZE,                   2992
+.equ NOW_TITLE,                  32       ; char[512]
+.equ NOW_ARTIST,                 544      ; char[256]
+.equ NOW_ART,                    800      ; char[2048]
+.equ NOW_SIZE,                   2848
 
 ; Track: title, artist and artwork URL, laid out as in the snapshot from NOW_TITLE.
 .equ T_TITLE,                    0        ; char[512]
@@ -230,13 +210,14 @@ Lc\@:	.asciz	"\text"
 .equ FMT_CODECS,                 32       ; char[64], e.g. "avc1.640028"
 .equ FMT_SIZE,                   96
 
-; Play job: main -> worker -> device queue -> main.
+; Play job: main -> worker -> main.
 .equ JOB_QUERY,                  0        ; char*, a link, search text or file path (owned)
 .equ JOB_RESULT,                 8        ; int, PLAY_*
 .equ JOB_LIVE,                   12       ; int
 .equ JOB_DUR,                    16       ; seconds, 0 when live or unknown
 .equ JOB_ERR,                    24       ; char*, why it failed, or NULL
 .equ JOB_KIND,                   32       ; int, KIND_*
+.equ JOB_GEN,                    36
 .equ JOB_ITEM,                   40       ; AVPlayerItem for This Mac, retained, or nil
 .equ JOB_TRACK,                  48       ; Track
 .equ JOB_AFMT,                   JOB_TRACK + T_SIZE ; Fmt of the sound stream
@@ -244,8 +225,7 @@ Lc\@:	.asciz	"\text"
 .equ JOB_MSG,                    JOB_VFMT + FMT_SIZE ; char[128], an error message
 .equ JOB_URL,                    JOB_MSG + 128      ; char[4096], the media URL
 .equ JOB_VURL,                   JOB_URL + 4096     ; char[4096], the video stream's URL, or ""
-.equ JOB_MURL,                   JOB_VURL + 4096    ; char[4096], picture and sound in one MP4 (for TVs), or ""
-.equ JOB_LOCAL,                  JOB_MURL + 4096    ; char[256], This Mac's URL of the sound
+.equ JOB_LOCAL,                  JOB_VURL + 4096    ; char[256], This Mac's URL of the sound
 .equ JOB_VLOCAL,                 JOB_LOCAL + 256    ; char[256], and of the picture, or ""
 .equ JOB_HLS,                    JOB_VLOCAL + 256   ; char[256], the HLS presentation of both, or ""
 .equ JOB_HLSA,                   JOB_HLS + 256      ; char[256], its sound alone, or ""
@@ -255,16 +235,7 @@ Lc\@:	.asciz	"\text"
 .equ KIND_FILE,                  2        ; a file on this Mac (JOB_QUERY is its path)
 .equ PLAY_OK,                    0
 .equ PLAY_FAILED,                1
-.equ PLAY_REJECTED,              2
 
-; Device list entries; entry 0 is This Mac.
-.equ DEV_NAME,                   0
-.equ DEV_BASE,                   128
-.equ DEV_AVT,                    256
-.equ DEV_RC,                     512
-.equ DEV_VIDEO,                  768      ; byte: 1 it renders video (a TV), 2 it plays HLS
-.equ DEV_SIZE,                   776
-.equ MAX_DEVS,                   16
 .equ AVPLAYER_WAITING,           1
 .equ AVPLAYER_PLAYING,           2
 
@@ -304,15 +275,11 @@ Lc\@:	.asciz	"\text"
 .equ BAR_M,                      12       ; the control bar floats this far from the edges
 .equ BAR_W,                      WIN_W - 2 * BAR_M
 .equ BAR_H,                      96
-.equ STAGE_B,                    BAR_M + BAR_H + 16 ; artwork and empty state sit between the bar
+.equ STAGE_B,                    BAR_M + BAR_H + 16 ; artwork and link field sit between the bar
 .equ STAGE_T,                    40       ; and the title bar
 .equ ART_RADIUS,                 14
 .equ ART_MAX,                    720
 .equ SPIN_S,                     32
-.equ EMPTY_W,                    420
-.equ EMPTY_H,                    196
-.equ PILL_W,                     132
-.equ PILL_H,                     32
 .equ URL_W,                      520
 .equ URL_H,                      48
 .equ STATUS_T,                   36
@@ -328,10 +295,8 @@ Lc\@:	.asciz	"\text"
 .equ PLAY_X,                     BAR_W / 2 - PLAY_S / 2
 .equ BACK_X,                     PLAY_X - BTN_GAP - BTN_S
 .equ FWD_X,                      PLAY_X + PLAY_S + BTN_GAP
-.equ DEV_W,                      40
-.equ DEV_X,                      BAR_W - 12 - DEV_W
 .equ AIR_W,                      28
-.equ AIR_X,                      DEV_X - 4 - AIR_W
+.equ AIR_X,                      BAR_W - 16 - AIR_W
 .equ VOL_W,                      64
 .equ VOL_X,                      AIR_X - 8 - VOL_W
 .equ MUTE_X,                     VOL_X - 4 - ICON_S
@@ -345,29 +310,18 @@ Lc\@:	.asciz	"\text"
 ; G: scalars at fixed offsets from x28; string literals follow them.
 .equ G_APP,                      0
 .equ G_CTRL,                     8
-.equ G_QUEUE,                    16       ; serial device queue
-.equ G_CURL,                     24       ; device queue's keep-alive handle
 .equ G_PLAYER,                   32       ; AVPlayer
-.equ G_LAN,                      40       ; mask << 32 | address, network order, one atomic word
 .equ G_LOCK,                     48       ; os_unfair_lock
 .equ G_PORT,                     52       ; proxy port
-.equ G_DEVN,                     56       ; devices listed (lock)
-.equ G_CHOSE,                    60       ; a device was picked by hand (device queue)
-.equ G_POLLB,                    64       ; a poll is queued (atomic)
-.equ G_VOLB,                     68       ; a volume change is queued (atomic)
-.equ G_PVOL,                     72       ; latest slider volume (atomic)
-.equ G_DISC,                     76       ; searches running, a bit per kind (atomic)
+.equ G_POOLN,                    60
 .equ G_SLOTI,                    80       ; next stream slot (lock)
-.equ G_MYDUR,                    88       ; duration we sent to the device (device queue)
+.equ G_PLAYGEN,                  84
 .equ G_LTDUR,                    96       ; This Mac's duration (main)
 .equ G_TICK,                     104      ; timer ticks since launch
 .equ G_SEEKH,                    112      ; tick until which polled positions are ignored
 .equ G_VOLH,                     120      ; tick until which polled volumes are ignored
 .equ G_MSGT,                     128      ; tick after which the status message expires
 .equ G_ARTGEN,                   136      ; artwork request generation
-.equ G_SEL,                      144      ; selected device, as the UI routes it
-.equ G_DEVREV,                   148      ; device list revision in the picker
-.equ G_READY,                    152      ; the device answers
 .equ G_LOADING,                  156      ; a link is being resolved
 .equ G_PPSHOWN,                  160      ; play/pause shows "pause"
 .equ G_MUTESHOWN,                164
@@ -387,17 +341,16 @@ Lc\@:	.asciz	"\text"
 .equ G_BACK,                     256      ; enabled when seekable: back, forward, position
 .equ G_FWD,                      264
 .equ G_POS,                      272
-.equ G_PP,                       280      ; enabled when the device answers: play, mute, volume
+.equ G_PP,                       280
 .equ G_MUTE,                     288
 .equ G_VOL,                      296
 .equ G_VIDEO,                    304      ; the view of This Mac's picture
 .equ G_STATUS,                   312
-.equ G_DEV,                      320
 .equ G_IMGPLAY,                  328
 .equ G_IMGPAUSE,                 336
 .equ G_IMGMUTED,                 344
 .equ G_IMGUNMUTED,               352
-.equ G_SLOTURL,                  360      ; char*[SLOTS], media URLs or file paths (lock)
+.equ G_SLOTURL,                  360      ; char*[SLOTS], media URLs or playlists (lock)
 .equ G_SECOND,                   G_SLOTURL + 8 * SLOTS ; colors (main)
 .equ G_TEXT,                     G_SECOND + 8
 .equ G_YEL,                      G_TEXT + 8
@@ -411,30 +364,25 @@ Lc\@:	.asciz	"\text"
 .equ G_T3,                       G_T2 + 8
 .equ G_WORKQ,                    G_T3 + 8 ; the global user-initiated queue
 .equ G_BAR,                      G_WORKQ + 8 ; the control bar
-.equ G_EMPTY,                    G_BAR + 8 ; what shows when nothing is playing
-.equ G_URLBOX,                   G_EMPTY + 8 ; Open from URL's floating field
+.equ G_URLBOX,                   G_BAR + 8 ; Open from URL's floating field
 .equ G_AOBTN,                    G_URLBOX + 8 ; the Audio Only button and menu item
 .equ G_AOITEM,                   G_AOBTN + 8
-.equ G_IMGDEV,                   G_AOITEM + 8 ; the picker's face: This Mac, then a device
-.equ G_IMGDEVON,                 G_IMGDEV + 8
-.equ G_ARTASP,                   G_IMGDEVON + 8 ; the artwork's height / width (double)
+.equ G_ARTASP,                   G_AOITEM + 8 ; the artwork's height / width (double)
 .equ G_IDLE,                     G_ARTASP + 8 ; ticks since the mouse last moved
 .equ G_HASVIDEO,                 G_IDLE + 4 ; This Mac's media has a picture
 .equ G_BARHID,                   G_HASVIDEO + 4 ; the bar is faded out
 .equ G_HOVER,                    G_BARHID + 4 ; the mouse is over the bar
 .equ G_ARTOK,                    G_HOVER + 4 ; the artwork has an image
 .equ G_FAILED,                   G_ARTOK + 4 ; This Mac's item failed and it was reported
-.equ G_DEVON,                    G_FAILED + 4 ; the picker's face shows a device
-.equ G_AV1,                      G_DEVON + 4 ; AV1 decodes in hardware
-.equ G_NOTE,                     G_AV1 + 4 ; the artwork card's music note, shown without an image
+.equ G_AV1,                      G_FAILED + 4 ; AV1 decodes in hardware
+.equ G_NOTE,                     G_AV1 + 8 ; the artwork card's music note, shown without an image
 .equ G_RESUMEMS,                 G_NOTE + 8 ; Audio Only's swap: the moment to return to
 .equ G_RESUMET,                  G_RESUMEMS + 8 ; and the timer waiting for the new item, or nil
 .equ G_RESUMEPLAY,               G_RESUMET + 8 ; it was playing
 .equ G_RATE,                     G_RESUMEPLAY + 8 ; Playback > Speed (float)
 .equ G_SUBMENU,                  G_RATE + 8 ; View > Subtitles
 .equ G_PIP,                      G_SUBMENU + 8 ; the Picture in Picture controller, made on first use
-.equ G_TV,                       G_PIP + 8 ; the selected device's DEV_VIDEO
-.equ G_SHARE,                    G_TV + 8 ; the libcurl pool
+.equ G_SHARE,                    G_PIP + 8 ; the libcurl pool
 .equ G_SHLOCKS,                  G_SHARE + 8 ; its locks, one per kind of data (os_unfair_lock[8])
 .equ G_CONNS,                    G_SHLOCKS + 32
 .equ G_SIZE,                     G_CONNS + 8
@@ -447,42 +395,17 @@ G:	.space	G_SIZE
 Lf_100:	.float	100.0                     ; volume percent, 8-aligned after G
 	.float	0.0
 
-; XML entities, 8 bytes each: the character, then its name after '&' (zero-padded).
-Lxml_entities:
-	.ascii	"&amp;\0\0\0"
-	.ascii	"<lt;\0\0\0\0"
-	.ascii	">gt;\0\0\0\0"
-	.ascii	"\"quot;\0\0"
-	.ascii	"'apos;\0\0"
-	.ascii	"'#39;\0\0\0"             ; numeric form, decode only
-	.byte	0
-
 ; B: the large buffers, at fixed offsets from x27.
-.equ B_LANIP,                    0        ; char[16], LAN address as text (device queue)
-.equ B_CUR,                      16       ; selected device (device queue)
-.equ B_NOW,                      B_CUR + DEV_SIZE + 8 ; snapshot (lock)
-.equ B_MYTRACK,                  4096     ; and its track
-	.if B_NOW + NOW_SIZE > B_MYTRACK
-	.error "B_NOW overlaps"
-	.endif
-.equ B_SLOTTOK,                  6912     ; stream tokens (lock)
+.equ B_NOW,                      0        ; snapshot (main)
+.equ B_SLOTTOK,                  B_NOW + NOW_SIZE ; stream tokens (lock)
 .equ B_UIMSG,                    B_SLOTTOK + SLOTS * TOKEN_STRIDE ; char[256], status message (main)
 .equ B_UIARTIST,                 B_UIMSG + 256 ; char[256], last rendered artist (main)
 .equ B_UIART,                    B_UIARTIST + 256 ; char[2048], artwork shown or loading (main)
 .equ B_UITITLE,                  B_UIART + 2048 ; char[512], last rendered title (main)
 .equ B_LTAURL,                   B_UITITLE + 512 ; char[256], This Mac's sound stream (main)
-.equ B_LTTRACK,                  12288    ; This Mac's track (main)
-	.if B_LTAURL + 256 > B_LTTRACK
-	.error "B buffers overlap"
-	.endif
-.equ B_DEVS,                     B_LTTRACK + T_SIZE ; device list (lock)
-.equ B_REG,                      (B_DEVS + MAX_DEVS * DEV_SIZE + 4095) & ~4095 ; the registry, 4 KiB-aligned: one add reaches it
+.equ B_LTTRACK,                  B_LTAURL + 256 ; This Mac's track (main)
+.equ B_REG,                      (B_LTTRACK + T_SIZE + 4095) & ~4095 ; the registry, 4 KiB-aligned: one add reaches it
 
-; A search's handoff from its worker to the device queue, one per kind, after the registry.
-.equ SC_MODE,                    0        ; 0 rebuilds the list, 1 only adds to it
-.equ SC_COUNT,                   4
-.equ SC_LOCS,                    8        ; char[MAX_DEVS - 1][256], description URLs
-.equ SC_SIZE,                    SC_LOCS + (MAX_DEVS - 1) * 256
 
 ; SYM / OBJC name — an imported symbol / class in the registry (FN, defined with each pass, is a function called by name).
 .macro SYM name
@@ -516,21 +439,14 @@ Lxml_entities:
 	FN	dispatch_semaphore_create
 	FN	dispatch_semaphore_signal
 	FN	dispatch_semaphore_wait
-	FN	dispatch_sync_f
 	FN	free
-	FN	freeifaddrs
-	FN	getenv
-	FN	getifaddrs
 	FN	getsockname
-	FN	inet_ntop
 	FN	listen
-	FN	lseek
 	FN	malloc
 	FN	memcpy
 	FN	objc_autoreleasePoolPop
 	FN	objc_autoreleasePoolPush
 	FN	objc_msgSend
-	FN	open
 	FN	os_unfair_lock_lock
 	FN	os_unfair_lock_unlock
 	FN	pthread_create
@@ -538,13 +454,10 @@ Lxml_entities:
 	FN	realloc
 	FN	recv
 	FN	sel_registerName
-	FN	sendfile
-	FN	sendto
 	FN	setsockopt
 	FN	snprintf
 	FN	socket
 	FN	sscanf
-	FN	strcasecmp
 	FN	strcasestr
 	FN	strchr
 	FN	strcmp
@@ -553,7 +466,6 @@ Lxml_entities:
 	FN	strlcpy
 	FN	strlen
 	FN	strncmp
-	FN	strrchr
 	FN	strstr
 	FN	strtol
 	FN	usleep
@@ -566,8 +478,6 @@ Lxml_entities:
 	SYM	class_addMethod
 	SYM	curl_global_init
 	SYM	dispatch_get_global_queue
-	SYM	dispatch_queue_attr_make_with_qos_class
-	SYM	dispatch_queue_create
 	SYM	objc_allocateClassPair
 	SYM	objc_registerClassPair
 	SYM	signal
@@ -594,7 +504,6 @@ Lxml_entities:
 	OBJC	NSMenuItem
 	OBJC	NSObject
 	OBJC	NSOpenPanel
-	OBJC	NSPopUpButton
 	OBJC	NSProgressIndicator
 	OBJC	NSSlider
 	OBJC	NSString
@@ -627,14 +536,12 @@ Lxml_entities:
 	REG	S_assetTrack, "assetTrack"
 	REG	S_bounds, "bounds"
 	REG	S_buttonWithImage_target_action_, "buttonWithImage:target:action:"
-	REG	S_buttonWithTitle_target_action_, "buttonWithTitle:target:action:"
 	REG	S_cancelOperation_, "cancelOperation:"
 	REG	S_cell, "cell"
 	REG	S_center, "center"
 	REG	S_clickCount, "clickCount"
 	REG	S_colorWithSRGBRed_green_blue_alpha_, "colorWithSRGBRed:green:blue:alpha:"
 	REG	S_componentsSeparatedByString_, "componentsSeparatedByString:"
-	REG	S_configurationWithPaletteColors_, "configurationWithPaletteColors:"
 	REG	S_configurationWithPointSize_weight_, "configurationWithPointSize:weight:"
 	REG	S_currentEvent, "currentEvent"
 	REG	S_currentItem, "currentItem"
@@ -648,13 +555,10 @@ Lxml_entities:
 	REG	S_firstObject, "firstObject"
 	REG	S_host, "host"
 	REG	S_imageViewWithImage_, "imageViewWithImage:"
-	REG	S_imageWithSymbolConfiguration_, "imageWithSymbolConfiguration:"
 	REG	S_imageWithSystemSymbolName_accessibilityDescription_, "imageWithSystemSymbolName:accessibilityDescription:"
-	REG	S_indexOfSelectedItem, "indexOfSelectedItem"
 	REG	S_initWithContentRect_styleMask_backing_defer_, "initWithContentRect:styleMask:backing:defer:"
 	REG	S_initWithData_, "initWithData:"
 	REG	S_initWithFrame_, "initWithFrame:"
-	REG	S_initWithFrame_pullsDown_, "initWithFrame:pullsDown:"
 	REG	S_initWithRect_options_owner_userInfo_, "initWithRect:options:owner:userInfo:"
 	REG	S_initWithTitle_, "initWithTitle:"
 	REG	S_intValue, "intValue"
@@ -662,7 +566,6 @@ Lxml_entities:
 	REG	S_isEqualToString_, "isEqualToString:"
 	REG	S_isFileURL, "isFileURL"
 	REG	S_isMuted, "isMuted"
-	REG	S_itemAtIndex_, "itemAtIndex:"
 	REG	S_labelWithString_, "labelWithString:"
 	REG	S_lastPathComponent, "lastPathComponent"
 	REG	S_layer, "layer"
@@ -673,7 +576,6 @@ Lxml_entities:
 	REG	S_mediaType, "mediaType"
 	REG	S_menu, "menu"
 	REG	S_new, "new"
-	REG	S_numberOfItems, "numberOfItems"
 	REG	S_openPanel, "openPanel"
 	REG	S_path, "path"
 	REG	S_pause, "pause"
@@ -684,7 +586,6 @@ Lxml_entities:
 	REG	S_readObjectsForClasses_options_, "readObjectsForClasses:options:"
 	REG	S_registerForDraggedTypes_, "registerForDraggedTypes:"
 	REG	S_release, "release"
-	REG	S_removeItemAtIndex_, "removeItemAtIndex:"
 	REG	S_replaceCurrentItemWithPlayerItem_, "replaceCurrentItemWithPlayerItem:"
 	REG	S_retain, "retain"
 	REG	S_run, "run"
@@ -699,7 +600,6 @@ Lxml_entities:
 	REG	S_setAllowedContentTypes_, "setAllowedContentTypes:"
 	REG	S_setAlphaValue_, "setAlphaValue:"
 	REG	S_setAppearance_, "setAppearance:"
-	REG	S_setArrowPosition_, "setArrowPosition:"
 	REG	S_setAutoresizingMask_, "setAutoresizingMask:"
 	REG	S_setBackgroundColor_, "setBackgroundColor:"
 	REG	S_setBezeled_, "setBezeled:"
@@ -794,7 +694,6 @@ Lxml_entities:
 	REG	S_setRate_, "setRate:"
 	REG	S_act_option_, "act_option:"
 	REG	S_invalidate, "invalidate"
-	REG	S_itemTitleAtIndex_, "itemTitleAtIndex:"
 	REG	S_objectAtIndex_, "objectAtIndex:"
 	REG	S_setContentView_, "setContentView:"
 	REG	S_size, "size"
@@ -820,11 +719,10 @@ _\name:
 	.purgem	REG
 	.purgem	REGSEL
 	.purgem	FN
-.equ B_SCAN,                     B_REG + 8 * Lnreg
-.equ B_MYURI,                    B_SCAN + 2 * SC_SIZE ; char[MYURI_SIZE], what we last sent to the device (device queue)
-.equ B_LTVURL,                   B_MYURI + MYURI_SIZE ; char[4096], This Mac's picture: our HLS or a broadcast's own, or "" (main)
+.equ B_LTVURL,                   B_REG + 8 * Lnreg ; char[4096], This Mac's picture: our HLS or a broadcast's own, or "" (main)
 .equ B_VISITOR,                  B_LTVURL + 4096 ; char[288], the visitorData member once YouTube gave it (worker)
-.equ B_SIZE,                     B_VISITOR + 288
+.equ B_POOL,                     B_VISITOR + 288
+.equ B_SIZE,                     B_POOL + 8 * HANDLES
 	.lcomm	B, B_SIZE, 4
 
 	.text
@@ -887,22 +785,12 @@ tramp:
 Ls_slash:	.asciz	"/"               ; Ls_slash+1 is ""
 Ls_crlf:	.asciz	"\r\n"
 Ls_sep:	.asciz	"://"
-Ls_avt:	.asciz	"AVTransport"
-Ls_rc:	.asciz	"RenderingControl"
-Ls_master:	.asciz	"<Channel>Master</Channel>"
-Ls_play:	.asciz	"Play"
-Ls_speed:	.asciz	"<Speed>1</Speed>"
-Ls_setmute:	.asciz	"SetMute"
 Ls_stream:	.asciz	"/stream/"
 Ls_mp4:	.asciz	"audio/mp4"
-Ls_aac:	.asciz	"audio/aac"
-Ls_hls:	.asciz	"application/vnd.apple.mpegurl"
 Ls_range:	.asciz	"%lld-%lld"
 Ls_200:	.asciz	"HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lld\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
 Ls_206:	.asciz	"HTTP/1.1 206 Partial Content\r\nContent-Type: %s\r\nContent-Length: %lld\r\nContent-Range: bytes %lld-%lld/%lld\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
 Ls_404:	.asciz	"404 Not Found"
-Ls_nothing:	.asciz	"Nothing playing"
-Ls_dashes:	.asciz	"--:--"
 	.popsection
 
 ; ---- Small utilities ----
@@ -919,6 +807,20 @@ copt:
 ; curl_new() -> a libcurl handle in the shared pool: connections, TLS sessions and DNS answers carry over between requests and threads.
 curl_new:
 	FRAME	1
+	LOCK
+	ldr	w9, [x28, #G_POOLN]
+	subs	w9, w9, #1
+	b.lo	Lcn_init
+	str	w9, [x28, #G_POOLN]
+	BADDR	x10, B_POOL
+	ldr	x19, [x10, w9, uxtw #3]
+	UNLOCK
+	mov	x0, x19
+	bl	_curl_easy_reset
+	mov	x0, x19
+	b	Lret1
+Lcn_init:
+	UNLOCK
 	bl	_curl_easy_init
 	mov	x19, x0
 	cbz	x0, Lret1
@@ -926,6 +828,25 @@ curl_new:
 	mov	w1, #CURLOPT_SHARE
 	bl	copt
 	mov	x0, x19
+	b	Lret1
+
+curl_done:
+	FRAME	1
+	mov	x19, x0
+	LOCK
+	ldr	w9, [x28, #G_POOLN]
+	cmp	w9, #HANDLES
+	b.hs	Lcd_full
+	BADDR	x10, B_POOL
+	str	x19, [x10, w9, uxtw #3]
+	add	w9, w9, #1
+	str	w9, [x28, #G_POOLN]
+	UNLOCK
+	b	Lret1
+Lcd_full:
+	UNLOCK
+	mov	x0, x19
+	bl	_curl_easy_cleanup
 	b	Lret1
 
 ; shopt(option, value) — curl_share_setopt on the pool in x19 (the variadic value goes on the stack).
@@ -953,9 +874,6 @@ share_init:
 	mov	w1, #CURLSHOPT_SHARE
 	bl	shopt
 	mov	x2, #CURL_LOCK_DATA_SSL_SESSION
-	mov	w1, #CURLSHOPT_SHARE
-	bl	shopt
-	mov	x2, #CURL_LOCK_DATA_CONNECT
 	mov	w1, #CURLSHOPT_SHARE
 	bl	shopt
 	b	Lret1
@@ -1059,202 +977,7 @@ post_main:
 	MAINQ	x0
 	b	_dispatch_async_f
 
-; ui_post_refresh() — re-render on the main thread.
-ui_post_refresh:
-	adr	x0, ui_refresh
-	mov	x1, #0
-	b	post_main
-
-; ui_post_error(message) — show a static error message from any thread.
-ui_post_error:
-	mov	x1, x0
-	adr	x0, ui_error_cb
-	b	post_main
-
-; ---- XML and time helpers ----
-
-; xml_unescape(text) — decode XML entities in place.
-xml_unescape:
-	mov	x1, x0
-	mov	x2, x0
-Lxu_loop:
-	ldrb	w3, [x1]
-	cbz	w3, Lxu_done
-	cmp	w3, #'&'
-	b.ne	Lxu_copy
-	GADDR	x4, Lxml_entities
-Lxu_entity:
-	ldrb	w5, [x4]
-	cbz	w5, Lxu_copy              ; unknown entity: keep the '&'
-	add	x6, x4, #1
-	add	x7, x1, #1
-Lxu_cmp:
-	ldrb	w8, [x6], #1
-	cbz	w8, Lxu_hit
-	ldrb	w9, [x7], #1
-	cmp	w8, w9
-	b.eq	Lxu_cmp
-	add	x4, x4, #8
-	b	Lxu_entity
-Lxu_hit:
-	strb	w5, [x2], #1
-	mov	x1, x7
-	b	Lxu_loop
-Lxu_copy:
-	strb	w3, [x2], #1
-	add	x1, x1, #1
-	b	Lxu_loop
-Lxu_done:
-	strb	wzr, [x2]
-	ret
-
-; xml_escape(text) -> malloc'd copy with & < > " ' as entities, or NULL.
-xml_escape:
-	FRAME	1
-	mov	x19, x0
-	bl	_strlen
-	mov	x9, #6
-	madd	x0, x0, x9, x9            ; the longest entity is 6 bytes
-	bl	_malloc
-	cbz	x0, Lret1
-	mov	x20, x0
-	mov	x2, x0
-	mov	x1, x19
-Lxe_loop:
-	ldrb	w3, [x1], #1
-	cbz	w3, Lxe_end
-	GADDR	x4, Lxml_entities
-Lxe_find:
-	ldrb	w5, [x4]
-	cbz	w5, Lxe_plain
-	cmp	w5, w3
-	b.eq	Lxe_emit
-	add	x4, x4, #8
-	b	Lxe_find
-Lxe_emit:
-	mov	w6, #'&'
-Lxe_name:
-	strb	w6, [x2], #1
-	ldrb	w6, [x4, #1]!
-	cbnz	w6, Lxe_name
-	b	Lxe_loop
-Lxe_plain:
-	strb	w3, [x2], #1
-	b	Lxe_loop
-Lxe_end:
-	strb	wzr, [x2]
-	mov	x0, x20
-	b	Lret1
-
-; xml_tag(xml, tag, out, cap) — copy and unescape the text of the first <tag>; w0 = 1 if found and it fits.
-xml_tag:
-	FRAME	3
-	mov	x19, x0
-	mov	x24, x0
-	mov	x20, x1
-	mov	x21, x2
-	mov	x22, x3
-	mov	x0, x1
-	bl	_strlen
-	mov	x23, x0
-Lxt_find:
-	mov	x0, x19
-	mov	x1, x20
-	bl	_strstr
-	cbz	x0, Lxt_no
-	add	x19, x0, #1
-	cmp	x0, x24
-	b.ls	Lxt_find
-	ldurb	w9, [x0, #-1]
-	cmp	w9, #'<'
-	b.ne	Lxt_find
-	add	x19, x0, x23
-	ldrb	w9, [x19], #1
-	cmp	w9, #'>'
-	b.ne	Lxt_find
-	mov	x0, x19
-	mov	w1, #'<'
-	bl	_strchr                   ; the text ends where the next tag starts
-	cbz	x0, Lxt_no
-	sub	x23, x0, x19
-	cmp	x23, x22
-	b.hs	Lxt_no
-	mov	x0, x21
-	mov	x1, x19
-	add	x2, x23, #1
-	bl	_strlcpy
-	mov	x0, x21
-	bl	xml_unescape
-	mov	w0, #1
-	b	Lret3
-Lxt_no:
-	mov	w0, #0
-	b	Lret3
-
-; hms(text) -> seconds of "h:mm:ss"; a fraction and anything after it are ignored.
-hms:
-	mov	x9, #0
-	mov	x10, #0
-	mov	x12, #60
-	mov	x13, #10
-Lhm_next:
-	ldrb	w11, [x0], #1
-	cmp	w11, #':'
-	b.eq	Lhm_colon
-	sub	w11, w11, #'0'
-	cmp	w11, #9
-	b.hi	Lhm_end
-	madd	x10, x10, x13, x11
-	b	Lhm_next
-Lhm_colon:
-	madd	x9, x9, x12, x10
-	mov	x10, #0
-	b	Lhm_next
-Lhm_end:
-	madd	x0, x9, x12, x10
-	ret
-
-; fmt_time(seconds, out[16], hours) — "m:ss", or "h:mm:ss" from one hour up or when hours is set.
-fmt_time:
-	FRAME	1, 32
-	mov	x19, x1
-	cmp	x0, #0
-	csel	x0, x0, xzr, gt
-	mov	x9, #3600
-	udiv	x10, x0, x9
-	msub	x11, x10, x9, x0
-	mov	x9, #60
-	udiv	x12, x11, x9
-	msub	x13, x12, x9, x11
-	orr	x14, x10, x2
-	stp	x10, x12, [sp]
-	str	x13, [sp, #16]
-	CSTR	x2, "%ld:%02ld:%02ld"
-	cbnz	x14, Lft_print
-	stp	x12, x13, [sp]
-	CSTR	x2, "%ld:%02ld"
-Lft_print:
-	mov	x0, x19
-	mov	x1, #16
-	bl	_snprintf
-	b	Lret1
-
-; tag_num(xml, tag) -> a tag's "h:mm:ss" in seconds, or its plain number; -1 when the response or the tag is missing.
-tag_num:
-	FRAME	0, 16
-	cbz	x0, Ltn_none
-	mov	x2, sp
-	mov	x3, #16
-	bl	xml_tag
-	cbz	w0, Ltn_none
-	mov	x0, sp
-	bl	hms                       ; a number without colons comes back as it is
-	b	Lret0
-Ltn_none:
-	mov	x0, #-1
-	b	Lret0
-
-; ---- HTTP (libcurl) and SOAP ----
+; ---- HTTP (libcurl) ----
 
 ; http(url, body, headers, buf, timeout_ms) — one request on the handle in x19 into buf {data, len}; w0 = 1 on success, buf empty otherwise.
 http:
@@ -1302,343 +1025,6 @@ Lht_ret:
 	cset	w0, eq
 	b	Lret3
 
-; dev_http(url, body, headers, timeout_ms) — a request through the LAN on the device queue's keep-alive handle; body or NULL.
-dev_http:
-	FRAME	3, 16
-	mov	x20, x0
-	mov	x21, x1
-	mov	x22, x2
-	mov	x23, x3
-	ldr	x19, [x28, #G_CURL]
-	mov	x0, x19
-	bl	_curl_easy_reset
-	BADDR	x2, B_LANIP               ; set: only discovered devices are asked
-	mov	w1, #CURLOPT_INTERFACE        ; leave through the LAN even with a VPN up
-	bl	copt
-	mov	x2, #CONNECT_TIMEOUT_MS
-	mov	w1, #CURLOPT_CONNECTTIMEOUT_MS
-	bl	copt
-	mov	x0, x20
-	mov	x1, x21
-	mov	x2, x22
-	mov	x3, sp
-	mov	x4, x23
-	bl	http
-	ldr	x0, [sp]
-	b	Lret3
-
-; av / rc (action, args) — upnp on the device's AVTransport / RenderingControl service.
-av:
-	GADDR	x2, Ls_avt
-	b	upnp
-rc:
-	GADDR	x2, Ls_rc
-
-; upnp(action, args, service) — a SOAP call on the selected device; the response, or NULL on error or fault.
-upnp:
-	FRAME	4, 48
-	mov	x20, x0
-	mov	x21, x1
-	mov	x22, x2
-	stp	x22, x20, [sp]
-	add	x0, sp, #32
-	CSTR	x1, "SOAPACTION: \"urn:schemas-upnp-org:service:%s:1#%s\""
-	bl	_asprintf
-	stp	x20, x22, [sp]
-	stp	x21, x20, [sp, #16]
-	add	x0, sp, #40
-	CSTR	x1, "<?xml version=\"1.0\" encoding=\"utf-8\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:%s xmlns:u=\"urn:schemas-upnp-org:service:%s:1\"><InstanceID>0</InstanceID>%s</u:%s></s:Body></s:Envelope>"
-	bl	_asprintf
-	mov	x23, #0
-	ldp	x24, x25, [sp, #32]
-	cbz	x24, Lup_free
-	cbz	x25, Lup_free
-	mov	x0, #0
-	CSTR	x1, "Content-Type: text/xml; charset=\"utf-8\""
-	bl	_curl_slist_append
-	mov	x1, x24
-	bl	_curl_slist_append
-	mov	x26, x0
-	ldrb	w9, [x22]
-	cmp	w9, #'A'
-	cset	w9, ne
-	mov	x10, #DEV_AVT
-	lsl	x10, x10, x9              ; DEV_AVT, or DEV_RC for RenderingControl
-	BADDR	x0, B_CUR
-	add	x0, x0, x10
-	mov	x1, x25
-	mov	x2, x26
-	mov	x3, #SOAP_TIMEOUT_MS
-	bl	dev_http
-	mov	x23, x0
-	mov	x0, x26
-	bl	_curl_slist_free_all
-	cbz	x23, Lup_free
-	mov	x0, x23
-	CSTR	x1, "Response"
-	bl	_strstr
-	cbnz	x0, Lup_free
-	mov	x0, x23                   ; a fault
-	bl	_free
-	mov	x23, #0
-Lup_free:
-	mov	x0, x24
-	bl	_free
-	mov	x0, x25
-	bl	_free
-	mov	x0, x23
-	b	Lret4
-
-; avcmd / rccmd (action, args) — a command to the device; w0 = 1 if it accepted it.
-avcmd:
-	GADDR	x2, Ls_avt
-	b	Lcmd
-rccmd:
-	GADDR	x2, Ls_rc
-Lcmd:
-	FRAME	0
-	bl	upnp
-	cbz	x0, Lret0
-	bl	_free
-	mov	w0, #1
-	b	Lret0
-
-; ---- Discovery (a worker, then the device queue) ----
-
-; discover_lan() — our private IPv4 address and mask into G_LAN: en0's, else the first one; w0 = 1 if found.
-discover_lan:
-	FRAME	3, 16
-	mov	x0, sp
-	bl	_getifaddrs
-	mov	x21, #0                   ; the chosen interface
-	cbnz	w0, Ldl_ret
-	ldr	x19, [sp]
-Ldl_loop:
-	cbz	x19, Ldl_take
-	ldr	x9, [x19, #IFA_ADDR]
-	cbz	x9, Ldl_next
-	ldrb	w10, [x9, #1]
-	cmp	w10, #AF_INET
-	b.ne	Ldl_next
-	ldr	x10, [x19, #IFA_NETMASK]
-	cbz	x10, Ldl_next
-	ldr	w10, [x19, #IFA_FLAGS]
-	tbz	w10, #0, Ldl_next         ; IFF_UP
-	tbnz	w10, #3, Ldl_next         ; IFF_LOOPBACK
-	ldr	w10, [x9, #4]
-	rev	w20, w10                  ; address in host order
-	lsr	w10, w20, #24
-	cmp	w10, #10                  ; 10.0.0.0/8
-	b.eq	Ldl_private
-	lsr	w10, w20, #20
-	cmp	w10, #0xac1               ; 172.16.0.0/12
-	b.eq	Ldl_private
-	lsr	w10, w20, #16
-	mov	w11, #0xc0a8              ; 192.168.0.0/16
-	cmp	w10, w11
-	b.ne	Ldl_next
-Ldl_private:
-	cbnz	x21, Ldl_en0
-	mov	x21, x19                  ; the first one, unless en0 comes later
-Ldl_en0:
-	ldr	x0, [x19, #IFA_NAME]
-	CSTR	x1, "en0"
-	bl	_strcmp
-	cbnz	w0, Ldl_next
-	mov	x21, x19
-	b	Ldl_take
-Ldl_next:
-	ldr	x19, [x19]
-	b	Ldl_loop
-Ldl_take:
-	cbz	x21, Ldl_free
-	ldr	x9, [x21, #IFA_ADDR]
-	ldr	w20, [x9, #4]
-	ldr	x10, [x21, #IFA_NETMASK]
-	ldr	w10, [x10, #4]
-	orr	x10, x20, x10, lsl #32
-	str	x10, [x28, #G_LAN]        ; one store: readers see a matching pair
-Ldl_free:
-	ldr	x0, [sp]
-	bl	_freeifaddrs
-Ldl_ret:
-	cmp	x21, #0
-	cset	w0, ne
-	b	Lret3
-
-; control_url(xml, service, base, out[256]) — the absolute control URL of a service; w0 = 1 if found.
-control_url:
-	FRAME	3, 32
-	mov	x19, x2
-	mov	x20, x3
-	bl	_strstr
-	cbz	x0, Lcl_no
-	CSTR	x1, "<controlURL>"
-	bl	_strstr
-	cbz	x0, Lcl_no
-	add	x21, x0, #12
-	mov	x0, x21
-	mov	w1, #'<'
-	bl	_strchr
-	cbz	x0, Lcl_no
-	sub	x22, x0, x21
-	cmp	x22, #200
-	b.hs	Lcl_no
-	mov	x0, x21
-	CSTR	x1, "http"
-	mov	x2, #4
-	bl	_strncmp
-	GADDR	x9, Ls_slash+1
-	mov	x10, x9
-	cbz	w0, Lcl_print             ; absolute already
-	mov	x9, x19
-	ldrb	w11, [x21]
-	cmp	w11, #'/'
-	b.eq	Lcl_print                 ; relative to the host
-	GADDR	x10, Ls_slash
-Lcl_print:
-	stp	x9, x10, [sp]
-	stp	x22, x21, [sp, #16]
-	mov	x0, x20
-	mov	x1, #256
-	CSTR	x2, "%s%s%.*s"
-	bl	_snprintf
-	mov	w0, #1
-	b	Lret3
-Lcl_no:
-	mov	w0, #0
-	b	Lret3
-
-; describe(location, dev) — fill a device entry from its UPnP description; w0 = 1 if it plays media.
-describe:
-	FRAME	3, 400                    ; +144: the ConnectionManager's control URL
-	mov	x19, x0
-	mov	x20, x1
-	mov	x1, #0
-	mov	x2, #0
-	mov	x3, #DESC_TIMEOUT_MS
-	bl	dev_http
-	mov	x21, x0
-	mov	w22, #0
-	cbz	x21, Lde_ret
-	mov	x0, x19                   ; base = scheme://host:port of the description
-	GADDR	x1, Ls_sep
-	bl	_strstr
-	cbz	x0, Lde_free
-	add	x23, x0, #3
-	mov	x0, x23
-	GADDR	x1, Ls_slash
-	bl	_strcspn
-	add	x9, x23, x0
-	sub	x2, x9, x19
-	cmp	x2, #128
-	b.hs	Lde_free
-	add	x0, x20, #DEV_BASE
-	mov	x1, x19
-	add	x2, x2, #1
-	bl	_strlcpy
-	mov	x0, x21
-	CSTR	x1, "urn:schemas-upnp-org:service:AVTransport:1"
-	add	x2, x20, #DEV_BASE
-	add	x3, x20, #DEV_AVT
-	bl	control_url
-	cbz	w0, Lde_free              ; it cannot play media
-	strb	wzr, [x20, #DEV_RC]       ; none unless it has one
-	mov	x0, x21
-	CSTR	x1, "urn:schemas-upnp-org:service:RenderingControl:1"
-	add	x2, x20, #DEV_BASE
-	add	x3, x20, #DEV_RC
-	bl	control_url
-	strb	wzr, [x20, #DEV_VIDEO]    ; a TV if its sink takes video
-	mov	x0, x21
-	CSTR	x1, "urn:schemas-upnp-org:service:ConnectionManager:1"
-	add	x2, x20, #DEV_BASE
-	add	x3, sp, #144
-	bl	control_url
-	cbz	w0, Lde_named
-	add	x0, sp, #144
-	bl	sink_video
-	strb	w0, [x20, #DEV_VIDEO]
-Lde_named:
-	mov	x0, x21                   ; "Room · Model" (Sonos), else friendlyName
-	CSTR	x1, "roomName"
-	add	x2, sp, #16
-	mov	x3, #64
-	bl	xml_tag
-	mov	w22, w0
-	mov	x0, x21
-	CSTR	x1, "modelName"
-	add	x2, sp, #80
-	mov	x3, #64
-	bl	xml_tag
-	cbz	w22, Lde_friendly
-	add	x1, sp, #16
-	cbz	w0, Lde_room
-	add	x10, sp, #80
-	stp	x1, x10, [sp]
-	add	x0, x20, #DEV_NAME
-	mov	x1, #128
-	CSTR	x2, "%s \302\267 %s"
-	bl	_snprintf
-	b	Lde_yes
-Lde_friendly:
-	mov	x0, x21
-	CSTR	x1, "friendlyName"
-	add	x2, x20, #DEV_NAME
-	mov	x3, #128
-	bl	xml_tag
-	cbnz	w0, Lde_yes
-	add	x1, x20, #DEV_BASE        ; unnamed: its address
-Lde_room:
-	add	x0, x20, #DEV_NAME
-	mov	x2, #128
-	bl	_strlcpy
-Lde_yes:
-	mov	w22, #1
-Lde_free:
-	mov	x0, x21
-	bl	_free
-Lde_ret:
-	mov	w0, w22
-	b	Lret3
-
-; sink_video(control) -> what the renderer's ConnectionManager says it can play beyond sound: 1 = video, 2 = HLS, or both.
-sink_video:
-	FRAME	2
-	mov	x19, x0
-	mov	x0, #0
-	CSTR	x1, "Content-Type: text/xml; charset=\"utf-8\""
-	bl	_curl_slist_append
-	CSTR	x1, "SOAPACTION: \"urn:schemas-upnp-org:service:ConnectionManager:1#GetProtocolInfo\""
-	bl	_curl_slist_append
-	mov	x20, x0
-	mov	x0, x19
-	CSTR	x1, "<?xml version=\"1.0\" encoding=\"utf-8\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:GetProtocolInfo xmlns:u=\"urn:schemas-upnp-org:service:ConnectionManager:1\"/></s:Body></s:Envelope>"
-	mov	x2, x20
-	mov	x3, #DESC_TIMEOUT_MS
-	bl	dev_http
-	mov	x21, x0
-	mov	x0, x20
-	bl	_curl_slist_free_all
-	mov	w22, #0
-	cbz	x21, Lsv_answer
-	mov	x0, x21
-	CSTR	x1, ":video/"
-	bl	_strcasestr
-	cmp	x0, #0
-	cset	w22, ne
-	mov	x0, x21
-	CSTR	x1, "mpegurl"
-	bl	_strcasestr
-	cmp	x0, #0
-	cset	w9, ne
-	orr	w22, w22, w9, lsl #1
-	mov	x0, x21
-	bl	_free
-Lsv_answer:
-	mov	w0, w22
-	b	Lret2
-
 ; header_value(text, pattern, out[256]) — copy the value of the header that pattern ("\nName:") finds; NULL if absent.
 header_value:
 	FRAME	2
@@ -1670,620 +1056,9 @@ Lhv_value:
 	mov	x0, x20
 	b	Lret2
 
-; ssdp_collect(scan) — the description URLs of the media renderers that answer an M-SEARCH from the LAN address, each once.
-	.pushsection __DATA,__data
-Lmsearch:	.ascii	"M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n"
-Lmsearch_end:
-	.popsection
-ssdp_collect:
-	FRAME	4, 1616
-	; +16 local address, +32 destination, +48 timeval, +80 datagram
-	mov	x19, x0
-	add	x24, x0, #SC_LOCS
-	mov	x23, #0
-	mov	w0, #AF_INET
-	mov	w1, #SOCK_DGRAM
-	mov	w2, #0
-	bl	_socket
-	tbnz	w0, #31, Lret4
-	mov	w20, w0
-	mov	w9, #SOCKADDR_IN_HEAD
-	ldr	w10, [x28, #G_LAN]        ; the LAN address, port 0
-	stp	w9, w10, [sp, #16]
-	str	xzr, [sp, #24]
-	mov	w0, w20
-	add	x1, sp, #16
-	mov	w2, #16
-	bl	_bind                     ; replies come back to the LAN address
-	cbnz	w0, Lsc_close
-	mov	w0, w20
-	mov	w1, #IPPROTO_IP
-	mov	w2, #IP_MULTICAST_IF
-	add	x3, sp, #20
-	mov	w4, #4
-	bl	_setsockopt               ; and the search leaves through it, even with a VPN up
-	mov	x9, #((SSDP_WAIT_MS * 1000) & 0xffff)
-	movk	x9, #((SSDP_WAIT_MS * 1000) >> 16), lsl #16
-	stp	xzr, x9, [sp, #48]        ; struct timeval: the silence that ends an attempt
-	mov	w0, w20
-	mov	w1, #SOL_SOCKET
-	mov	w2, #SO_RCVTIMEO
-	add	x3, sp, #48
-	mov	w4, #16
-	bl	_setsockopt
-	mov	w9, #SOCKADDR_IN_HEAD
-	movk	w9, #SSDP_PORT_BE, lsl #16
-	mov	w10, #0xffef              ; 239.255.255.250
-	movk	w10, #0xfaff, lsl #16
-	stp	w9, w10, [sp, #32]
-	str	xzr, [sp, #40]
-	mov	w21, #SSDP_ROUNDS
-Lsc_round:
-	mov	w0, w20
-	GADDR	x1, Lmsearch
-	mov	x2, #(Lmsearch_end - Lmsearch)
-	mov	w3, #0
-	add	x4, sp, #32
-	mov	w5, #16
-	bl	_sendto
-	mov	w22, #SSDP_MAX_REPLIES
-Lsc_wait:
-	mov	w0, w20
-	add	x1, sp, #80
-	mov	x2, #1535
-	mov	w3, #0
-	bl	_recv
-	cmp	x0, #0
-	b.le	Lsc_next                  ; quiet for a while: next attempt
-	add	x9, sp, #80
-	strb	wzr, [x9, x0]
-	add	x0, sp, #80
-	CSTR	x1, "\nLOCATION:"
-	add	x2, x24, x23, lsl #8      ; into the next free slot
-	bl	header_value
-	cbz	x0, Lsc_counted
-	mov	x25, #0
-Lsc_dup:
-	cmp	x25, x23
-	b.hs	Lsc_new
-	add	x0, x24, x25, lsl #8
-	add	x1, x24, x23, lsl #8
-	bl	_strcmp
-	add	x25, x25, #1
-	cbnz	w0, Lsc_dup
-	b	Lsc_counted               ; heard already
-Lsc_new:
-	add	x23, x23, #1
-	str	w23, [x19, #SC_COUNT]
-	cmp	x23, #(MAX_DEVS - 1)
-	b.hs	Lsc_close                 ; full
-Lsc_counted:
-	subs	w22, w22, #1
-	b.ne	Lsc_wait
-Lsc_next:
-	subs	w21, w21, #1
-	b.ne	Lsc_round
-Lsc_close:
-	mov	w0, w20
-	bl	_close
-	b	Lret4
+; ---- Playing a link: main -> worker -> main ----
 
-; scan_job(mode) — the slow half of a search, on a worker so device commands never wait for it: our LAN, then who answers.
-	ENTRY	scan_job
-	FRAME	2, 16
-	BADDR	x20, B_SCAN
-	mov	x9, #SC_SIZE
-	madd	x20, x0, x9, x20          ; this kind's handoff
-	stp	w0, wzr, [x20, #SC_MODE]
-	bl	discover_lan
-	cbz	w0, Lsj_queue             ; no LAN: This Mac only
-	CSTR	x0, "BEAM_HOST"
-	bl	_getenv
-	mov	x21, x0
-	cbz	x0, Lsj_ssdp
-	ldrb	w9, [x0]
-	cbz	w9, Lsj_ssdp
-	GADDR	x1, Ls_sep
-	bl	_strstr
-	cmp	x0, #0
-	CSTR	x2, "http://%s:1400/xml/device_description.xml"
-	CSTR	x9, "%s"
-	csel	x2, x9, x2, ne            ; a description URL, or a host with Sonos' default one
-	str	x21, [sp]
-	add	x0, x20, #SC_LOCS
-	mov	x1, #256
-	bl	_snprintf
-	mov	w9, #1
-	str	w9, [x20, #SC_COUNT]
-	b	Lsj_queue
-Lsj_ssdp:
-	mov	x0, x20
-	bl	ssdp_collect
-Lsj_queue:
-	ldr	x0, [x28, #G_QUEUE]
-	mov	x1, x20
-	adr	x2, discover_job
-	bl	_dispatch_async_f
-	b	Lret2
-
-; discover_job(scan) — the device queue's half: describe the new renderers, publish the list, keep or pick the selection.
-	ENTRY	discover_job
-	FRAME	4, 272 + MAX_DEVS * DEV_SIZE
-	mov	x24, x0
-	ldr	w26, [x24, #SC_MODE]
-	ldr	w9, [x28, #G_LAN]         ; our requests leave through the LAN address
-	str	w9, [sp]
-	mov	w0, #AF_INET
-	mov	x1, sp
-	BADDR	x2, B_LANIP
-	mov	w3, #16
-	bl	_inet_ntop
-	add	x19, sp, #272
-	LOCK
-	mov	w20, #1                   ; This Mac
-	mov	x2, #DEV_SIZE
-	cbz	w26, Ldj_copy
-	ldr	w20, [x28, #G_DEVN]       ; the picker opened: what is listed stays, in place
-	mov	x2, #(MAX_DEVS * DEV_SIZE)
-Ldj_copy:
-	mov	x0, x19
-	BADDR	x1, B_DEVS
-	bl	_memcpy
-	UNLOCK
-	mov	x21, #0
-Ldj_loc:
-	ldr	w9, [x24, #SC_COUNT]
-	cmp	x21, x9
-	b.hs	Ldj_pick
-	add	x22, x24, #SC_LOCS
-	add	x22, x22, x21, lsl #8
-	add	x21, x21, #1
-	mov	x23, #1                   ; skip devices already listed
-Ldj_dup:
-	cmp	x23, x20
-	b.hs	Ldj_new
-	mov	x9, #DEV_SIZE
-	madd	x25, x23, x9, x19
-	add	x25, x25, #DEV_BASE
-	mov	x0, x25
-	bl	_strlen
-	mov	x2, x0
-	mov	x0, x22
-	mov	x1, x25
-	bl	_strncmp
-	add	x23, x23, #1
-	cbnz	w0, Ldj_dup
-	b	Ldj_loc
-Ldj_new:
-	cmp	x20, #MAX_DEVS
-	b.hs	Ldj_pick                  ; the list is full
-	mov	x9, #DEV_SIZE
-	madd	x1, x20, x9, x19
-	mov	x0, x22
-	bl	describe
-	add	x20, x20, w0, uxtw
-	b	Ldj_loc
-Ldj_pick:
-	mov	w21, #-1                  ; the selection stays
-	cbnz	w26, Ldj_store
-	mov	w21, #0
-	BADDR	x22, B_CUR
-	ldrb	w9, [x22, #DEV_BASE]
-	cbz	w9, Ldj_auto              ; This Mac is selected
-	mov	x23, #1                   ; keep the selected device if it is still there
-Ldj_find:
-	cmp	x23, x20
-	b.hs	Ldj_store
-	mov	x9, #DEV_SIZE
-	madd	x0, x23, x9, x19
-	add	x0, x0, #DEV_BASE
-	add	x1, x22, #DEV_BASE
-	bl	_strcmp
-	add	x23, x23, #1
-	cbnz	w0, Ldj_find
-	sub	w21, w23, #1
-	b	Ldj_store
-Ldj_auto:
-	ldr	w9, [x28, #G_CHOSE]
-	cbnz	w9, Ldj_store             ; This Mac was picked by hand
-	cmp	x20, #1
-	csinc	w21, wzr, wzr, ls         ; otherwise the first device found
-Ldj_store:
-	LOCK
-	BADDR	x0, B_DEVS
-	mov	x1, x19
-	mov	x2, #(MAX_DEVS * DEV_SIZE)
-	bl	_memcpy
-	str	w20, [x28, #G_DEVN]
-	BADDR	x9, B_NOW
-	ldr	w10, [x9, #NOW_DEVREV]
-	add	w10, w10, #1
-	str	w10, [x9, #NOW_DEVREV]
-	UNLOCK
-	mov	w9, #1                    ; a search of this kind may start again
-	lsl	w9, w9, w26
-	add	x10, x28, #G_DISC
-	stclrl	w9, [x10]
-	tbnz	w21, #31, Ldj_kept
-	mov	w0, w21
-	bl	select_apply
-	b	Lret4
-Ldj_kept:
-	bl	ui_post_refresh
-	b	Lret4
-
-; select_apply(index) — make device index current, publish it and poll it.
-select_apply:
-	FRAME	2
-	mov	w19, w0
-	LOCK
-	ldr	w9, [x28, #G_DEVN]
-	cmp	w19, w9
-	csel	w19, w19, wzr, lo         ; gone: back to This Mac
-	BADDR	x20, B_DEVS
-	mov	x9, #DEV_SIZE
-	madd	x20, x19, x9, x20
-	BADDR	x0, B_CUR
-	mov	x1, x20
-	mov	x2, #DEV_SIZE
-	bl	_memcpy
-	BADDR	x21, B_NOW
-	str	w19, [x21, #NOW_SEL]
-	add	x0, x21, #NOW_NAME
-	add	x1, x20, #DEV_NAME
-	mov	x2, #128
-	bl	_strlcpy
-	str	wzr, [x21, #NOW_STATE]    ; unknown until polled
-	ldrb	w9, [x20, #DEV_VIDEO]
-	str	w9, [x28, #G_TV]          ; a TV gets H.264, which every TV decodes
-	stp	xzr, xzr, [x21, #NOW_POS]
-	strb	wzr, [x21, #NOW_TITLE]
-	strb	wzr, [x21, #NOW_ARTIST]
-	strb	wzr, [x21, #NOW_ART]
-	UNLOCK
-	bl	poll_now
-	b	Lret2
-
-; select_job — a device picked by hand.
-	ENTRY	select_job
-	mov	w9, #1
-	str	w9, [x28, #G_CHOSE]
-	b	select_apply
-
-; ---- State polling (device queue) ----
-
-; poll_job — the timer's poll; one is queued at most.
-	ENTRY	poll_job
-	FRAME	0
-	bl	poll_now
-	add	x9, x28, #G_POLLB
-	stlr	wzr, [x9]
-	b	Lret0
-
-; poll_now() — read state, position, track, volume and mute from the device, publish them; re-render.
-	.equ P_RESP,	16                ; 4 responses: transport, position, volume, mute
-	.equ P_STATE,	48                ; char[32]
-	.equ P_URI,	80                ; char[2048]: track URI, then artwork URI
-	.equ P_NOW,	P_URI + 2048      ; new snapshot
-	.equ P_META,	P_NOW + NOW_SIZE  ; char[8192]: DIDL-Lite
-	.equ P_SIZE,	P_META + 8192
-poll_now:
-	FRAME	3, P_SIZE
-	BADDR	x9, B_CUR
-	ldrb	w9, [x9, #DEV_AVT]
-	cbz	w9, Lpn_render            ; This Mac fills the snapshot itself
-	BADDR	x19, B_NOW
-	add	x20, sp, #P_NOW
-	LOCK
-	mov	x0, x20
-	mov	x1, x19
-	mov	x2, #NOW_SIZE
-	bl	_memcpy
-	UNLOCK
-	stp	xzr, xzr, [sp, #P_RESP]
-	stp	xzr, xzr, [sp, #P_RESP + 16]
-	str	wzr, [x20, #NOW_STATE]    ; offline unless it answers
-	CSTR	x0, "GetTransportInfo"
-	GADDR	x1, Ls_slash+1
-	bl	av
-	str	x0, [sp, #P_RESP]
-	cbz	x0, Lpn_publish           ; unreachable: skip the other requests
-	CSTR	x1, "CurrentTransportState"
-	add	x2, sp, #P_STATE
-	strb	wzr, [x2]
-	mov	x3, #32
-	bl	xml_tag
-	ldrb	w9, [sp, #P_STATE]        ; PLAYING, PAUSED_PLAYBACK, TRANSITIONING, else stopped
-	ldrb	w10, [sp, #P_STATE + 1]
-	mov	w11, #ST_STOPPED
-	mov	w12, #ST_TRANSITIONING
-	cmp	w9, #'T'
-	csel	w11, w12, w11, eq
-	cmp	w9, #'P'
-	b.ne	Lpn_state
-	mov	w11, #ST_PLAYING
-	mov	w12, #ST_PAUSED
-	cmp	w10, #'L'
-	csel	w11, w11, w12, eq
-Lpn_state:
-	str	w11, [x20, #NOW_STATE]
-	CSTR	x0, "GetPositionInfo"
-	GADDR	x1, Ls_slash+1
-	bl	av
-	str	x0, [sp, #P_RESP + 8]
-	CSTR	x0, "GetVolume"
-	GADDR	x1, Ls_master
-	bl	rc
-	str	x0, [sp, #P_RESP + 16]
-	CSTR	x0, "GetMute"
-	GADDR	x1, Ls_master
-	bl	rc
-	str	x0, [sp, #P_RESP + 24]
-	ldr	x21, [sp, #P_RESP + 8]
-	cbz	x21, Lpn_volume
-	stp	xzr, xzr, [x20, #NOW_POS] ; the position answer replaces the track
-	strb	wzr, [x20, #NOW_TITLE]
-	strb	wzr, [x20, #NOW_ARTIST]
-	strb	wzr, [x20, #NOW_ART]
-	mov	x0, x21
-	CSTR	x1, "RelTime"
-	bl	tag_num
-	tbnz	x0, #63, Lpn_dur
-	str	x0, [x20, #NOW_POS]
-Lpn_dur:
-	mov	x0, x21
-	CSTR	x1, "TrackDuration"
-	bl	tag_num
-	tbnz	x0, #63, Lpn_uri
-	str	x0, [x20, #NOW_DUR]
-Lpn_uri:
-	add	x22, sp, #P_URI
-	strb	wzr, [x22]
-	mov	x0, x21
-	CSTR	x1, "TrackURI"
-	mov	x2, x22
-	mov	x3, #2048
-	bl	xml_tag
-	ldrb	w9, [x22]
-	cbz	w9, Lpn_meta
-	mov	x0, x22
-	BADDR	x1, B_MYURI
-	bl	_strcmp
-	cbnz	w0, Lpn_meta
-	add	x0, x20, #NOW_TITLE       ; our own stream: our metadata
-	BADDR	x1, B_MYTRACK
-	mov	x2, #T_SIZE
-	bl	_memcpy
-	ldr	x9, [x20, #NOW_DUR]
-	cbnz	x9, Lpn_volume
-	ldr	x9, [x28, #G_MYDUR]       ; the device does not know it yet
-	str	x9, [x20, #NOW_DUR]
-	b	Lpn_volume
-Lpn_meta:
-	mov	x0, x22                   ; one of our streams from an earlier session?
-	GADDR	x1, Ls_stream
-	bl	_strstr
-	cbz	x0, Lpn_didl
-	mov	x0, x22
-	BADDR	x1, B_LANIP
-	bl	_strstr
-	cbz	x0, Lpn_didl
-	stp	xzr, xzr, [x20, #NOW_POS] ; its proxy is gone: nothing is playing
-	b	Lpn_volume
-Lpn_didl:
-	add	x23, x20, #NOW_SIZE       ; P_META
-	mov	x0, x21
-	CSTR	x1, "TrackMetaData"
-	mov	x2, x23
-	mov	x3, #8192
-	bl	xml_tag                   ; first unescape: DIDL-Lite markup
-	cbz	w0, Lpn_volume
-	mov	x0, x23
-	CSTR	x1, "dc:title"
-	add	x2, x20, #NOW_TITLE
-	mov	x3, #512
-	bl	xml_tag                   ; second unescape: the text itself
-	mov	x0, x23
-	CSTR	x1, "dc:creator"
-	add	x2, x20, #NOW_ARTIST
-	mov	x3, #256
-	bl	xml_tag
-	mov	x0, x23
-	CSTR	x1, "upnp:albumArtURI"
-	mov	x2, x22
-	mov	x3, #2048
-	bl	xml_tag
-	cbz	w0, Lpn_volume
-	BADDR	x9, B_CUR
-	add	x9, x9, #DEV_BASE
-	GADDR	x10, Ls_slash+1
-	ldrb	w11, [x22]
-	cmp	w11, #'/'
-	csel	x9, x9, x10, eq           ; relative: served by the device itself
-	stp	x9, x22, [sp]
-	add	x0, x20, #NOW_ART
-	mov	x1, #2048
-	CSTR	x2, "%s%s"
-	bl	_snprintf
-Lpn_volume:
-	ldr	x0, [sp, #P_RESP + 16]
-	CSTR	x1, "CurrentVolume"
-	bl	tag_num
-	tbnz	w0, #31, Lpn_mute
-	str	w0, [x20, #NOW_VOL]
-Lpn_mute:
-	ldr	x0, [sp, #P_RESP + 24]
-	CSTR	x1, "CurrentMute"
-	bl	tag_num
-	tbnz	w0, #31, Lpn_publish
-	cmp	w0, #0
-	cset	w0, ne
-	str	w0, [x20, #NOW_MUTE]
-Lpn_publish:
-	LOCK
-	mov	x0, x19
-	mov	x1, x20
-	mov	x2, #NOW_SIZE
-	bl	_memcpy
-	UNLOCK
-	mov	x21, #P_RESP
-Lpn_free:
-	ldr	x0, [sp, x21]
-	bl	_free
-	add	x21, x21, #8
-	cmp	x21, #(P_RESP + 32)
-	b.lo	Lpn_free
-Lpn_render:
-	bl	ui_post_refresh
-	b	Lret3
-
-; ---- Transport and volume commands (device queue) ----
-
-; report(ok) — tell the user when the device refused a command.
-report:
-	cbnz	w0, Lrp_ret
-	CSTR	x0, "The device rejected the command."
-	b	ui_post_error
-Lrp_ret:
-	ret
-
-; av_done(action, args) — an AVTransport command; report a refusal, then poll right away.
-av_done:
-	FRAME	0
-	bl	avcmd
-	bl	report
-	bl	poll_now
-	b	Lret0
-
-; toggle_job — pause when playing, play otherwise.
-	ENTRY	toggle_job
-	BADDR	x9, B_NOW
-	ldr	w9, [x9, #NOW_STATE]
-	GADDR	x0, Ls_play
-	GADDR	x1, Ls_speed
-	cmp	w9, #ST_PLAYING
-	ccmp	w9, #ST_TRANSITIONING, #4, ne
-	b.ne	av_done
-	CSTR	x0, "Pause"
-	GADDR	x1, Ls_slash+1
-	b	av_done
-
-; stop_job
-	ENTRY	stop_job
-	CSTR	x0, "Stop"
-	GADDR	x1, Ls_slash+1
-	b	av_done
-
-; mute_job — toggle the device's own mute (the volume is kept).
-	ENTRY	mute_job
-	FRAME	0, 80
-	BADDR	x9, B_NOW
-	ldr	w9, [x9, #NOW_MUTE]
-	eor	w9, w9, #1
-	str	x9, [sp]
-	add	x0, sp, #16
-	mov	x1, #64
-	CSTR	x2, "<Channel>Master</Channel><DesiredMute>%d</DesiredMute>"
-	bl	_snprintf
-	GADDR	x0, Ls_setmute
-	add	x1, sp, #16
-	bl	rccmd
-	bl	report
-	bl	poll_now
-	b	Lret0
-
-; set_volume(level) — set the volume and unmute; w0 = 1 on success.
-set_volume:
-	FRAME	1, 96
-	mov	w19, w0
-	BADDR	x20, B_NOW
-	ldr	w9, [x20, #NOW_VOL]
-	mov	w0, #1
-	cmp	w9, w19
-	b.eq	Lret1                     ; already there
-	str	x19, [sp]
-	add	x0, sp, #16
-	mov	x1, #80
-	CSTR	x2, "<Channel>Master</Channel><DesiredVolume>%d</DesiredVolume>"
-	bl	_snprintf
-	CSTR	x0, "SetVolume"
-	add	x1, sp, #16
-	bl	rccmd
-	cbz	w0, Lret1
-	LOCK
-	str	w19, [x20, #NOW_VOL]
-	UNLOCK
-	ldr	w9, [x20, #NOW_MUTE]
-	cbz	w9, Lsv_done
-	GADDR	x0, Ls_setmute
-	CSTR	x1, "<Channel>Master</Channel><DesiredMute>0</DesiredMute>"
-	bl	rccmd
-	cbz	w0, Lsv_done
-	LOCK
-	str	wzr, [x20, #NOW_MUTE]
-	UNLOCK
-Lsv_done:
-	bl	ui_post_refresh
-	mov	w0, #1
-	b	Lret1
-
-; vol_set(level) — set_volume within 0..100, reporting a refusal.
-vol_set:
-	FRAME	0
-	bl	clamp100
-	bl	set_volume
-	bl	report
-	b	Lret0
-
-; vol_job — send the latest slider value.
-	ENTRY	vol_job
-	add	x9, x28, #G_VOLB
-	stlr	wzr, [x9]
-	add	x9, x28, #G_PVOL
-	ldar	w0, [x9]
-	b	vol_set
-
-; volstep_job(delta) — change the volume by delta, within 0..100.
-	ENTRY	volstep_job
-	BADDR	x9, B_NOW
-	ldr	w9, [x9, #NOW_VOL]
-	add	w0, w9, w0
-	b	vol_set
-
-; clamp100(n) -> n within 0..100.
-clamp100:
-	cmp	w0, #0
-	csel	w0, w0, wzr, gt
-	mov	w9, #100
-	cmp	w0, w9
-	csel	w0, w0, w9, lt
-	ret
-
-; seek_job(seconds) — absolute seek.
-	ENTRY	seek_job
-	FRAME	0, 112
-	add	x1, sp, #16
-	mov	x2, #1
-	bl	fmt_time
-	add	x9, sp, #16
-	str	x9, [sp]
-	add	x0, sp, #32
-	mov	x1, #80
-	CSTR	x2, "<Unit>REL_TIME</Unit><Target>%s</Target>"
-	bl	_snprintf
-	CSTR	x0, "Seek"
-	add	x1, sp, #32
-	bl	avcmd
-	cbnz	w0, Lsk_poll
-	CSTR	x0, "Seeking is not available for this audio."
-	bl	ui_post_error
-Lsk_poll:
-	bl	poll_now
-	b	Lret0
-
-; ---- Playing a link: main -> worker -> device queue -> main ----
-
-; play_resolve(job) — resolve the link, hand it to the device or prepare This Mac's item, report to main.
+; play_resolve(job) — resolve the link, prepare This Mac's item, report to main.
 	ENTRY	play_resolve
 	FRAME	2
 	mov	x19, x0
@@ -2293,19 +1068,13 @@ Lsk_poll:
 	bl	resolve
 	str	w0, [x19, #JOB_RESULT]
 	cbnz	w0, Lpr_done
-	LOCK
-	BADDR	x9, B_NOW
-	ldr	w20, [x9, #NOW_SEL]
-	UNLOCK
-	cbnz	w20, Lpr_device
+	ldr	w9, [x19, #JOB_GEN]
+	add	x10, x28, #G_PLAYGEN
+	ldar	w10, [x10]
+	cmp	w9, w10
+	b.ne	Lpr_done
 	mov	x0, x19
 	bl	local_prepare
-	b	Lpr_done
-Lpr_device:
-	ldr	x0, [x28, #G_QUEUE]
-	mov	x1, x19
-	adr	x2, play_upnp
-	bl	_dispatch_sync_f          ; keeps the job alive until the device answers
 Lpr_done:
 	mov	x0, x21
 	bl	_objc_autoreleasePoolPop
@@ -2322,8 +1091,7 @@ local_prepare:
 	add	x0, x20, #JOB_URL
 	cbnz	w9, Llp_item
 	ldr	w1, [x20, #JOB_LIVE]
-	CSTR	x2, "127.0.0.1"
-	ADDO	x3, x20, JOB_LOCAL
+	ADDO	x2, x20, JOB_LOCAL
 	bl	slot_uri
 	ADDO	x9, x20, JOB_VURL
 	ldrb	w9, [x9]
@@ -2337,14 +1105,12 @@ local_prepare:
 Llp_vslot:
 	ADDO	x0, x20, JOB_VURL
 	mov	w1, #SLOT_VIDEO
-	CSTR	x2, "127.0.0.1"
-	ADDO	x3, x20, JOB_VLOCAL
+	ADDO	x2, x20, JOB_VLOCAL
 	bl	slot_uri
 Llp_hls:
 	ldr	w9, [x20, #JOB_LIVE]
 	cbnz	w9, Llp_sound             ; a broadcast has no index: it plays as it comes
 	mov	x0, x20                   ; the picture's too, even for Audio Only, which can be turned off later
-	CSTR	x1, "127.0.0.1"
 	bl	hls_master
 	ldr	w9, [x28, #G_AONLY]
 	cbnz	w9, Llp_sound
@@ -2383,14 +1149,13 @@ make_item:
 	SEND	S_retain
 	b	Lret0
 
-; hls_master(job, host) — JOB_HLSA: the sound as HLS, segmented by its index; then, with a picture (JOB_VLOCAL), JOB_HLS: a master playlist with the picture as its one variant and that sound as its audio. Each stays "" if its index did not come.
+; hls_master(job) — JOB_HLSA: the sound as HLS, segmented by its index; then, with a picture (JOB_VLOCAL), JOB_HLS: a master playlist with the picture as its one variant and that sound as its audio. Each stays "" if its index did not come.
 	.equ HX_V,	48                ; char[256], the picture's playlist
 	.equ HX_TEXT,	304               ; char*
 	.equ HX_SIZE,	320
 hls_master:
 	FRAME	3, HX_SIZE
 	mov	x20, x0
-	mov	x23, x1
 	bl	curl_new
 	mov	x19, x0
 	cbz	x0, Lret2
@@ -2398,7 +1163,6 @@ hls_master:
 	ADDO	x1, x20, JOB_LOCAL
 	add	x2, x20, #JOB_AFMT
 	ADDO	x3, x20, JOB_HLSA
-	mov	x4, x23
 	bl	hls_media
 	cbz	w0, Lhx_done
 	ADDO	x9, x20, JOB_VLOCAL
@@ -2408,7 +1172,6 @@ hls_master:
 	ADDO	x1, x20, JOB_VLOCAL
 	add	x2, x20, #JOB_VFMT
 	add	x3, sp, #HX_V
-	mov	x4, x23
 	bl	hls_media
 	cbz	w0, Lhx_done
 	ADDO	x9, x20, JOB_HLSA
@@ -2427,31 +1190,28 @@ hls_master:
 	tbnz	w0, #31, Lhx_done
 	ldr	x0, [sp, #HX_TEXT]
 	mov	w1, #SLOT_SOUND
-	mov	x2, x23
-	ADDO	x3, x20, JOB_HLS
+	ADDO	x2, x20, JOB_HLS
 	bl	slot_uri
 	ldr	x0, [sp, #HX_TEXT]
 	bl	_free
 Lhx_done:
 	mov	x0, x19
-	bl	_curl_easy_cleanup
+	bl	curl_done
 	b	Lret3
 
-; hls_media(upstream, local, fmt, out[256], host) — an HLS playlist of one fragmented MP4 stream, its segments read from the stream's sidx (fetched with the handle in x19); out = where it is served on host; w0 = 1 if built.
+; hls_media(upstream, local, fmt, out[256]) — an HLS playlist of one fragmented MP4 stream, its segments read from the stream's sidx (fetched with the handle in x19); out = where it is served; w0 = 1 if built.
 	.equ HM_BUF,	48                ; {data, len}: the sidx
 	.equ HM_RANGE,	64                ; char[48]
 	.equ HM_TEXT,	112               ; char*, the playlist
 	.equ HM_CAP,	120               ; its size
 	.equ HM_SCALE,	128               ; sidx timescale
 	.equ HM_INIT,	136               ; init segment length
-	.equ HM_HOST,	144               ; char *, where the playlist is served
-	.equ HM_SIZE,	160
+	.equ HM_SIZE,	144
 hls_media:
 	FRAME	4, HM_SIZE
 	mov	x20, x0
 	mov	x21, x1
 	mov	x23, x3
-	str	x4, [sp, #HM_HOST]
 	ldr	x9, [x2, #FMT_INIT]
 	add	x9, x9, #1
 	str	x9, [sp, #HM_INIT]
@@ -2587,8 +1347,7 @@ Lhl_end:
 	bl	_snprintf
 	ldr	x0, [sp, #HM_TEXT]
 	mov	w1, #SLOT_SOUND
-	ldr	x2, [sp, #HM_HOST]
-	mov	x3, x23
+	mov	x2, x23
 	bl	slot_uri
 	ldr	x0, [sp, #HM_TEXT]
 	bl	_free
@@ -2599,13 +1358,12 @@ Lhl_free:
 	mov	w0, w22
 	b	Lret4
 
-; slot_uri(source, kind, host, out[256]) — serve a media URL or file path under a fresh random token; out = its URL on host.
+; slot_uri(source, kind, out[256]) — serve a media URL or playlist under a fresh random token; out = its URL.
 slot_uri:
 	FRAME	3, 96
 	mov	x19, x0
 	mov	w22, w1
-	mov	x20, x2
-	mov	x21, x3
+	mov	x21, x2
 	mov	x0, sp                    ; 128 random bits, printed as 32 hex digits
 	mov	x1, #16
 	bl	_arc4random_buf
@@ -2634,7 +1392,7 @@ slot_uri:
 	bl	_strdup
 	str	x0, [x24, x23, lsl #3]
 	UNLOCK
-	CSTR	x10, "m4a"                ; a name the device can tell the format from
+	CSTR	x10, "m4a"                ; a name the player can tell the format from
 	CSTR	x11, "aac"
 	cmp	w22, #SLOT_LIVE
 	csel	x10, x11, x10, eq
@@ -2645,171 +1403,17 @@ slot_uri:
 	CSTR	x11, "m3u8"
 	cmp	w9, #'#'
 	csel	x10, x11, x10, eq         ; a playlist made here
-	cmp	w9, #'/'
-	b.ne	Lsl_print
-	mov	x0, x19                   ; a file keeps its own extension
-	mov	w1, #'.'
-	bl	_strrchr
-	CSTR	x10, "bin"
-	cbz	x0, Lsl_print
-	add	x10, x0, #1
-Lsl_print:
 	ldr	w9, [x28, #G_PORT]
-	stp	x20, x9, [sp]
-	add	x9, sp, #48
-	stp	x9, x10, [sp, #16]
+	add	x11, sp, #48
+	stp	x9, x11, [sp]
+	str	x10, [sp, #16]
 	mov	x0, x21
 	mov	x1, #256
-	CSTR	x2, "http://%s:%u/stream/%s.%s"
+	CSTR	x2, "http://127.0.0.1:%u/stream/%s.%s"
 	bl	_snprintf
 	b	Lret3
 
-; play_upnp(job) — serve the media (a web address goes as it is) and play it on the device with DIDL-Lite metadata.
-	ENTRY	play_upnp
-	FRAME	4, 64
-	mov	x19, x0
-	ldr	w25, [x19, #JOB_KIND]
-	cmp	w25, #KIND_WEB
-	b.ne	Lps_serve
-	BADDR	x0, B_MYURI
-	add	x1, x19, #JOB_URL
-	mov	x2, #MYURI_SIZE
-	bl	_strlcpy
-	CSTR	x26, "*"
-	b	Lps_track
-Lps_serve:
-	add	x0, x19, #JOB_URL
-	ldr	w1, [x19, #JOB_LIVE]
-	GADDR	x26, Ls_mp4
-	cbz	w1, Lps_tv
-	GADDR	x26, Ls_aac
-	b	Lps_kind
-Lps_tv:
-	BADDR	x9, B_CUR
-	ldrb	w20, [x9, #DEV_VIDEO]
-	tbz	w20, #1, Lps_mp4          ; a TV that plays HLS gets Beam's presentation, at full quality
-	ADDO	x9, x19, JOB_VURL
-	ldrb	w9, [x9]
-	cbz	w9, Lps_mp4
-	add	x0, x19, #JOB_URL
-	mov	w1, #SLOT_SOUND
-	BADDR	x2, B_LANIP
-	ADDO	x3, x19, JOB_LOCAL
-	bl	slot_uri
-	ADDO	x0, x19, JOB_VURL
-	mov	w1, #SLOT_VIDEO
-	BADDR	x2, B_LANIP
-	ADDO	x3, x19, JOB_VLOCAL
-	bl	slot_uri
-	mov	x0, x19
-	BADDR	x1, B_LANIP
-	bl	hls_master
-	ADDO	x1, x19, JOB_HLS
-	ldrb	w9, [x1]
-	cbz	w9, Lps_mp4
-	BADDR	x0, B_MYURI
-	mov	x2, #MYURI_SIZE
-	bl	_strlcpy
-	GADDR	x26, Ls_hls
-	b	Lps_track
-Lps_mp4:
-	add	x0, x19, #JOB_URL         ; the sound, unless a TV gets picture and sound in one MP4 (when YouTube offers it)
-	mov	w1, #SLOT_SOUND
-	tbz	w20, #0, Lps_kind
-	ADDO	x9, x19, JOB_MURL
-	ldrb	w10, [x9]
-	cbz	w10, Lps_kind
-	mov	x0, x9
-	mov	w1, #SLOT_VIDEO
-	CSTR	x26, "video/mp4"
-	b	Lps_slot
-Lps_kind:
-	cmp	w25, #KIND_FILE
-	b.ne	Lps_slot
-	ldr	x0, [x19, #JOB_QUERY]     ; a file: the proxy reads it from disk
-	bl	mime_of
-	mov	x26, x0
-	ldr	x0, [x19, #JOB_QUERY]
-	mov	w1, #SLOT_SOUND
-Lps_slot:
-	BADDR	x2, B_LANIP
-	BADDR	x3, B_MYURI
-	bl	slot_uri
-Lps_track:
-	BADDR	x0, B_MYTRACK
-	add	x1, x19, #JOB_TRACK
-	mov	x2, #T_SIZE
-	bl	_memcpy
-	ldr	x9, [x19, #JOB_DUR]
-	str	x9, [x28, #G_MYDUR]
-	add	x0, x19, #(JOB_TRACK + T_TITLE)
-	bl	xml_escape
-	mov	x20, x0
-	add	x0, x19, #(JOB_TRACK + T_ARTIST)
-	bl	xml_escape
-	mov	x21, x0
-	add	x0, x19, #(JOB_TRACK + T_ART)
-	bl	xml_escape
-	mov	x22, x0
-	BADDR	x0, B_MYURI
-	bl	xml_escape
-	mov	x23, x0
-	stp	x20, x21, [sp]
-	str	x22, [sp, #16]
-	CSTR	x9, "audio"               ; a picture plays as a video item (TVs)
-	CSTR	x10, "video"
-	ldrb	w11, [x26]
-	cmp	w11, #'v'
-	GADDR	x11, Ls_hls
-	ccmp	x26, x11, #4, ne
-	csel	x9, x10, x9, eq
-	stp	x9, x26, [sp, #24]
-	str	x23, [sp, #40]
-	add	x0, sp, #48
-	CSTR	x1, "<DIDL-Lite xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" xmlns:r=\"urn:schemas-rinconnetworks-com:metadata-1-0/\" xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\"><item id=\"-1\" parentID=\"-1\" restricted=\"true\"><dc:title>%s</dc:title><dc:creator>%s</dc:creator><upnp:albumArtURI>%s</upnp:albumArtURI><upnp:class>object.item.%sItem</upnp:class><res protocolInfo=\"http-get:*:%s:*\">%s</res></item></DIDL-Lite>"
-	bl	_asprintf
-	mov	x0, x20
-	bl	_free
-	mov	x0, x21
-	bl	_free
-	mov	x0, x22
-	bl	_free
-	mov	w22, #PLAY_REJECTED
-	ldr	x20, [sp, #48]
-	cbz	x20, Lps_done
-	mov	x0, x20
-	bl	xml_escape                ; the DIDL travels as text inside SOAP
-	mov	x21, x0
-	mov	x0, x20
-	bl	_free
-	cbz	x21, Lps_done
-	stp	x23, x21, [sp]
-	add	x0, sp, #48
-	CSTR	x1, "<CurrentURI>%s</CurrentURI><CurrentURIMetaData>%s</CurrentURIMetaData>"
-	bl	_asprintf
-	mov	x0, x21
-	bl	_free
-	ldr	x20, [sp, #48]
-	cbz	x20, Lps_done
-	CSTR	x0, "SetAVTransportURI"
-	mov	x1, x20
-	bl	avcmd
-	mov	w21, w0
-	mov	x0, x20
-	bl	_free
-	cbz	w21, Lps_done
-	GADDR	x0, Ls_play
-	GADDR	x1, Ls_speed
-	bl	avcmd
-	mov	w22, #PLAY_OK
-Lps_done:
-	mov	x0, x23
-	bl	_free
-	str	w22, [x19, #JOB_RESULT]
-	bl	poll_now                  ; show the new track right away
-	b	Lret4
-
-; ---- Audio proxy: streams the media to the speaker ----
+; ---- Media proxy: streams YouTube to This Mac's player ----
 
 ; respond(fd, status, message) — a complete plain-text response, e.g. status "404 Not Found".
 respond:
@@ -2830,7 +1434,7 @@ respond:
 	bl	send_all
 	b	Lret2
 
-; proxy_reply(proxy) — check an upstream answer; the first one also sends the speaker its response head.
+; proxy_reply(proxy) — check an upstream answer; the first one also sends the player its response head.
 	.equ PR_HDR,	48                ; struct curl_header *
 	.equ PR_START,	56                ; Content-Range first byte
 	.equ PR_LAST,	64                ; last byte
@@ -2954,10 +1558,10 @@ Lpb_stop:
 	mov	x0, #0
 	b	Lret2
 
-; vod_stream(fd, url, range, head, slot) — proxy a media file in chunks the CDN serves at full speed, honoring the speaker's range; the slot then keeps the address the CDN redirected to, so later requests go straight there.
+; vod_stream(fd, url, range, head, slot) — proxy a media file in chunks the CDN serves at full speed, honoring the player's range; the slot then keeps the address the CDN redirected to, so later requests go straight there.
 	.equ VS_PX,	16                ; proxy state
 	.equ VS_RANGE,	VS_PX + PX_SIZE   ; char[32], upstream range
-	.equ VS_A,	VS_RANGE + 32     ; the speaker's first byte
+	.equ VS_A,	VS_RANGE + 32     ; the player's first byte
 	.equ VS_B,	VS_A + 8          ; and last byte
 	.equ VS_SLOT,	VS_B + 8          ; char **, the slot's URL
 	.equ VS_EFF,	VS_SLOT + 8       ; char *, where the CDN sent us
@@ -2971,7 +1575,7 @@ vod_stream:
 	str	x4, [sp, #VS_SLOT]
 	bl	curl_new
 	mov	x19, x0
-	cbz	x0, Lret4                 ; out of memory: the speaker sees the connection close
+	cbz	x0, Lret4                 ; out of memory: the player sees the connection close
 	add	x25, sp, #VS_PX
 	stp	xzr, xzr, [x25]
 	stp	xzr, xzr, [x25, #16]
@@ -3020,7 +1624,7 @@ Lvs_setup:
 	bl	copt1
 	mov	w1, #CURLOPT_FOLLOWLOCATION
 	bl	copt1
-	mov	w1, #CURLOPT_FAILONERROR      ; error pages never reach the speaker
+	mov	w1, #CURLOPT_FAILONERROR      ; error pages never reach the player
 	bl	copt1
 	adr	x2, proxy_body
 	mov	w1, #CURLOPT_WRITEFUNCTION
@@ -3036,7 +1640,7 @@ Lvs_setup:
 	bl	copt
 Lvs_chunk:
 	ldr	x9, [x25, #PX_POS]
-	mov	x2, x22                   ; a suffix of unknown size goes as the speaker wrote it
+	mov	x2, x22                   ; a suffix of unknown size goes as the player wrote it
 	tbnz	x9, #63, Lvs_range
 	mov	x10, #CHUNK
 	add	x10, x9, x10
@@ -3076,6 +1680,10 @@ Lvs_range:
 	ldr	x0, [sp, #VS_EFF]
 	bl	_strdup
 	str	x0, [sp, #VS_EFF]
+	cbz	x0, Lvs_once
+	mov	x2, x0
+	mov	w1, #CURLOPT_URL
+	bl	copt
 	LOCK
 	ldr	x9, [sp, #VS_SLOT]
 	ldr	x0, [x9]
@@ -3119,7 +1727,7 @@ Lvs_reply:
 	bl	respond
 Lvs_done:
 	mov	x0, x19
-	bl	_curl_easy_cleanup
+	bl	curl_done
 	b	Lret4
 
 ; range_of(header, out[2]) -> how many of first and last byte a Range value gives ("bytes=a-b", "a-", "-n", or a bare "a-b"); a suffix reads as a negative first byte.
@@ -3144,48 +1752,6 @@ range_of:
 Lro_none:
 	mov	w0, #0
 	b	Lret1
-
-; mime_of(path) -> the media type of a file name's extension.
-	.pushsection __DATA,__data
-Lmimes:	                                  ; extension, then its type
-	.asciz	"mp3", "audio/mpeg"
-	.asciz	"m4a", "audio/mp4"
-	.asciz	"m4b", "audio/mp4"
-	.asciz	"aac", "audio/aac"
-	.asciz	"flac", "audio/flac"
-	.asciz	"wav", "audio/wav"
-	.asciz	"aif", "audio/aiff"
-	.asciz	"aiff", "audio/aiff"
-	.asciz	"ogg", "audio/ogg"
-	.asciz	"opus", "audio/ogg"
-	.asciz	"mp4", "video/mp4"
-	.asciz	"m4v", "video/mp4"
-	.asciz	"mov", "video/quicktime"
-	.byte	0
-	.popsection
-mime_of:
-	FRAME	2
-	mov	w1, #'.'
-	bl	_strrchr
-	cbz	x0, Lmo_none
-	add	x19, x0, #1
-	GADDR	x20, Lmimes
-Lmo_next:
-	ldrb	w9, [x20]
-	cbz	w9, Lmo_none
-	mov	x0, x19
-	mov	x1, x20
-	bl	_strcasecmp
-	mov	w21, w0
-	mov	x0, x20
-	bl	nextstr
-	cbz	w21, Lret2                ; its type
-	bl	nextstr
-	mov	x20, x0
-	b	Lmo_next
-Lmo_none:
-	CSTR	x0, "application/octet-stream"
-	b	Lret2
 
 ; text_stream(fd, text, head) — a playlist made here.
 text_stream:
@@ -3212,101 +1778,6 @@ text_stream:
 	mov	x2, x22
 	bl	send_all
 	b	Lret2
-
-; file_stream(fd, path, range, head) — serve a file on this Mac, honoring the speaker's range, straight from disk to the socket.
-	.equ FS_AB,	48                ; first and last byte asked; then sendfile's count (after snprintf's five arguments)
-	.equ FS_HEAD,	64                ; char[512]
-	.equ FS_SIZE,	FS_HEAD + 512
-file_stream:
-	FRAME	4, FS_SIZE
-	mov	w19, w0
-	mov	x20, x1
-	mov	x21, x2
-	mov	w22, w3
-	mov	x0, x20
-	mov	w1, #0                    ; O_RDONLY
-	bl	_open
-	mov	w23, w0
-	tbnz	w0, #31, Lfs_gone
-	mov	x1, #0
-	mov	w2, #2                    ; SEEK_END: the size
-	bl	_lseek
-	mov	x24, x0
-	mov	x0, x21
-	add	x1, sp, #FS_AB
-	bl	range_of
-	mov	w25, w0                   ; asked for a range
-	mov	x26, #0                   ; first byte
-	sub	x21, x24, #1              ; last byte
-	cbz	w25, Lfs_span
-	ldp	x9, x10, [sp, #FS_AB]
-	mov	x26, x9
-	tbz	x9, #63, Lfs_last
-	adds	x26, x24, x9              ; a suffix: the last n bytes
-	csel	x26, x26, xzr, gt
-	b	Lfs_span
-Lfs_last:
-	cmp	w25, #2
-	b.ne	Lfs_span
-	cmp	x10, x21
-	csel	x21, x10, x21, lt
-Lfs_span:
-	cmp	x26, x21
-	b.gt	Lfs_416                   ; past the end (or an empty file)
-	mov	x0, x20
-	bl	mime_of
-	sub	x9, x21, x26
-	add	x9, x9, #1                ; bytes to send
-	stp	x0, x9, [sp]
-	GADDR	x2, Ls_200
-	cbz	w25, Lfs_print
-	stp	x26, x21, [sp, #16]
-	str	x24, [sp, #32]
-	GADDR	x2, Ls_206
-Lfs_print:
-	add	x0, sp, #FS_HEAD
-	mov	x1, #512
-	bl	_snprintf
-	cmp	w0, #512
-	b.hs	Lfs_close
-	mov	w2, w0
-	mov	w0, w19
-	add	x1, sp, #FS_HEAD
-	bl	send_all
-	cbz	w0, Lfs_close
-	cbnz	w22, Lfs_close            ; HEAD: the response head was all it wanted
-Lfs_send:
-	sub	x9, x21, x26
-	add	x9, x9, #1
-	str	x9, [sp, #FS_AB]          ; in: how many, out: how many went
-	mov	w0, w23
-	mov	w1, w19
-	mov	x2, x26
-	add	x3, sp, #FS_AB
-	mov	x4, #0
-	mov	w5, #0
-	bl	_sendfile
-	ldr	x9, [sp, #FS_AB]
-	add	x26, x26, x9
-	cmp	x26, x21
-	b.gt	Lfs_close                 ; all sent
-	cbnz	x9, Lfs_send              ; part of it: the rest
-	b	Lfs_close                 ; none: the speaker went away
-Lfs_416:
-	mov	w0, w19
-	CSTR	x1, "416 Range Not Satisfiable"
-	GADDR	x2, Ls_slash+1
-	bl	respond
-Lfs_close:
-	mov	w0, w23
-	bl	_close
-	b	Lret4
-Lfs_gone:
-	mov	w0, w19
-	GADDR	x1, Ls_404
-	CSTR	x2, "file not found"
-	bl	respond
-	b	Lret4
 
 ; box_find(p, end, type) — x0 = the payload of the first box of that type in [p, end), x1 = its end; x0 = 0 if none.
 box_find:
@@ -3384,7 +1855,7 @@ Ltrun_path:	                          ; moof -> the frame sizes
 	.quad	0
 	.popsection
 
-; adts_send(fd, segment, len) — send the AAC frames of one fragmented MP4 segment as ADTS; w0 = 0 when the speaker went away or none could be read.
+; adts_send(fd, segment, len) — send the AAC frames of one fragmented MP4 segment as ADTS; w0 = 0 when the player went away or none could be read.
 	.equ AD_COUNT,	0                 ; frames left
 	.equ AD_STRIDE,	8                 ; bytes per trun sample record
 	.equ AD_OUT,	16                ; ADTS write cursor
@@ -3585,7 +2056,7 @@ Lls_get:
 	mov	x1, #0
 	mov	w2, #10
 	bl	_strtol
-	subs	x23, x0, #1               ; start one segment back: a cushion for the speaker
+	subs	x23, x0, #1               ; start one segment back: a cushion for the player
 	csinc	x23, x23, xzr, gt
 	mov	w25, #0
 	b	Lls_free
@@ -3594,7 +2065,7 @@ Lls_send:
 	ldp	x1, x2, [sp, #LS_BUF]
 	bl	adts_send
 	cmp	w0, #0
-	cset	w25, eq                   ; the speaker went away, or the stream is not one we can read
+	cset	w25, eq                   ; the player went away, or the stream is not one we can read
 	add	x23, x23, #1
 	mov	w24, #0
 Lls_free:
@@ -3611,7 +2082,7 @@ Lls_failed:
 	b.lo	Lls_fetch
 Lls_cleanup:
 	mov	x0, x19
-	bl	_curl_easy_cleanup
+	bl	curl_done
 	b	Lret4
 
 ; handle_conn(fd) — a proxy thread: read one request, serve the stream its token names, close.
@@ -3694,15 +2165,10 @@ Lhc_unlock:
 	add	x2, sp, #H_RANGE
 	cbnz	w25, Lhc_live
 	ldrb	w9, [x23]
-	cmp	w9, #'/'
-	b.eq	Lhc_file
 	cmp	w9, #'#'
 	b.eq	Lhc_text
 	mov	x4, x24                   ; its slot, to learn the CDN's redirect
 	bl	vod_stream
-	b	Lhc_free
-Lhc_file:
-	bl	file_stream
 	b	Lhc_free
 Lhc_text:
 	mov	w2, w3
@@ -3727,7 +2193,7 @@ Lhc_close:
 	mov	x0, #0
 	b	Lret4
 
-; server_run(fd) — accept LAN peers, one detached thread per connection.
+; server_run(fd) — accept connections, one detached thread each.
 	ENTRY	server_run
 	FRAME	2, 48
 	mov	w19, w0
@@ -3736,11 +2202,9 @@ Lsr_slot:
 	mov	x1, #DISPATCH_TIME_FOREVER
 	bl	_dispatch_semaphore_wait
 Lsr_accept:
-	mov	w9, #16
-	str	w9, [sp, #32]
 	mov	w0, w19
-	add	x1, sp, #16
-	add	x2, sp, #32
+	mov	x1, #0
+	mov	x2, #0
 	bl	_accept
 	tbz	w0, #31, Lsr_peer
 	mov	w0, #ACCEPT_BACKOFF_US    ; e.g. out of descriptors: do not spin
@@ -3748,25 +2212,6 @@ Lsr_accept:
 	b	Lsr_accept
 Lsr_peer:
 	mov	w20, w0
-	ldr	w9, [sp, #20]             ; the peer, network order like G_LAN
-	ldr	x10, [x28, #G_LAN]        ; one atomic load: address and mask agree
-	lsr	x11, x10, #32
-	cbz	w11, Lsr_loopback
-	eor	w12, w9, w10
-	tst	w12, w11
-	b.eq	Lsr_ok                    ; same subnet
-Lsr_loopback:
-	and	w12, w9, #0xff            ; the first octet
-	cmp	w12, #127
-	b.eq	Lsr_ok                    ; loopback
-	mov	w0, w20
-	CSTR	x1, "403 Forbidden"
-	CSTR	x2, "local network only"
-	bl	respond
-	mov	w0, w20
-	bl	_close
-	b	Lsr_accept
-Lsr_ok:
 	mov	x9, #CLIENT_TIMEOUT_S
 	stp	x9, xzr, [sp]             ; struct timeval
 	mov	w0, w20
@@ -3801,8 +2246,18 @@ server_start:
 	bl	_socket
 	mov	w19, w0
 	tbnz	w0, #31, Lss_fail
+	mov	w9, #SOCKADDR_IN_HEAD
+	mov	w10, #0x007f
+	movk	w10, #0x0100, lsl #16
+	stp	w9, w10, [sp, #16]
+	str	xzr, [sp, #24]
+	add	x1, sp, #16
+	mov	w2, #16
+	bl	_bind                     ; 127.0.0.1 only, on a port the system picks
+	cbnz	w0, Lss_close
+	mov	w0, w19
 	mov	w1, #64
-	bl	_listen                   ; on any address and a port the system picks
+	bl	_listen
 	cbnz	w0, Lss_close
 	mov	w9, #16
 	str	w9, [sp, #32]
@@ -4246,13 +2701,12 @@ Lfi_codecs:
 Lk_itag:	.asciz	"\"itag\":"
 	.popsection
 parse_player:
-	FRAME	4, 64                     ; the best picture's "url" value and score, its JSON span, the sound's span, then the best muxed stream
+	FRAME	4, 48                     ; the best picture's "url" value and score, its JSON span, the sound's span
 	mov	x19, x0
 	mov	x20, x1
 	stp	xzr, xzr, [sp]
 	stp	xzr, xzr, [sp, #16]
 	stp	xzr, xzr, [sp, #32]
-	stp	xzr, xzr, [sp, #48]
 	mov	x0, x1
 	CSTR	x1, "\"streamingData\":"
 	bl	_strstr
@@ -4286,26 +2740,19 @@ Lpp_one:
 	add	x26, x0, #6
 	CSTR	x0, "mp4a"
 	bl	within
-	cbz	x0, Lpp_video             ; not AAC: not every speaker plays it
+	cbz	x0, Lpp_video             ; not AAC: the HLS made here carries AAC
 	CSTR	x0, "\"video/mp4"
 	bl	within
-	cbz	x0, Lpp_sound
-	CSTR	x0, "\"height\":"         ; picture and sound in one: the tallest, for TVs
-	bl	within
-	cbz	x0, Lpp_fmt
-	add	x0, x0, #9
-	mov	x1, #0
-	mov	w2, #10
-	bl	_strtol
-	ldr	x9, [sp, #56]
-	cmp	x0, x9
-	b.le	Lpp_fmt
-	stp	x26, x0, [sp, #48]
-	b	Lpp_fmt
+	cbnz	x0, Lpp_fmt
 Lpp_sound:
-	cmp	x24, #140                 ; score: itag 140 4, audio only 2, no loudness compression 1
+	cmp	x24, #140                 ; score: the original track 8, itag 140 4, audio only 2, no loudness compression 1
 	cset	w24, eq
 	lsl	w24, w24, #2
+	CSTR	x0, "\"audioIsDefault\":true"
+	bl	within
+	cmp	x0, #0
+	cset	w9, ne
+	orr	w24, w24, w9, lsl #3
 	CSTR	x0, "\"audio/"
 	bl	within
 	cbz	x0, Lpp_drc
@@ -4334,8 +2781,6 @@ Lpp_video:
 	bl	within
 	cbnz	x0, Lpp_height
 	ldr	w9, [x28, #G_AV1]
-	ldr	w10, [x28, #G_TV]
-	bic	w9, w9, w10               ; (any TV flag clears it)
 	cbz	w9, Lpp_fmt
 	CSTR	x0, "av01"
 	bl	within
@@ -4382,10 +2827,6 @@ Lpp_picked:
 	ADDO	x1, x19, JOB_VURL
 	mov	x2, #4096
 	bl	jstr
-	ldr	x0, [sp, #48]
-	ADDO	x1, x19, JOB_MURL
-	mov	x2, #4096
-	bl	jstr
 	mov	x0, x22
 	add	x1, x19, #JOB_URL
 	mov	x2, #4096
@@ -4407,7 +2848,7 @@ Lpp_picked:
 	add	x1, x19, #(JOB_TRACK + T_ARTIST)
 	mov	x2, #256
 	bl	jstr
-	mov	x0, x20                   ; artwork: the largest JPEG thumbnail YouTube lists (they grow along the list)
+	mov	x0, x20                   ; artwork: the largest thumbnail YouTube lists (they grow along the list)
 	CSTR	x1, "\"thumbnails\":["
 	bl	jfind
 	cbz	x0, Lpp_thumbed
@@ -4425,13 +2866,7 @@ Lpp_thumb:
 	cmp	x0, x25
 	b.hs	Lpp_tpick
 	add	x21, x0, #1
-	add	x24, x0, #6
-	mov	x0, x24
-	CSTR	x1, "\"https://i.ytimg.com/vi_webp"
-	mov	x2, #28
-	bl	_strncmp
-	cbz	w0, Lpp_thumb             ; WebP: not every speaker shows it
-	mov	x22, x24
+	add	x22, x0, #6
 	b	Lpp_thumb
 Lpp_tpick:
 	mov	x0, x22
@@ -4494,9 +2929,21 @@ resolve:
 	bl	is_link
 	cbz	w0, Lrs_tube              ; search words
 	mov	x0, x22
-	CSTR	x1, "youtu"
+	GADDR	x1, Ls_sep
 	bl	_strstr
-	cbnz	x0, Lrs_tube
+	add	x9, x0, #3
+	cmp	x0, #0
+	csel	x23, x9, x22, ne
+	mov	x0, x23
+	CSTR	x1, "&?/#"
+	bl	_strcspn
+	add	x24, x23, x0
+	mov	x0, x23
+	CSTR	x1, "youtu"
+	bl	_strcasestr
+	cmp	x0, #0
+	ccmp	x0, x24, #2, ne
+	b.lo	Lrs_tube
 	mov	x0, x20                   ; any other address plays as it is
 	bl	resolve_web
 	b	Lrs_named
@@ -4652,7 +3099,7 @@ Lrs_none:
 	bl	_snprintf
 Lrs_done:
 	mov	x0, x19
-	bl	_curl_easy_cleanup
+	bl	curl_done
 Lrs_pool:
 	mov	x0, x26
 	bl	_objc_autoreleasePoolPop
@@ -4937,19 +3384,13 @@ show_track:
 	orr	w0, w0, w21
 	cbz	w0, Lret3
 	mov	x22, x19
-	ldr	x23, [x28, #G_TEXT]
 	ldrb	w9, [x19]
 	cbnz	w9, Ltr_show
-	GADDR	x19, Ls_nothing
-	ldr	x23, [x28, #G_SECOND]
 	CSTR	x22, "Beam"
 Ltr_show:
 	ldr	x0, [x28, #G_TITLE]
 	mov	x1, x19
 	bl	setstr
-	ldr	x0, [x28, #G_TITLE]
-	mov	x2, x23
-	SEND	S_setTextColor_
 	ldr	x0, [x28, #G_ARTIST]
 	mov	x1, x20
 	bl	setstr
@@ -5024,7 +3465,7 @@ Lsw_hide:
 	mov	x4, #ART_TIMEOUT_MS
 	bl	http
 	mov	x0, x19
-	bl	_curl_easy_cleanup
+	bl	curl_done
 Laf_done:
 	adr	x0, art_apply
 	mov	x1, x20
@@ -5111,7 +3552,7 @@ Laa_free:
 	bl	_free
 	b	Lret2
 
-; layout_stage() — between the bar and the title bar: the artwork card as large as fits (at its shape), with the note, the spinner and the empty state centered on it.
+; layout_stage() — between the bar and the title bar: the artwork card as large as fits (at its shape), with the note, the spinner and the link field centered on it.
 layout_stage:
 	FRAME	0
 	ldr	x0, [x28, #G_CONTENT]
@@ -5144,9 +3585,9 @@ layout_stage:
 	mov	x1, #SPIN_S
 	ldr	x2, [x28, #G_SPIN]
 	bl	center_box
-	mov	x0, #EMPTY_W
-	mov	x1, #EMPTY_H
-	ldr	x2, [x28, #G_EMPTY]
+	mov	x0, #URL_W
+	mov	x1, #URL_H
+	ldr	x2, [x28, #G_URLBOX]
 	bl	center_box
 	b	Lret0
 
@@ -5179,12 +3620,10 @@ center_box:
 	SEND	S_setFrame_
 	b	Lret1
 
-; stage_update() — what the stage shows: This Mac's picture, else the artwork card while a track plays or loads, else the empty state.
+; stage_update() — what the stage shows: This Mac's picture, else the artwork card while a track plays or loads.
 stage_update:
 	FRAME	2
 	mov	w19, #0                   ; the picture shows
-	ldr	w9, [x28, #G_SEL]
-	cbnz	w9, Lsu_pic
 	ldr	w9, [x28, #G_AONLY]
 	cbnz	w9, Lsu_pic
 	ldr	w19, [x28, #G_HASVIDEO]
@@ -5211,15 +3650,6 @@ Lsu_pic:
 	orr	w2, w2, w9
 	ldr	x0, [x28, #G_NOTE]
 	SEND	S_setHidden_
-	BADDR	x9, B_UITITLE
-	ldrb	w9, [x9]
-	ldr	w10, [x28, #G_LOADING]
-	orr	w9, w9, w10
-	orr	w9, w9, w19
-	cmp	w9, #0
-	cset	w2, ne
-	ldr	x0, [x28, #G_EMPTY]
-	SEND	S_setHidden_
 	cbz	w19, Lsu_bar
 	ldr	w9, [x28, #G_PPSHOWN]
 	cbnz	w9, Lret2                 ; a playing picture may keep the bar away
@@ -5245,7 +3675,7 @@ bar_alpha:
 Lbs_ret:
 	ret
 
-; render_status() — a fresh message, else "not responding" for a silent device.
+; render_status() — the status message while it is fresh.
 render_status:
 	FRAME	1
 	BADDR	x1, B_UIMSG
@@ -5260,9 +3690,6 @@ render_status:
 Lrs_hint:
 	mov	w19, #0                   ; hints are not errors
 	GADDR	x1, Ls_slash+1
-	ldr	w9, [x28, #G_READY]
-	cbnz	w9, Lrs_show
-	CSTR	x1, "The device is not responding."
 Lrs_show:
 	ldr	x0, [x28, #G_STATUS]
 	bl	setstr
@@ -5292,102 +3719,6 @@ add_item:
 	SEND	S_addItemWithTitle_action_keyEquivalent_
 	b	Lret2
 
-; rebuild_devices() — the picker's items (after its face) from the device list; items that still match stay, so an open menu only grows.
-rebuild_devices:
-	FRAME	3, MAX_DEVS * DEV_SIZE
-	mov	x22, sp                   ; a copy of the list
-	LOCK
-	ldr	w19, [x28, #G_DEVN]
-	mov	x0, x22
-	BADDR	x1, B_DEVS
-	mov	x2, #(MAX_DEVS * DEV_SIZE)
-	bl	_memcpy
-	UNLOCK
-	ldr	x0, [x28, #G_DEV]
-	SEND	S_numberOfItems
-	sub	x23, x0, #1               ; devices shown
-	mov	x20, #0
-Lrd_same:
-	cmp	x20, x23
-	ccmp	x20, x19, #2, lo
-	b.hs	Lrd_cut
-	ldr	x0, [x28, #G_DEV]
-	add	x2, x20, #1
-	SEND	S_itemTitleAtIndex_
-	SEND	S_UTF8String
-	mov	x9, #DEV_SIZE
-	madd	x1, x20, x9, x22
-	bl	_strcmp
-	cbnz	w0, Lrd_cut
-	add	x20, x20, #1
-	b	Lrd_same
-Lrd_cut:
-	cmp	x23, x20
-	b.ls	Lrd_add
-	ldr	x0, [x28, #G_DEV]
-	mov	x2, x23                   ; the last one shown, after the face
-	SEND	S_removeItemAtIndex_
-	sub	x23, x23, #1
-	b	Lrd_cut
-Lrd_add:
-	cmp	x20, x19
-	b.hs	Lret3
-	ldr	x0, [x28, #G_DEV]
-	SEND	S_menu                    ; the menu allows duplicate names
-	mov	x9, #DEV_SIZE
-	madd	x1, x20, x9, x22          ; the name
-	mov	x2, #0
-	GADDR	x3, Ls_slash+1
-	bl	add_item
-	mov	x21, x0
-	CSTR	x0, "hifispeaker.fill"
-	CSTR	x9, "laptopcomputer"
-	cmp	x20, #0
-	csel	x0, x9, x0, eq            ; This Mac, or a network device
-	GADDR	x1, Ls_slash+1
-	bl	symbol
-	mov	x2, x0
-	mov	x0, x21
-	SEND	S_setImage_
-	add	x20, x20, #1
-	b	Lrd_add
-
-; mark_devices(selected) — the selected device's checkmark, and a lit face while a network device plays.
-mark_devices:
-	FRAME	2
-	mov	w19, w0
-	ldr	x0, [x28, #G_DEV]
-	SEND	S_numberOfItems
-	mov	x20, x0
-Lmk_item:
-	subs	x20, x20, #1
-	b.le	Lmk_face
-	ldr	x0, [x28, #G_DEV]
-	mov	x2, x20
-	SEND	S_itemAtIndex_
-	sub	x9, x20, #1
-	cmp	x9, w19, uxtw
-	cset	w2, eq
-	SEND	S_setState_
-	b	Lmk_item
-Lmk_face:
-	cmp	w19, #0
-	cset	w9, ne
-	ldr	w10, [x28, #G_DEVON]
-	cmp	w9, w10
-	b.eq	Lret2
-	str	w9, [x28, #G_DEVON]
-	ldr	x10, [x28, #G_IMGDEV]
-	ldr	x11, [x28, #G_IMGDEVON]
-	cmp	w9, #0
-	csel	x21, x11, x10, ne
-	ldr	x0, [x28, #G_DEV]
-	mov	x2, #0
-	SEND	S_itemAtIndex_
-	mov	x2, x21
-	SEND	S_setImage_
-	b	Lret2
-
 ; set_status(message, is_error) — show a message for STATUS_TICKS seconds.
 set_status:
 	FRAME	1
@@ -5403,38 +3734,11 @@ set_status:
 	bl	render_status
 	b	Lret1
 
-; ui_error_cb(message) — main-queue side of ui_post_error.
-	ENTRY	ui_error_cb
-	mov	w1, #1
-	b	set_status
-
-; ui_refresh — copy the snapshot under the lock and render all of it.
+; ui_refresh — render This Mac's snapshot.
 	ENTRY	ui_refresh
-	FRAME	4, NOW_SIZE + 16
-	mov	x19, sp
-	LOCK
-	mov	x0, x19
-	BADDR	x1, B_NOW
-	mov	x2, #NOW_SIZE
-	bl	_memcpy
-	UNLOCK
-	ldr	w20, [x19, #NOW_SEL]
+	FRAME	4
+	BADDR	x19, B_NOW
 	ldr	w21, [x19, #NOW_STATE]
-	cmp	w21, #ST_OFFLINE
-	cset	w22, ne                   ; the device answers
-	cmp	w20, #0
-	csinc	w22, w22, wzr, ne         ; This Mac always does
-	str	w20, [x28, #G_SEL]
-	str	w22, [x28, #G_READY]
-	ldr	w9, [x19, #NOW_DEVREV]
-	ldr	w10, [x28, #G_DEVREV]
-	cmp	w9, w10
-	b.eq	Lur_pick
-	str	w9, [x28, #G_DEVREV]
-	bl	rebuild_devices
-Lur_pick:
-	mov	w0, w20
-	bl	mark_devices
 	add	x0, x19, #NOW_TITLE
 	add	x1, x19, #NOW_ARTIST
 	bl	show_track
@@ -5456,15 +3760,14 @@ Lur_pick:
 Lur_enable:
 	ldp	x24, x25, [x19, #NOW_POS]
 	cmp	x25, #0
-	csel	w26, w22, wzr, gt         ; seekable: answering, with a known duration
+	cset	w26, gt                   ; seekable: with a known duration
 	mov	x23, #G_BACK
 Lur_each:
 	ldr	x0, [x28, x23]
-	cmp	x23, #G_PP
-	csel	w2, w26, w22, lo
+	mov	w2, w26
 	SEND	S_setEnabled_
 	add	x23, x23, #8
-	cmp	x23, #(G_VOL + 8)
+	cmp	x23, #G_PP
 	b.lo	Lur_each
 	ldr	w9, [x28, #G_SEEKDRAG]
 	cbnz	w9, Lur_volume            ; the user is dragging it
@@ -5503,6 +3806,31 @@ Lur_status:
 	bl	stage_update
 	b	Lret4
 
+; fmt_time(seconds, out[16], hours) — "m:ss", or "h:mm:ss" from one hour up or when hours is set.
+fmt_time:
+	FRAME	1, 32
+	mov	x19, x1
+	cmp	x0, #0
+	csel	x0, x0, xzr, gt
+	mov	x9, #3600
+	udiv	x10, x0, x9
+	msub	x11, x10, x9, x0
+	mov	x9, #60
+	udiv	x12, x11, x9
+	msub	x13, x12, x9, x11
+	orr	x14, x10, x2
+	stp	x10, x12, [sp]
+	str	x13, [sp, #16]
+	CSTR	x2, "%ld:%02ld:%02ld"
+	cbnz	x14, Lft_print
+	stp	x12, x13, [sp]
+	CSTR	x2, "%ld:%02ld"
+Lft_print:
+	mov	x0, x19
+	mov	x1, #16
+	bl	_snprintf
+	b	Lret1
+
 ; show_time(pos, dur) — position slider, elapsed time and time left.
 show_time:
 	FRAME	2, 32
@@ -5525,10 +3853,15 @@ show_time:
 	mov	x1, sp
 	mov	x2, #0
 	bl	fmt_time
+	cmp	x19, #0
+	ccmp	x20, #0, #0, le
+	b.gt	Lst_now
+	strb	wzr, [sp]
+Lst_now:
 	ldr	x0, [x28, #G_CUR]
 	mov	x1, sp
 	bl	setstr
-	GADDR	x1, Ls_dashes
+	GADDR	x1, Ls_slash+1
 	cmp	x20, #0
 	b.le	Lst_left
 	cmp	x19, x20
@@ -5549,6 +3882,10 @@ Lst_left:
 	ENTRY	ui_play_done
 	FRAME	2, 272
 	mov	x19, x0
+	ldr	w9, [x19, #JOB_GEN]
+	ldr	w10, [x28, #G_PLAYGEN]
+	cmp	w9, w10
+	b.ne	Lpd_free
 	str	wzr, [x28, #G_LOADING]
 	ADDR	x0, Lprog_idle
 	bl	ui_run
@@ -5556,18 +3893,13 @@ Lst_left:
 	cbnz	w20, Lpd_failed
 	ADDR	x0, Lprog_played
 	bl	ui_run
-	ldr	w9, [x28, #G_SEL]
-	cbnz	w9, Lpd_cleared
-	mov	x0, x19
-	bl	local_play
-Lpd_cleared:
 	GADDR	x0, Ls_slash+1
 	mov	w1, #0
-	b	Lpd_message
+	bl	set_status
+	mov	x0, x19
+	bl	local_play
+	b	Lpd_free
 Lpd_failed:
-	CSTR	x0, "The device rejected the track."
-	cmp	w20, #PLAY_REJECTED
-	b.eq	Lpd_error
 	CSTR	x0, "Could not load the link."
 	ldr	x9, [x19, #JOB_ERR]
 	cbz	x9, Lpd_error
@@ -5581,7 +3913,8 @@ Lpd_error:
 	mov	w1, #1
 Lpd_message:
 	bl	set_status
-	ldr	x0, [x19, #JOB_ITEM]      ; unused if the device changed meanwhile
+Lpd_free:
+	ldr	x0, [x19, #JOB_ITEM]
 	SEND	S_release
 	ldr	x0, [x19, #JOB_QUERY]
 	bl	_free
@@ -5707,10 +4040,7 @@ Llq_time:
 	mov	x0, x19
 	SEND	S_isMuted
 	mov	w23, w0
-	LOCK
 	BADDR	x26, B_NOW
-	ldr	w9, [x26, #NOW_SEL]
-	cbnz	w9, Llq_unlock            ; a device owns the snapshot now
 	str	w20, [x26, #NOW_STATE]
 	stp	w22, w23, [x26, #NOW_VOL]
 	ldr	x9, [x28, #G_LTDUR]
@@ -5719,8 +4049,6 @@ Llq_time:
 	BADDR	x1, B_LTTRACK
 	mov	x2, #T_SIZE
 	bl	_memcpy
-Llq_unlock:
-	UNLOCK
 	str	w25, [x28, #G_HASVIDEO]
 	bl	Lui_refresh
 	b	Lret4
@@ -5821,6 +4149,15 @@ local_setvol:
 	bl	local_poll
 	b	Lret1
 
+; clamp100(n) -> n within 0..100.
+clamp100:
+	cmp	w0, #0
+	csel	w0, w0, wzr, gt
+	mov	w9, #100
+	cmp	w0, w9
+	csel	w0, w0, w9, lt
+	ret
+
 ; local_volstep(delta) — change This Mac's volume by delta, within 0..100.
 local_volstep:
 	FRAME	1
@@ -5919,36 +4256,13 @@ resume_stop:
 
 ; ---- Actions (Objective-C methods: self, _cmd, sender) ----
 
-; enqueue(work, context) — run work on the device queue when the device answers.
-enqueue:
-	ldr	w9, [x28, #G_READY]
-	cbz	w9, Leq_ret
-	mov	x2, x0
-	ldr	x0, [x28, #G_QUEUE]
-	b	_dispatch_async_f
-Leq_ret:
-	ret
-
-; route(job, context, local) — This Mac runs local(context) now; a device gets job(context) on its queue.
-route:
-	ldr	w9, [x28, #G_SEL]
-	cbnz	w9, enqueue
-	mov	x0, x1
-	br	x2
-
 ; act_toggle — the play/pause button and Space.
 	ENTRY	act_toggle
-	adr	x0, toggle_job
-	mov	x1, #0
-	adr	x2, local_toggle
-	b	route
+	b	local_toggle
 
 ; act_stop — Cmd-.
 	ENTRY	act_stop
-	adr	x0, stop_job
-	mov	x1, #0
-	adr	x2, local_stop
-	b	route
+	b	local_stop
 
 ; act_back / act_fwd — the 10-second skips and Cmd-Left / Cmd-Right.
 	ENTRY	act_back
@@ -5979,57 +4293,28 @@ skip:
 	mov	x0, x19
 	mov	x1, x20
 	bl	show_time
-	mov	x1, x19
+	mov	x0, x19
 	bl	seek_route
 	b	Lret2
 
-; seek_route(_, seconds) — hold polled positions for the seek, then send it.
+; seek_route(seconds) — hold polled positions for the seek, then send it.
 seek_route:
 	ldr	x9, [x28, #G_TICK]
 	add	x9, x9, #HOLD_TICKS
 	str	x9, [x28, #G_SEEKH]
-	adr	x0, seek_job
-	adr	x2, local_seek
-	b	route
+	b	local_seek
 
 ; act_volup / act_voldown — Cmd-Up / Cmd-Down: one volume step.
 	ENTRY	act_volup
-	mov	x1, #VOLUME_STEP
-	b	volstep
+	mov	w0, #VOLUME_STEP
+	b	local_volstep
 	ENTRY	act_voldown
-	mov	x1, #-VOLUME_STEP
-volstep:
-	adr	x0, volstep_job
-	adr	x2, local_volstep
-	b	route
+	mov	w0, #-VOLUME_STEP
+	b	local_volstep
 
 ; act_mute — the mute button and Opt-Cmd-Down.
 	ENTRY	act_mute
-	adr	x0, mute_job
-	mov	x1, #0
-	adr	x2, local_mute
-	b	route
-
-; act_device — the device picker: switch the playback target.
-	ENTRY	act_device
-	FRAME	1
-	ldr	x0, [x28, #G_DEV]
-	SEND	S_indexOfSelectedItem
-	subs	x19, x0, #1               ; after the face
-	b.lt	Lret1
-	ldr	w9, [x28, #G_SEL]
-	cmp	w9, w19
-	b.eq	Lret1                     ; the same device
-	cbnz	w9, Lad_switch
-	ldr	x0, [x28, #G_PLAYER]      ; leaving This Mac: stop playing here
-	SEND	S_pause
-Lad_switch:
-	str	w19, [x28, #G_SEL]        ; route new actions right away
-	ldr	x0, [x28, #G_QUEUE]
-	mov	x1, x19
-	adr	x2, select_job
-	bl	_dispatch_async_f
-	b	Lret1
+	b	local_mute
 
 ; dragging() — w0 = 1 while the mouse button is still down.
 dragging:
@@ -6042,21 +4327,12 @@ dragging:
 	cset	w0, eq
 	b	Lret0
 
-; play_text(text) — resolve and play a link, search, web address or file path (copied), one at a time.
+; play_text(text) — resolve and play a link, search, web address or file path (copied); the newest one wins.
 play_text:
 	FRAME	2
 	mov	x19, x0
 	ldrb	w9, [x19]
 	cbz	w9, Lret2                 ; empty
-	ldr	w9, [x28, #G_LOADING]
-	cbnz	w9, Lret2
-	ldr	w9, [x28, #G_READY]
-	cbnz	w9, Lpt_go
-	CSTR	x0, "No device available."
-	mov	w1, #1
-	bl	set_status
-	b	Lret2
-Lpt_go:
 	mov	x0, #1
 	mov	x1, #JOB_SIZE
 	bl	_calloc
@@ -6066,6 +4342,10 @@ Lpt_go:
 	bl	_strdup                   ; the caller's text dies with its pool
 	str	x0, [x20, #JOB_QUERY]
 	cbz	x0, Lpt_drop
+	ldr	w9, [x28, #G_PLAYGEN]
+	add	w9, w9, #1
+	str	w9, [x28, #G_PLAYGEN]
+	str	w9, [x20, #JOB_GEN]
 	mov	w9, #1
 	str	w9, [x28, #G_LOADING]
 	ADDR	x0, Lprog_busy
@@ -6255,8 +4535,6 @@ Ldp_text:
 	csel	x2, x9, x10, ne
 	ldr	x0, [x28, #G_AOBTN]
 	SEND	S_setContentTintColor_
-	ldr	w9, [x28, #G_SEL]
-	cbnz	w9, Lao_stage             ; speakers play sound only anyway
 	BADDR	x9, B_LTVURL
 	ldrb	w9, [x9]
 	cbz	w9, Lao_poll              ; a file or web media: its picture tracks switch in place
@@ -6264,15 +4542,10 @@ Ldp_text:
 Lao_poll:
 	bl	local_poll
 	b	Lret1
-Lao_stage:
-	bl	stage_update
-	b	Lret1
 
-; act_vol — the volume slider; a device gets at most one queued job, always with the latest value.
+; act_vol — the volume slider.
 	ENTRY	act_vol
 	FRAME	1
-	ldr	w9, [x28, #G_READY]
-	cbz	w9, Lret1
 	ldr	x0, [x28, #G_VOL]
 	SEND	S_intValue
 	mov	w19, w0
@@ -6281,29 +4554,13 @@ Lao_stage:
 	ldr	x9, [x28, #G_TICK]
 	add	x9, x9, #HOLD_TICKS
 	str	x9, [x28, #G_VOLH]
-	ldr	w9, [x28, #G_SEL]
-	cbnz	w9, Lav_device
 	mov	w0, w19
 	bl	local_setvol
 	b	Lret1
-Lav_device:
-	add	x9, x28, #G_PVOL
-	stlr	w19, [x9]
-	add	x9, x28, #G_VOLB
-	mov	w10, #1
-	swpal	w10, w10, [x9]            ; claim the single queue slot
-	cbnz	w10, Lret1                ; already queued: it reads the new value
-	ldr	x0, [x28, #G_QUEUE]
-	mov	x1, #0
-	adr	x2, vol_job
-	bl	_dispatch_async_f
-	b	Lret1
 
-; act_seek — the position slider: This Mac follows the drag frame by frame; a device seeks when it is released.
+; act_seek — the position slider: This Mac follows the drag frame by frame.
 	ENTRY	act_seek
 	FRAME	1
-	ldr	w9, [x28, #G_READY]
-	cbz	w9, Lret1
 	ldr	x0, [x28, #G_POS]
 	SEND	S_doubleValue
 	fcvtzs	x19, d0
@@ -6315,36 +4572,22 @@ Lav_device:
 	bl	dragging
 	str	w0, [x28, #G_SEEKDRAG]
 	cbz	w0, Lsk_release
-	ldr	w9, [x28, #G_SEL]
-	cbnz	w9, Lret1
 	mov	x0, x19
 	bl	local_seek
 	b	Lret1
 Lsk_release:
-	mov	x1, x19
+	mov	x0, x19
 	bl	seek_route
 	b	Lret1
 
-; act_tick — the 1 Hz timer: the controls' idle fade; This Mac renders itself; a device is polled, one poll in flight at most.
+; act_tick — the 1 Hz timer: the controls' idle fade; This Mac renders itself.
 	ENTRY	act_tick
 	FRAME	0
 	ldr	x10, [x28, #G_TICK]
 	add	x10, x10, #1
 	str	x10, [x28, #G_TICK]
 	bl	idle_tick
-	ldr	w9, [x28, #G_SEL]
-	cbnz	w9, Lat_device
 	bl	local_poll
-	b	Lret0
-Lat_device:
-	add	x9, x28, #G_POLLB
-	mov	w10, #1
-	swpal	w10, w10, [x9]
-	cbnz	w10, Lret0                ; the previous poll is still running
-	ldr	x0, [x28, #G_QUEUE]
-	mov	x1, #0
-	adr	x2, poll_job
-	bl	_dispatch_async_f
 	b	Lret0
 
 ; idle_tick() — a picture playing on This Mac: after a few still seconds the controls and the pointer fade away.
@@ -6357,8 +4600,6 @@ idle_tick:
 	b.lo	Lret0
 	ldr	w9, [x28, #G_BARHID]
 	ldr	w10, [x28, #G_HOVER]
-	orr	w9, w9, w10
-	ldr	w10, [x28, #G_SEL]
 	orr	w9, w9, w10
 	ldr	w10, [x28, #G_AONLY]
 	orr	w9, w9, w10
@@ -6614,38 +4855,6 @@ Lpi_toggle:
 	ENTRY	act_layout
 	b	layout_stage
 
-; act_rescan — Cmd-R: search for devices again (e.g. after changing networks); also the first search.
-	ENTRY	act_rescan
-	mov	w0, #0
-	b	search
-
-; act_scan(menu) — the picker opens: look for devices that came up since, keeping the listed ones in place.
-	ENTRY	act_scan
-	FRAME	1
-	mov	x19, x2
-	ldr	x0, [x28, #G_DEV]
-	SEND	S_menu
-	cmp	x0, x19
-	b.ne	Lret1                     ; another menu of the controller's
-	mov	w0, #1
-	bl	search
-	b	Lret1
-
-; search(mode) — start a search unless one of its kind is running.
-search:
-	mov	w9, #1
-	lsl	w9, w9, w0
-	add	x11, x28, #G_DISC
-	ldsetal	w9, w10, [x11]
-	tst	w10, w9
-	b.ne	Lse_ret                   ; already running
-	mov	x1, x0
-	WORKQ
-	adr	x2, scan_job
-	b	_dispatch_async_f
-Lse_ret:
-	ret
-
 ; imp_yes -> YES: the last window closing quits; the canvas takes the keyboard; a drag is a copy.
 imp_yes:
 	mov	w0, #1
@@ -6655,7 +4864,7 @@ imp_yes:
 
 ; ---- Entry point ----
 
-; main() — the registry, then services, the app with its menus and window, discovery and the poll timer; then the run loop.
+; main() — the registry, then services, the app with its menus and window and the poll timer; then the run loop.
 	.globl	_main
 _main:
 	FRAME	0
@@ -6683,10 +4892,6 @@ Lmn_skip:
 	cbnz	w9, Lmn_skip
 	b	Lmn_reg
 Lmn_regged:
-	mov	w9, #1
-	str	w9, [x28, #G_DEVN]        ; the device list starts with This Mac
-	BADDR	x10, B_NOW
-	str	w9, [x10, #NOW_DEVREV]    ; the first render fills the picker
 	fmov	d0, #1.0
 	str	d0, [x28, #G_ARTASP]      ; a square card until artwork arrives
 	fmov	s0, #1.0
@@ -6707,12 +4912,11 @@ Lmn_build:
 	bl	ui_run
 	bl	layout_stage
 	bl	server_start
-	cbnz	w0, Lmn_discover
+	cbnz	w0, Lmn_run
 	CSTR	x0, "Could not start the media server."
 	mov	w1, #1
 	bl	set_status
-Lmn_discover:
-	bl	Lact_rescan
+Lmn_run:
 	ADDR	x0, Lprog_run
 	bl	ui_run
 	mov	w0, #0
@@ -6872,36 +5076,6 @@ Lmn_discover:
 	MASKV	\mask
 	ADDIN	\parent
 .endm
-.macro PILL parent, title, action, x, y
-	CLS	NSButton
-	MSG	S_buttonWithTitle_target_action_, "=SOL"
-	.asciz	"\title"
-	.byte	G_CTRL >> 3
-	.asciz	"\action"
-	MSG	S_setBordered_, "I"
-	.byte	0
-	MSG	S_setFrame_, "N"
-	RN	\x, \y, PILL_W, PILL_H
-	MSG	S_setContentTintColor_, "O"
-	.byte	G_TEXT >> 3
-	LAYERBG	G_SURF2, PILL_H / 2
-	ADDIN	\parent
-.endm
-.macro PALETTE slot, sym, color       ; a symbol drawn in one color, kept
-	CLS	NSArray
-	MSG	S_arrayWithObject_, "=O"
-	.byte	\color >> 3
-	STO	G_T1
-	CLS	NSImageSymbolConfiguration
-	MSG	S_configurationWithPaletteColors_, "=O"
-	.byte	G_T1 >> 3
-	STO	G_T1
-	IMG	G_T2, "\sym", "Play on"
-	MSG	S_imageWithSymbolConfiguration_, "=O"
-	.byte	G_T1 >> 3
-	MSG	S_retain, "="
-	STO	\slot
-.endm
 .macro SUBMENU title
 	CLS	NSMenu
 	MSG	S_alloc, "="
@@ -6959,7 +5133,7 @@ Lmn_discover:
 	.equ X_REGULAR,	(F_NSFontWeightRegular - B_REG) >> 3
 	.equ X_MEDIUM,	(F_NSFontWeightMedium - B_REG) >> 3
 	.equ X_SEMIBOLD,	(F_NSFontWeightSemibold - B_REG) >> 3
-	.equ G_SEP,	G_DEV                 ; a separator item, before the picker takes the slot
+	.equ G_SEP,	G_T3                  ; a separator item
 .macro METHOD name, imp, types="v@:@"    ; - (void)action:(id)sender, unless types say otherwise
 	CALL	F_class_addMethod, "OLQC"
 	.byte	G_T0 >> 3
@@ -6972,28 +5146,13 @@ Lmn_discover:
 ; Services, the colors, the controller (every action's target, the app and window delegate), the canvas, the menus (Edit enables Cmd-V), the window and its views.
 Lprog_build:
 	CALL	F_objc_autoreleasePoolPush
-	CALL	F_signal, "II"            ; a vanished speaker must not kill the app
+	CALL	F_signal, "II"            ; a vanished client must not kill the app
 	.byte	SIGPIPE, SIG_IGN
 	CALL	F_curl_global_init, "I"   ; before any other thread exists
 	.byte	CURL_GLOBAL_ALL
-	CALL	F_dispatch_queue_attr_make_with_qos_class, "=III"
-	.byte	0, QOS_CLASS_USER_INITIATED, 0
-	CALL	F_dispatch_queue_create, "=CV"  ; the serial device queue
-	.asciz	"beam.device"
-	STO	G_QUEUE
 	CALL	F_dispatch_get_global_queue, "=II"
 	.byte	QOS_CLASS_USER_INITIATED, 0
 	STO	G_WORKQ
-	CALL	F_curl_easy_init, "="     ; its keep-alive handle
-	STO	G_CURL
-	CALL	F_strlcpy, "BCI"
-	.short	B_DEVS
-	.asciz	"This Mac"
-	.byte	128
-	CALL	F_strlcpy, "BCI"
-	.short	B_NOW + NOW_NAME
-	.asciz	"This Mac"
-	.byte	128
 
 	; Flat colors: near-black, two surfaces, one yellow accent.
 	COLOR	G_BGC, 21, 21, 21, 255
@@ -7024,9 +5183,6 @@ Lprog_build:
 	METHOD	"act_focus:", act_focus
 	METHOD	"act_open:", act_open
 	METHOD	"act_aonly:", act_aonly
-	METHOD	"act_rescan:", act_rescan
-	METHOD	"act_device:", act_device
-	METHOD	"menuWillOpen:", act_scan
 	METHOD	"menuNeedsUpdate:", act_options
 	METHOD	"act_speed:", act_speed
 	METHOD	"act_option:", act_option
@@ -7127,8 +5283,6 @@ Lprog_build:
 	SPEED	"1.25\303\227", 125
 	SPEED	"1.5\303\227", 150
 	SPEED	"2\303\227", 200
-	SEP
-	ITEM	"Find Devices", "act_rescan:", "r"
 	SUBMENU	"View"
 	ITEM	"Enter Full Screen", "toggleFullScreen:", "f"
 	MASK	0x140000
@@ -7251,32 +5405,6 @@ Lprog_build:
 	.byte	1
 	ADDV
 
-	; Nothing playing: an invitation to drop or open something.
-	NEWV	NSView, 0, 0, EMPTY_W, EMPTY_H
-	STO	G_EMPTY
-	CLS	NSImageSymbolConfiguration
-	MSG	S_configurationWithPointSize_weight_, "=DF"
-	.short	44 * 4
-	.byte	X_REGULAR
-	STO	G_T0
-	IMG	G_T2, "play.circle", ""
-	CLS	NSImageView
-	MSG	S_imageViewWithImage_, "=O"
-	.byte	G_T2 >> 3
-	MSG	S_setSymbolConfiguration_, "O"
-	.byte	G_T0 >> 3
-	MSG	S_setContentTintColor_, "O"
-	.byte	G_YEL >> 3
-	MSG	S_setFrame_, "N"
-	RN	(EMPTY_W - 64) / 2, EMPTY_H - 64, 64, 64
-	ADDIN	G_EMPTY
-	FONT	S_systemFontOfSize_weight_, 20, X_SEMIBOLD
-	LABELIN	G_T2, G_EMPTY, "Drop a file or a link", 0, 88, EMPTY_W, 26, 1, G_TEXT, 0
-	FONT	S_systemFontOfSize_weight_, 13, X_REGULAR
-	LABELIN	G_T2, G_EMPTY, "Audio and video, from this Mac or the web.", 0, 64, EMPTY_W, 18, 1, G_SECOND, 0
-	PILL	G_EMPTY, "Open File\342\200\246", "act_open:", EMPTY_W / 2 - PILL_W - 6, 8
-	PILL	G_EMPTY, "Open from URL\342\200\246", "act_focus:", EMPTY_W / 2 + 6, 8
-
 	; A spinner while a link resolves.
 	NEWV	NSProgressIndicator, 0, 0, SPIN_S, SPIN_S
 	STO	G_SPIN
@@ -7309,11 +5437,11 @@ Lprog_build:
 	MASKV	AR_WIDTH | AR_TOP
 	LAYERBG	G_SURF, 16
 	FONT	S_monospacedDigitSystemFontOfSize_weight_, 11, X_MEDIUM
-	LABELIN	G_CUR, G_BAR, "0:00", 16, ROW1_Y + 2, TIME_W, LABEL_H, 0, G_SECOND, AR_RIGHT
-	LABELIN	G_DUR, G_BAR, "--:--", BAR_W - 16 - TIME_W, ROW1_Y + 2, TIME_W, LABEL_H, 2, G_SECOND, AR_LEFT
+	LABELIN	G_CUR, G_BAR, "", 16, ROW1_Y + 2, TIME_W, LABEL_H, 0, G_SECOND, AR_RIGHT
+	LABELIN	G_DUR, G_BAR, "", BAR_W - 16 - TIME_W, ROW1_Y + 2, TIME_W, LABEL_H, 2, G_SECOND, AR_LEFT
 	SLIDERIN	G_POS, G_BAR, "act_seek:", 24 + TIME_W, ROW1_Y, BAR_W - 2 * (24 + TIME_W), 1, AR_WIDTH
 	FONT	S_systemFontOfSize_weight_, 13, X_SEMIBOLD
-	LABELIN	G_TITLE, G_BAR, "Nothing playing", 16, ROW2_C - 9, TEXT_W, 18, 0, G_SECOND, AR_WIDTH | AR_RIGHT
+	LABELIN	G_TITLE, G_BAR, "", 16, ROW2_C - 9, TEXT_W, 18, 0, G_TEXT, AR_WIDTH | AR_RIGHT
 	FONT	S_systemFontOfSize_weight_, 12, X_REGULAR
 	LABELIN	G_ARTIST, G_BAR, "", 16, ROW2_C - 17, TEXT_W, 16, 0, G_SECOND, AR_WIDTH | AR_RIGHT
 	BTN	G_BACK, G_BAR, "gobackward.10", "Back 10 seconds", "act_back:", "Back 10 seconds (\342\214\230\342\206\220)", BACK_X, ROW2_C - BTN_S / 2, BTN_S, 16, AR_LEFT | AR_RIGHT, G_TEXT
@@ -7342,43 +5470,9 @@ Lprog_build:
 	MASKV	AR_LEFT
 	ADDIN	G_BAR
 
-	; Where it plays: This Mac or a network speaker or TV, a pull-down whose face is lit while a device plays.
-	PALETTE	G_IMGDEV, "hifispeaker.2.fill", G_TEXT
-	PALETTE	G_IMGDEVON, "hifispeaker.2.fill", G_YEL
-	CLS	NSPopUpButton
-	MSG	S_alloc, "="
-	MSG	S_initWithFrame_pullsDown_, "=NI"
-	RN	DEV_X, ROW2_C - 14, DEV_W, 28
-	.byte	1
-	STO	G_DEV
-	MSG	S_setBordered_, "I"
-	.byte	0
-	MSG	S_setTarget_, "O"
-	.byte	G_CTRL >> 3
-	MSG	S_setAction_, "L"
-	.asciz	"act_device:"
-	MSG	S_setToolTip_, "S"
-	.asciz	"Play on a network speaker or TV"
-	MASKV	AR_LEFT
-	ADDIN	G_BAR
-	MSG	S_cell, "="
-	MSG	S_setArrowPosition_, "I"
-	.byte	0                         ; no arrow: the icon says it all
-	LD	G_DEV
-	MSG	S_menu, "="               ; its opening starts a search
-	MSG	S_setDelegate_, "O"
-	.byte	G_CTRL >> 3
-	MSG	S_addItemWithTitle_action_keyEquivalent_, "=SIS"
-	.asciz	""
-	.byte	0
-	.asciz	""
-	MSG	S_setImage_, "O"          ; the face
-	.byte	G_IMGDEV >> 3
-
-	; Open from URL: a field floating under the title bar.
-	NEWV	NSView, (WIN_W - URL_W) / 2, 56, URL_W, URL_H
+	; Open from URL: a field floating in the middle of the stage (placed by layout_stage).
+	NEWV	NSView, 0, 0, URL_W, URL_H
 	STO	G_URLBOX
-	MASKV	AR_LEFT | AR_RIGHT | AR_BOTTOM
 	LAYERBG	G_SURF2, 12
 	MSG	S_setHidden_, "I"
 	.byte	1
@@ -7408,7 +5502,7 @@ Lprog_build:
 	MSG	S_setTextColor_, "O"
 	.byte	G_TEXT >> 3
 	MSG	S_setPlaceholderString_, "S"
-	.asciz	"Paste a link or search YouTube"
+	.asciz	"Link or search"
 	MSG	S_setTarget_, "O"
 	.byte	G_CTRL >> 3
 	MSG	S_setAction_, "L"

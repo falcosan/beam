@@ -54,8 +54,6 @@ cat > "$app/Contents/Info.plist" <<'EOF'
 	<string>1</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>Beam finds and plays on the speakers and TVs on your network.</string>
 </dict>
 </plist>
 EOF
