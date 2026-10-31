@@ -155,6 +155,10 @@ Lc\@:	.asciz	"\text"
 .equ SIG_IGN,                    1
 .equ QOS_CLASS_USER_INITIATED,   0x19
 .equ DISPATCH_TIME_FOREVER,      -1
+.equ IFA_NAME,                   8
+.equ IFA_FLAGS,                  16
+.equ IFA_ADDR,                   24
+.equ IFA_NETMASK,                32
 
 ; Network timeouts and limits.
 .equ ART_TIMEOUT_MS,             10000
@@ -179,24 +183,7 @@ Lc\@:	.asciz	"\text"
 .equ SKIP_SECONDS,               10
 .equ VOLUME_STEP,                5
 
-; Transport states.
-.equ ST_STOPPED,                 1
-.equ ST_PLAYING,                 2
-.equ ST_PAUSED,                  3
-.equ ST_TRANSITIONING,           4
-
-; now: This Mac's "now playing" snapshot.
-.equ NOW_STATE,                  0
-.equ NOW_VOL,                    8
-.equ NOW_MUTE,                   12
-.equ NOW_POS,                    16
-.equ NOW_DUR,                    24       ; 0 = unknown or live
-.equ NOW_TITLE,                  32       ; char[512]
-.equ NOW_ARTIST,                 544      ; char[256]
-.equ NOW_ART,                    800      ; char[2048]
-.equ NOW_SIZE,                   2848
-
-; Track: title, artist and artwork URL, laid out as in the snapshot from NOW_TITLE.
+; Track: title, artist and artwork URL.
 .equ T_TITLE,                    0        ; char[512]
 .equ T_ARTIST,                   512      ; char[256]
 .equ T_ART,                      768      ; char[2048]
@@ -217,7 +204,7 @@ Lc\@:	.asciz	"\text"
 .equ JOB_DUR,                    16       ; seconds, 0 when live or unknown
 .equ JOB_ERR,                    24       ; char*, why it failed, or NULL
 .equ JOB_KIND,                   32       ; int, KIND_*
-.equ JOB_GEN,                    36
+.equ JOB_GEN,                    36       ; int, G_PLAYGEN when asked
 .equ JOB_ITEM,                   40       ; AVPlayerItem for This Mac, retained, or nil
 .equ JOB_TRACK,                  48       ; Track
 .equ JOB_AFMT,                   JOB_TRACK + T_SIZE ; Fmt of the sound stream
@@ -235,9 +222,6 @@ Lc\@:	.asciz	"\text"
 .equ KIND_FILE,                  2        ; a file on this Mac (JOB_QUERY is its path)
 .equ PLAY_OK,                    0
 .equ PLAY_FAILED,                1
-
-.equ AVPLAYER_WAITING,           1
-.equ AVPLAYER_PLAYING,           2
 
 ; Stream proxy state for the libcurl write callback.
 .equ PX_FD,                      0
@@ -311,11 +295,12 @@ Lc\@:	.asciz	"\text"
 .equ G_APP,                      0
 .equ G_CTRL,                     8
 .equ G_PLAYER,                   32       ; AVPlayer
+.equ G_LAN,                      40       ; mask << 32 | address, network order, one atomic word
 .equ G_LOCK,                     48       ; os_unfair_lock
 .equ G_PORT,                     52       ; proxy port
-.equ G_POOLN,                    60
+.equ G_POOLN,                    60       ; idle handles in B_POOL (lock)
 .equ G_SLOTI,                    80       ; next stream slot (lock)
-.equ G_PLAYGEN,                  84
+.equ G_PLAYGEN,                  84       ; the newest play (written on main)
 .equ G_LTDUR,                    96       ; This Mac's duration (main)
 .equ G_TICK,                     104      ; timer ticks since launch
 .equ G_SEEKH,                    112      ; tick until which polled positions are ignored
@@ -396,8 +381,7 @@ Lf_100:	.float	100.0                     ; volume percent, 8-aligned after G
 	.float	0.0
 
 ; B: the large buffers, at fixed offsets from x27.
-.equ B_NOW,                      0        ; snapshot (main)
-.equ B_SLOTTOK,                  B_NOW + NOW_SIZE ; stream tokens (lock)
+.equ B_SLOTTOK,                  0        ; stream tokens (lock)
 .equ B_UIMSG,                    B_SLOTTOK + SLOTS * TOKEN_STRIDE ; char[256], status message (main)
 .equ B_UIARTIST,                 B_UIMSG + 256 ; char[256], last rendered artist (main)
 .equ B_UIART,                    B_UIARTIST + 256 ; char[2048], artwork shown or loading (main)
@@ -440,6 +424,8 @@ Lf_100:	.float	100.0                     ; volume percent, 8-aligned after G
 	FN	dispatch_semaphore_signal
 	FN	dispatch_semaphore_wait
 	FN	free
+	FN	freeifaddrs
+	FN	getifaddrs
 	FN	getsockname
 	FN	listen
 	FN	malloc
@@ -466,6 +452,7 @@ Lf_100:	.float	100.0                     ; volume percent, 8-aligned after G
 	FN	strlcpy
 	FN	strlen
 	FN	strncmp
+	FN	strrchr
 	FN	strstr
 	FN	strtol
 	FN	usleep
@@ -564,6 +551,7 @@ Lf_100:	.float	100.0                     ; volume percent, 8-aligned after G
 	REG	S_intValue, "intValue"
 	REG	S_isEnabled, "isEnabled"
 	REG	S_isEqualToString_, "isEqualToString:"
+	REG	S_isExternalPlaybackActive, "isExternalPlaybackActive"
 	REG	S_isFileURL, "isFileURL"
 	REG	S_isMuted, "isMuted"
 	REG	S_labelWithString_, "labelWithString:"
@@ -720,7 +708,7 @@ _\name:
 	.purgem	REGSEL
 	.purgem	FN
 .equ B_LTVURL,                   B_REG + 8 * Lnreg ; char[4096], This Mac's picture: our HLS or a broadcast's own, or "" (main)
-.equ B_VISITOR,                  B_LTVURL + 4096 ; char[288], the visitorData member once YouTube gave it (worker)
+.equ B_VISITOR,                  B_LTVURL + 4096 ; char[288], the visitorData member once YouTube gave it (lock)
 .equ B_POOL,                     B_VISITOR + 288
 .equ B_SIZE,                     B_POOL + 8 * HANDLES
 	.lcomm	B, B_SIZE, 4
@@ -830,6 +818,7 @@ Lcn_init:
 	mov	x0, x19
 	b	Lret1
 
+; curl_done(handle) — back to the pool for the next request, or cleaned up when the pool is full.
 curl_done:
 	FRAME	1
 	mov	x19, x0
@@ -1174,16 +1163,22 @@ hls_master:
 	add	x3, sp, #HX_V
 	bl	hls_media
 	cbz	w0, Lhx_done
-	ADDO	x9, x20, JOB_HLSA
+	ADDO	x0, x20, JOB_HLSA         ; both playlists by name, relative to the master
+	mov	w1, #'/'
+	bl	_strrchr
+	add	x21, x0, #1
+	add	x0, sp, #HX_V
+	mov	w1, #'/'
+	bl	_strrchr
+	add	x22, x0, #1
 	ldr	x10, [x20, #(JOB_VFMT + FMT_RATE)]
 	ldr	x11, [x20, #(JOB_AFMT + FMT_RATE)]
 	add	x10, x10, x11
-	stp	x9, x10, [sp]
+	stp	x21, x10, [sp]
 	add	x9, x20, #(JOB_VFMT + FMT_CODECS)
 	add	x10, x20, #(JOB_AFMT + FMT_CODECS)
 	stp	x9, x10, [sp, #16]
-	add	x9, sp, #HX_V
-	str	x9, [sp, #32]
+	str	x22, [sp, #32]
 	add	x0, sp, #HX_TEXT
 	CSTR	x1, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"Sound\",DEFAULT=YES,AUTOSELECT=YES,URI=\"%s\"\n#EXT-X-STREAM-INF:BANDWIDTH=%llu,CODECS=\"%s,%s\",AUDIO=\"a\"\n%s\n"
 	bl	_asprintf
@@ -1275,6 +1270,10 @@ Lhl_refs:
 	cmp	x9, x25
 	b.hi	Lhl_free                  ; cut short
 	mov	x25, x24                  ; the references
+	mov	x0, x21                   ; its segments by name, relative to wherever the playlist was fetched
+	mov	w1, #'/'
+	bl	_strrchr
+	add	x21, x0, #1
 	mov	x0, x21                   ; room: 80 bytes and the URL per segment
 	bl	_strlen
 	add	x9, x0, #80
@@ -2193,7 +2192,7 @@ Lhc_close:
 	mov	x0, #0
 	b	Lret4
 
-; server_run(fd) — accept connections, one detached thread each.
+; server_run(fd) — accept this Mac and its LAN, one detached thread per connection.
 	ENTRY	server_run
 	FRAME	2, 48
 	mov	w19, w0
@@ -2202,9 +2201,11 @@ Lsr_slot:
 	mov	x1, #DISPATCH_TIME_FOREVER
 	bl	_dispatch_semaphore_wait
 Lsr_accept:
+	mov	w9, #16
+	str	w9, [sp, #32]
 	mov	w0, w19
-	mov	x1, #0
-	mov	x2, #0
+	add	x1, sp, #16
+	add	x2, sp, #32
 	bl	_accept
 	tbz	w0, #31, Lsr_peer
 	mov	w0, #ACCEPT_BACKOFF_US    ; e.g. out of descriptors: do not spin
@@ -2212,6 +2213,19 @@ Lsr_accept:
 	b	Lsr_accept
 Lsr_peer:
 	mov	w20, w0
+	ldr	w9, [sp, #20]             ; the peer, network order like G_LAN
+	ldr	x10, [x28, #G_LAN]        ; one atomic load: address and mask agree
+	lsr	x11, x10, #32
+	eor	w12, w9, w10
+	tst	w12, w11
+	ccmp	w11, #0, #4, eq
+	b.ne	Lsr_ok                    ; same subnet
+	and	w12, w9, #0xff            ; the first octet
+	cmp	w12, #127
+	b.eq	Lsr_ok                    ; loopback
+	bl	_close
+	b	Lsr_accept
+Lsr_ok:
 	mov	x9, #CLIENT_TIMEOUT_S
 	stp	x9, xzr, [sp]             ; struct timeval
 	mov	w0, w20
@@ -2247,13 +2261,11 @@ server_start:
 	mov	w19, w0
 	tbnz	w0, #31, Lss_fail
 	mov	w9, #SOCKADDR_IN_HEAD
-	mov	w10, #0x007f
-	movk	w10, #0x0100, lsl #16
-	stp	w9, w10, [sp, #16]
+	stp	w9, wzr, [sp, #16]
 	str	xzr, [sp, #24]
 	add	x1, sp, #16
 	mov	w2, #16
-	bl	_bind                     ; 127.0.0.1 only, on a port the system picks
+	bl	_bind                     ; every address (an AirPlay receiver fetches from the LAN one), on a port the system picks
 	cbnz	w0, Lss_close
 	mov	w0, w19
 	mov	w1, #64
@@ -2744,7 +2756,6 @@ Lpp_one:
 	CSTR	x0, "\"video/mp4"
 	bl	within
 	cbnz	x0, Lpp_fmt
-Lpp_sound:
 	cmp	x24, #140                 ; score: the original track 8, itag 140 4, audio only 2, no loudness compression 1
 	cset	w24, eq
 	lsl	w24, w24, #2
@@ -2967,10 +2978,12 @@ Lrs_tube:
 	mov	x2, #API_CONNECT_MS
 	mov	w1, #CURLOPT_CONNECTTIMEOUT_MS
 	bl	copt
+	LOCK
 	add	x0, sp, #RS_VIS           ; a visitorData first, as the WEB client, once per launch
 	BADDR	x1, B_VISITOR
 	mov	x2, #288
 	bl	_strlcpy
+	UNLOCK
 	ldrb	w9, [sp, #RS_VIS]
 	cbnz	w9, Lrs_id
 	ADDR	x0, Lep_guide
@@ -2992,10 +3005,12 @@ Lrs_tube:
 	mov	x1, #288
 	CSTR	x2, ",\"visitorData\":\"%.*s\""
 	bl	_snprintf
+	LOCK
 	BADDR	x0, B_VISITOR
 	add	x1, sp, #RS_VIS
 	mov	x2, #288
 	bl	_strlcpy
+	UNLOCK
 Lrs_vfree:
 	ldr	x0, [sp, #RS_BUF]
 	bl	_free
@@ -3734,31 +3749,30 @@ set_status:
 	bl	render_status
 	b	Lret1
 
-; ui_refresh — render This Mac's snapshot.
-	ENTRY	ui_refresh
+; ui_refresh(playing, position, volume, muted) — render This Mac's state and track.
+ui_refresh:
 	FRAME	4
-	BADDR	x19, B_NOW
-	ldr	w21, [x19, #NOW_STATE]
-	add	x0, x19, #NOW_TITLE
-	add	x1, x19, #NOW_ARTIST
+	mov	w21, w0
+	mov	x24, x1
+	mov	w20, w2
+	mov	w19, w3
+	BADDR	x0, B_LTTRACK
+	add	x1, x0, #T_ARTIST
 	bl	show_track
-	add	x0, x19, #NOW_ART
+	BADDR	x0, (B_LTTRACK + T_ART)
 	bl	show_art
-	cmp	w21, #ST_PLAYING
-	ccmp	w21, #ST_TRANSITIONING, #4, ne
-	cset	w23, eq                   ; playing, or about to
 	ldr	w10, [x28, #G_PPSHOWN]
-	cmp	w10, w23
+	cmp	w10, w21
 	b.eq	Lur_enable
-	str	w23, [x28, #G_PPSHOWN]
+	str	w21, [x28, #G_PPSHOWN]
 	ldr	x10, [x28, #G_IMGPAUSE]
 	ldr	x11, [x28, #G_IMGPLAY]
-	cmp	w23, #0
+	cmp	w21, #0
 	csel	x2, x10, x11, ne
 	ldr	x0, [x28, #G_PP]
 	SEND	S_setImage_
 Lur_enable:
-	ldp	x24, x25, [x19, #NOW_POS]
+	ldr	x25, [x28, #G_LTDUR]
 	cmp	x25, #0
 	cset	w26, gt                   ; seekable: with a known duration
 	mov	x23, #G_BACK
@@ -3785,19 +3799,17 @@ Lur_volume:
 	ldr	x10, [x28, #G_VOLH]
 	cmp	x9, x10
 	b.lo	Lur_mute                  ; a volume change is still settling
-	ldr	w9, [x19, #NOW_VOL]
-	scvtf	d0, w9
+	scvtf	d0, w20
 	ldr	x0, [x28, #G_VOL]
 	SEND	S_setDoubleValue_
 Lur_mute:
-	ldr	w9, [x19, #NOW_MUTE]
 	ldr	w10, [x28, #G_MUTESHOWN]
-	cmp	w9, w10
+	cmp	w19, w10
 	b.eq	Lur_status
-	str	w9, [x28, #G_MUTESHOWN]
+	str	w19, [x28, #G_MUTESHOWN]
 	ldr	x10, [x28, #G_IMGMUTED]
 	ldr	x11, [x28, #G_IMGUNMUTED]
-	cmp	w9, #0
+	cmp	w19, #0
 	csel	x2, x10, x11, ne
 	ldr	x0, [x28, #G_MUTE]
 	SEND	S_setImage_
@@ -3911,7 +3923,6 @@ Lpd_failed:
 	add	x0, sp, #16
 Lpd_error:
 	mov	w1, #1
-Lpd_message:
 	bl	set_status
 Lpd_free:
 	ldr	x0, [x19, #JOB_ITEM]
@@ -3920,7 +3931,7 @@ Lpd_free:
 	bl	_free
 	mov	x0, x19
 	bl	_free
-	bl	Lui_refresh
+	bl	local_poll
 	b	Lret2
 
 ; ---- This Mac: AVPlayer; macOS routes the sound to the chosen output (speakers, Bluetooth, AirPlay) ----
@@ -3978,9 +3989,16 @@ local_poll:
 	FRAME	4, 48                     ; a CMTime at sp + 16
 	ldr	x19, [x28, #G_PLAYER]
 	mov	x0, x19
+	SEND	S_isExternalPlaybackActive
+	cbz	w0, Llq_poll
+	bl	to_lan
+	cbz	w0, Llq_poll
+	bl	local_swap
+Llq_poll:
+	mov	x0, x19
 	SEND	S_currentItem
 	mov	x24, x0
-	mov	w20, #ST_STOPPED
+	mov	w20, #0                   ; playing, or about to
 	mov	w25, #0                   ; a picture
 	cbz	x0, Llq_time              ; nothing loaded
 	SEND	S_status
@@ -4018,13 +4036,8 @@ Llq_size:
 	bl	video_tracks
 	mov	x0, x19
 	SEND	S_timeControlStatus
-	mov	w20, #ST_PAUSED
-	mov	w9, #ST_TRANSITIONING
-	cmp	x0, #AVPLAYER_WAITING
-	csel	w20, w9, w20, eq
-	mov	w9, #ST_PLAYING
-	cmp	x0, #AVPLAYER_PLAYING
-	csel	w20, w9, w20, eq
+	cmp	x0, #0
+	cset	w20, ne
 Llq_time:
 	mov	x0, x19
 	add	x8, sp, #16               ; a CMTime comes back through x8
@@ -4039,18 +4052,12 @@ Llq_time:
 	fcvtns	w22, s0
 	mov	x0, x19
 	SEND	S_isMuted
-	mov	w23, w0
-	BADDR	x26, B_NOW
-	str	w20, [x26, #NOW_STATE]
-	stp	w22, w23, [x26, #NOW_VOL]
-	ldr	x9, [x28, #G_LTDUR]
-	stp	x21, x9, [x26, #NOW_POS]
-	add	x0, x26, #NOW_TITLE
-	BADDR	x1, B_LTTRACK
-	mov	x2, #T_SIZE
-	bl	_memcpy
+	mov	w3, w0
 	str	w25, [x28, #G_HASVIDEO]
-	bl	Lui_refresh
+	mov	w0, w20
+	mov	x1, x21
+	mov	w2, w22
+	bl	ui_refresh
 	b	Lret4
 
 ; video_tracks(item) — Audio Only turns the item's picture tracks off (nothing is decoded), and back on.
@@ -4222,6 +4229,106 @@ Lsw_make:
 	bl	resume_stop
 	ADDR	x0, Lprog_resume
 	bl	ui_run
+	b	Lret1
+
+; discover_lan() -> x0 = our private IPv4 network, mask << 32 | address (en0's, else the first one; 0 without one), also into G_LAN.
+discover_lan:
+	FRAME	3, 16
+	mov	x0, sp
+	bl	_getifaddrs
+	mov	x21, #0                   ; the chosen interface
+	mov	x22, #0
+	cbnz	w0, Ldl_ret
+	ldr	x19, [sp]
+Ldl_loop:
+	cbz	x19, Ldl_take
+	ldr	x9, [x19, #IFA_ADDR]
+	cbz	x9, Ldl_next
+	ldrb	w10, [x9, #1]
+	cmp	w10, #AF_INET
+	b.ne	Ldl_next
+	ldr	x10, [x19, #IFA_NETMASK]
+	cbz	x10, Ldl_next
+	ldr	w10, [x19, #IFA_FLAGS]
+	tbz	w10, #0, Ldl_next         ; IFF_UP
+	tbnz	w10, #3, Ldl_next         ; IFF_LOOPBACK
+	ldr	w10, [x9, #4]
+	rev	w20, w10                  ; address in host order
+	lsr	w10, w20, #24
+	cmp	w10, #10                  ; 10.0.0.0/8
+	b.eq	Ldl_private
+	lsr	w10, w20, #20
+	cmp	w10, #0xac1               ; 172.16.0.0/12
+	b.eq	Ldl_private
+	lsr	w10, w20, #16
+	mov	w11, #0xc0a8              ; 192.168.0.0/16
+	cmp	w10, w11
+	b.ne	Ldl_next
+Ldl_private:
+	cbnz	x21, Ldl_en0
+	mov	x21, x19                  ; the first one, unless en0 comes later
+Ldl_en0:
+	ldr	x0, [x19, #IFA_NAME]
+	CSTR	x1, "en0"
+	bl	_strcmp
+	cbnz	w0, Ldl_next
+	mov	x21, x19
+	b	Ldl_take
+Ldl_next:
+	ldr	x19, [x19]
+	b	Ldl_loop
+Ldl_take:
+	cbz	x21, Ldl_free
+	ldr	x9, [x21, #IFA_ADDR]
+	ldr	w20, [x9, #4]
+	ldr	x10, [x21, #IFA_NETMASK]
+	ldr	w10, [x10, #4]
+	orr	x22, x20, x10, lsl #32
+Ldl_free:
+	ldr	x0, [sp]
+	bl	_freeifaddrs
+Ldl_ret:
+	str	x22, [x28, #G_LAN]        ; one store: readers see a matching pair
+	mov	x0, x22
+	b	Lret3
+
+; to_lan() -> w0 = 1 when This Mac's picture moved from loopback to our LAN address, as AirPlay video hands its address to the receiver.
+to_lan:
+	FRAME	1, 320                    ; the new address at sp + 64
+	ldr	w9, [x28, #G_AONLY]
+	cbnz	w9, Ltl_no
+	BADDR	x19, B_LTVURL
+	mov	x0, x19
+	CSTR	x1, "http://127.0.0.1:"
+	mov	x2, #17
+	bl	_strncmp
+	cbnz	w0, Ltl_no                ; not ours, or moved already
+	bl	discover_lan
+	cbz	x0, Ltl_no
+	mov	x20, x0
+	add	x0, x19, #7
+	mov	w1, #'/'
+	bl	_strchr                   ; the path
+	ldr	w9, [x28, #G_PORT]
+	stp	x9, x0, [sp, #32]
+	and	w10, w20, #0xff
+	ubfx	w11, w20, #8, #8
+	stp	x10, x11, [sp]
+	ubfx	w10, w20, #16, #8
+	lsr	w11, w20, #24
+	stp	x10, x11, [sp, #16]
+	add	x0, sp, #64
+	mov	x1, #256
+	CSTR	x2, "http://%u.%u.%u.%u:%u%s"
+	bl	_snprintf
+	mov	x0, x19
+	add	x1, sp, #64
+	mov	x2, #4096
+	bl	_strlcpy
+	mov	w0, #1
+	b	Lret1
+Ltl_no:
+	mov	w0, #0
 	b	Lret1
 
 ; act_resume(timer) — every quarter second until the swapped item is ready: then the saved moment, and play if it was playing.
@@ -4907,7 +5014,7 @@ Lmn_build:
 	ADDR	x0, Lprog_build
 	bl	ui_run
 	bl	share_init                ; after curl_global_init, before any other thread
-	bl	Lui_refresh
+	bl	local_poll
 	ADDR	x0, Lprog_show
 	bl	ui_run
 	bl	layout_stage
