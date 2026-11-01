@@ -6,7 +6,7 @@ app=Beam.app
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
 
-cc -o "$app/Contents/MacOS/Beam" beam.s -framework AppKit -framework AVFoundation -framework AVKit -lcurl \
+cc -o "$app/Contents/MacOS/Beam" beam.s -framework AppKit -framework AVFoundation -framework AVKit \
   -Wl,-objc_stubs_small,-no_data_const,-x,-no_function_starts,-no_data_in_code_info,-no_source_version
 
 icons=$app/Contents/Resources/Beam.iconset
