@@ -1,13 +1,17 @@
 ; ---- Macros ----
 
-; FRAME pairs, locals — prologue: fp/lr, then `pairs` register pairs from x19 (stored by Lpro<pairs>), then locals.
-.macro FRAME pairs, locals=0
+; FRAME pairs, locals, args — prologue: fp/lr, then `pairs` register pairs from x19 (stored by Lpro<pairs>), then locals; with args, x19 = x0 and x20 = x1.
+.macro FRAME pairs, locals=0, args=0
 	.if (\locals) % 16
 	.error "FRAME locals must keep sp 16-byte aligned"
 	.endif
 	stp	x29, x30, [sp, #-16]!
 	.if \pairs
+	.if \args
+	bl	Lpro\pairs\()m
+	.else
 	bl	Lpro\pairs
+	.endif
 	.else
 	mov	x29, sp
 	.endif
@@ -27,6 +31,29 @@
 L\name:
 .endm
 
+; VM program — the function's body is a UI program, its arguments in locals a-h; VMENTRY name, program: the same for a method.
+.macro VM program
+	ADDR	x9, \program
+	b	vm_run
+.endm
+.macro VMENTRY name, program
+\name:
+	ADDR	x9, \program
+	b	vm_entry
+.endm
+; VMT / VMTENTRY name — the same with the program right after, in the code (it ends with OP_END and .p2align 2).
+.macro VMT
+	adr	x9, Lvmt\@
+	b	vm_run
+Lvmt\@:
+.endm
+.macro VMTENTRY name
+\name:
+	adr	x9, Lvmt\@
+	b	vm_entry
+Lvmt\@:
+.endm
+
 ; ADDR reg, sym — address of a symbol in this file.
 .macro ADDR reg, sym
 	adrp	\reg, \sym@PAGE
@@ -39,23 +66,27 @@ L\name:
 .endm
 
 ; SEND / SENDT sel — objc_msgSend with a selector from the registry (SENDT: a tail call).
-.macro SEND sel
+.macro SEND sel                          ; through the selector's stub, if it has one
+	.ifdef	L\sel
+	bl	L\sel
+	.else
 	ldr	x1, [x27, #\sel]
 	bl	_objc_msgSend
+	.endif
 .endm
 .macro SENDT sel
+	.ifdef	L\sel
+	b	L\sel
+	.else
 	ldr	x1, [x27, #\sel]
 	b	_objc_msgSend
+	.endif
 .endm
 
 ; GADDR reg, label — address of a label in G's data, from x28.
 .macro GADDR reg, label
-	.if (\label - G) < 4096
-	add	\reg, x28, #(\label - G)
-	.else
-	add	\reg, x28, #((\label - G) >> 12), lsl #12
-	add	\reg, \reg, #((\label - G) & 4095)
-	.endif
+	adrp	\reg, \label@PAGE
+	add	\reg, \reg, \label@PAGEOFF
 .endm
 
 ; BADDR reg, offset — address of a B buffer, from x27.
@@ -90,11 +121,21 @@ L\name:
 
 ; CSTR reg, text — a C string literal, kept after G.
 .macro CSTR reg, text
-	.pushsection __TEXT,__cstring,cstring_literals
+	.pushsection __DATA,__data
 Lc\@:	.asciz	"\text"
 	.popsection
 	adrp	\reg, Lc\@@PAGE
 	add	\reg, \reg, Lc\@@PAGEOFF
+.endm
+
+; CALLF / JUMPF name — call or tail-call a registry function that has no stub (one call site).
+.macro CALLF name
+	ldr	x16, [x27, #F_\name]
+	blr	x16
+.endm
+.macro JUMPF name
+	ldr	x16, [x27, #F_\name]
+	br	x16
 .endm
 
 ; LOCK / UNLOCK — the lock guarding the playlist slots and visitorData.
@@ -115,38 +156,405 @@ Lc\@:	.asciz	"\text"
 	ldr	x0, [x28, #G_WORKQ]
 .endm
 
-; DBL reg, label — a double kept after G.
-.macro DBL reg, label
-	ldr	\reg, [x28, #(\label - G)]
+; UI programs for ui_run (vm_run).
+.macro OP_END
+	.byte	0
+.endm
+.macro STO slot
+	.byte	1, (\slot) >> 3
+.endm
+.macro LD slot
+	.byte	2, (\slot) >> 3
+.endm
+.macro ADDV
+	.byte	3
+.endm
+.macro CLS name
+	.byte	4, (C_\name - B_REG) >> 3
+.endm
+.macro MSG sel, kinds=""                 ; the commonest kinds have operations of their own
+	.set	Lmk, 6
+	.ifc	"\kinds", "="
+	.set	Lmk, 64
+	.endif
+	.ifc	"\kinds", "I"
+	.set	Lmk, 65
+	.endif
+	.ifc	"\kinds", "O"
+	.set	Lmk, 66
+	.endif
+	.ifc	"\kinds", ""
+	.set	Lmk, 67
+	.endif
+	.byte	Lmk, (\sel - B_SEL) >> 3
+	.if	Lmk == 6
+	.asciz	"\kinds"
+	.endif
+.endm
+.macro CALL fn, kinds=""
+	.byte	5, (\fn - B_REG) >> 3
+	.asciz	"\kinds"
+.endm
+.macro NCALL fn, kinds=""                ; a function of this file
+	.byte	11
+	.long	\fn - Lvm_base
+	.asciz	"\kinds"
+.endm
+.macro JUMP op, label                     ; a jump of at most 127 bytes either way to a HERE, checked as it assembles
+	.byte	\op
+	.ifdef	\label
+	.if	(. + 1 - \label) > 128
+	.error	"backward jump too far"
+	.endif
+	.else
+	.ifndef	\label\()_far
+\label\()_far:
+	.endif
+	.endif
+	.byte	\label - . - 1
+.endm
+.macro HERE label
+\label:
+	.ifdef	\label\()_far
+	.if	(\label - \label\()_far) > 128
+	.error	"forward jump too far"
+	.endif
+	.endif
+.endm
+.macro JZ label
+	JUMP	12, \label
+.endm
+.macro JNZ label
+	JUMP	13, \label
+.endm
+.macro JMP label
+	JUMP	14, \label
+.endm
+.macro LW field                          ; a G word into current
+	.byte	15, (\field) >> 2
+.endm
+.macro SW field
+	.byte	16, (\field) >> 2
+.endm
+.macro IMM n
+	.byte	17, \n
+.endm
+.macro ADDI n
+	.byte	18, \n
+.endm
+.macro EQ n                              ; current = current == n
+	.byte	19, \n
+.endm
+.macro LT n                              ; current = current < n
+	.byte	20, \n
+.endm
+.macro BIT n                             ; current = bit n of current
+	.byte	21, \n
+.endm
+.macro SHL n
+	.byte	22, \n
+.endm
+.macro SL n                              ; current into local n (0-7: a-h)
+	.byte	23 + \n
+.endm
+.macro GL n
+	.byte	31 + \n
+.endm
+.macro EQL n                             ; current = current == local n
+	.byte	39 + \n
+.endm
+.macro ADDL n
+	.byte	47 + \n
+.endm
+.macro SUBL n
+	.byte	55 + \n
+.endm
+.macro LDX off                           ; current = the xword, word or byte at current + off
+	.byte	68
+	.short	\off
+.endm
+.macro LDW off
+	.byte	69
+	.short	\off
+.endm
+.macro LDB off
+	.byte	70
+	.short	\off
+.endm
+.macro ADDH n                            ; current += n, up to 65535
+	.byte	71
+	.short	\n
+.endm
+.macro MULH n
+	.byte	72
+	.short	\n
+.endm
+.macro DIVH n
+	.byte	73
+	.short	\n
+.endm
+.macro ANDH n
+	.byte	74
+	.short	\n
+.endm
+.macro LDEW field                        ; a B word into current, and back
+	.byte	79
+	.short	\field
+.endm
+.macro STEW field
+	.byte	80
+	.short	\field
+.endm
+.macro FL n                              ; f = local n (a double)
+	.byte	82, \n
+.endm
+.macro FS n
+	.byte	83, \n
+.endm
+.macro FK k                              ; f = k / 16
+	.byte	84
+	.short	\k
+.endm
+.macro FI                                ; f = current
+	.byte	85
+.endm
+.macro FT                                ; current = f, truncated
+	.byte	86
+.endm
+.macro FOP op, n                         ; f = f op local n: 0 +, 1 -, 2 *, 3 /, 4 min, 5 max, 6 current = f > it, 7 ceil, 8 floor, 9 |f - it|
+	.byte	87, \op, \n
+.endm
+.macro FOPK op, k                        ; the same with k / 16
+	.byte	88, \op
+	.short	\k
+.endm
+.macro LEA label                         ; current = the address of a label
+	.byte	81
+	.long	\label - Lvm_base
+.endm
+.macro LEAB off                          ; current = the address of a B field
+	.byte	75
+	.short	\off
+.endm
+.macro LDBE off                          ; current = the big-endian word at current + off
+	.byte	76
+	.short	\off
+.endm
+.macro STX n, off                        ; current into the xword or word at local n + off
+	.byte	77, \n
+	.short	\off
+.endm
+.macro STW n, off
+	.byte	78, \n
+	.short	\off
+.endm
+.macro EQS slot                          ; current = current == a G slot
+	.byte	63, (\slot) >> 3
+.endm
+.macro STE field                         ; current into a B field
+	.byte	9
+	.short	\field
+.endm
+.macro LDE field
+	.byte	10
+	.short	\field
+.endm
+.macro RC x, top, w, h                ; for 'R': from the content's top-left
+	.short	\x, \top, \w, \h
+.endm
+.macro RN x, y, w, h                  ; for 'N': from the container's bottom-left
+	.short	\x, \y, \w, \h
+.endm
+.macro IMG slot, sym, desc
+	CLS	NSImage
+	MSG	S_imageWithSystemSymbolName_accessibilityDescription_, "=SS"
+	.asciz	"\sym", "\desc"
+	STO	\slot
+.endm
+.macro IMAGE slot, sym, desc
+	IMG	\slot, "\sym", "\desc"
+	MSG	S_retain, "="
+	STO	\slot
+.endm
+.macro NEWV class, x, top, w, h       ; a new view in the content; it stays current
+	CLS	\class
+	MSG	S_alloc, "="
+	MSG	S_initWithFrame_, "=R"
+	RC	\x, \top, \w, \h
+	ADDV
+.endm
+.macro ADDIN parent                   ; add the current view to a container; it stays current
+	STO	G_T3
+	LD	\parent
+	MSG	S_addSubview_, "O"
+	.byte	G_T3 >> 3
+	LD	G_T3
+.endm
+.macro MASKV mask                     ; the current view's autoresizing
+	MSG	S_setAutoresizingMask_, "I"
+	.byte	\mask
+.endm
+.macro COLOR slot, r, g, b, a
+	CLS	NSColor
+	MSG	S_colorWithSRGBRed_green_blue_alpha_, "=KKKK"
+	.byte	\r, \g, \b, \a
+	MSG	S_retain, "="
+	STO	\slot
+.endm
+.macro LAYERBG color, radius          ; a flat fill with continuous corners for the current view
+	MSG	S_setWantsLayer_, "I"
+	.byte	1
+	STO	G_T3
+	LD	\color
+	MSG	S_CGColor, "="
+	STO	G_T2
+	LD	G_T3
+	MSG	S_layer, "="
+	MSG	S_setBackgroundColor_, "O"
+	.byte	G_T2 >> 3
+	MSG	S_setCornerRadius_, "D"
+	.short	(\radius) * 4
+	MSG	S_setCornerCurve_, "S"
+	.asciz	"continuous"
+	LD	G_T3
+.endm
+.macro FONT sel, size, weight
+	CLS	NSFont
+	MSG	\sel, "=DF"
+	.short	(\size) * 4
+	.byte	\weight
+	STO	G_T0
+.endm
+.macro LABELIN slot, parent, text, x, y, w, h, align, color, mask
+	CLS	NSTextField
+	MSG	S_labelWithString_, "=S"
+	.asciz	"\text"
+	STO	\slot
+	MSG	S_setFrame_, "N"
+	RN	\x, \y, \w, \h
+	MSG	S_setFont_, "O"
+	.byte	G_T0 >> 3
+	MSG	S_setTextColor_, "O"
+	.byte	\color >> 3
+	MSG	S_setAlignment_, "I"
+	.byte	\align
+	MSG	S_setLineBreakMode_, "I"
+	.byte	4                         ; NSLineBreakByTruncatingTail
+	MASKV	\mask
+	ADDIN	\parent
+.endm
+.macro SLIDERIN slot, parent, action, x, y, w, max, mask
+	CLS	NSSlider
+	MSG	S_sliderWithTarget_action_, "=OY"
+	.byte	G_CTRL >> 3, (\action - B_ACT) >> 3
+	STO	\slot
+	MSG	S_setControlSize_, "I"
+	.byte	1                         ; small: a slim track
+	MSG	S_setFrame_, "N"
+	RN	\x, \y, \w, SLIDER_H
+	MSG	S_setMaxValue_, "D"
+	.short	(\max) * 4
+	MSG	S_setTrackFillColor_, "O"
+	.byte	G_YEL >> 3
+	MASKV	\mask
+	ADDIN	\parent
+.endm
+.macro BTN slot, parent, sym, desc, action, tip, x, y, size, pt, mask, tint
+	CLS	NSImageSymbolConfiguration
+	MSG	S_configurationWithPointSize_weight_, "=DF"
+	.short	(\pt) * 4
+	.byte	X_SEMIBOLD
+	STO	G_T0
+	IMG	G_T1, "\sym", "\desc"
+	CLS	NSButton
+	MSG	S_buttonWithImage_target_action_, "=OOY"
+	.byte	G_T1 >> 3, G_CTRL >> 3, (\action - B_ACT) >> 3
+	STO	\slot
+	MSG	S_setBordered_, "I"
+	.byte	0
+	MSG	S_setSymbolConfiguration_, "O"
+	.byte	G_T0 >> 3
+	MSG	S_setFrame_, "N"
+	RN	\x, \y, \size, \size
+	MSG	S_setToolTip_, "S"
+	.asciz	"\tip"
+	MSG	S_setContentTintColor_, "O"
+	.byte	\tint >> 3
+	MASKV	\mask
+	ADDIN	\parent
+.endm
+.macro SUBMENU title
+	CLS	NSMenu
+	MSG	S_alloc, "="
+	MSG	S_initWithTitle_, "=S"
+	.asciz	"\title"
+	STO	G_T1
+	LD	G_T0
+	MSG	S_addItemWithTitle_action_keyEquivalent_, "=SIS"
+	.asciz	"\title"
+	.byte	0
+	.asciz	""
+	MSG	S_setSubmenu_, "O"
+	.byte	G_T1 >> 3
+.endm
+.macro ITEM title, action, key
+	.byte	8
+	.asciz	"\title"
+	.byte	(\action - B_ACT) >> 3
+	.asciz	"\key"
+.endm
+.macro NESTED title                   ; a submenu in the current menu (G_T1); it becomes current, in G_T2
+	CLS	NSMenu
+	MSG	S_alloc, "="
+	MSG	S_initWithTitle_, "=S"
+	.asciz	"\title"
+	STO	G_T2
+	LD	G_T1
+	MSG	S_addItemWithTitle_action_keyEquivalent_, "=SIS"
+	.asciz	"\title"
+	.byte	0
+	.asciz	""
+	MSG	S_setSubmenu_, "O"
+	.byte	G_T2 >> 3
+	LD	G_T2
+.endm
+.macro SPEED title, percent           ; an item of the Speed submenu (G_T2); it stays current
+	LD	G_T2
+	MSG	S_addItemWithTitle_action_keyEquivalent_, "=SYS"
+	.asciz	"\title"
+	.byte	(S_act_speed_ - B_ACT) >> 3
+	.asciz	""
+	MSG	S_setTag_, "I"
+	.byte	\percent
+.endm
+.macro MASK flags                     ; the last item's modifiers, when not Command alone
+	MSG	S_setKeyEquivalentModifierMask_, "X"
+	.long	\flags
+.endm
+.macro SEP
+	CLS	NSMenuItem
+	MSG	S_separatorItem, "="
+	STO	G_SEP
+	LD	G_T1
+	MSG	S_addItem_, "O"
+	.byte	G_SEP >> 3
+.endm
+.macro METHOD sel, imp, types=""         ; - (void)action:(id)sender, unless types say otherwise
+	.byte	7, (\sel - B_ACT) >> 3
+	.long	\imp - Lvm_base
+	.asciz	"\types"
 .endm
 
 ; ---- Constants ----
 
-; BSD sockets, signals and GCD.
-.equ AF_INET,                    2
-.equ SOCK_STREAM,                1
-.equ SOL_SOCKET,                 0xffff
-.equ SO_RCVTIMEO,                0x1006
-.equ SOCKADDR_IN_HEAD,           0x0210   ; sin_len = 16, sin_family = AF_INET
-.equ SIGPIPE,                    13
-.equ SIG_IGN,                    1
+; GCD.
 .equ QOS_CLASS_USER_INITIATED,   0x19
 .equ DISPATCH_TIME_FOREVER,      -1
-.equ IFA_NAME,                   8
-.equ IFA_FLAGS,                  16
-.equ IFA_ADDR,                   24
-.equ IFA_NETMASK,                32
 
 ; Network timeouts and limits.
-.equ ART_TIMEOUT_MS,             10000
 .equ API_TIMEOUT_MS,             30000
 .equ BUF_MAX,                    0x800000 ; 8 MiB cap for any buffered body
-.equ REQ_MAX,                    4096
 .equ CHUNK,                      0xa00000 ; 10 MiB: larger upstream ranges are throttled to realtime
-.equ CLIENT_TIMEOUT_S,           10
-.equ ACCEPT_BACKOFF_US,          10000
-.equ SLOTS,                      32       ; a video on This Mac takes five: picture, sound and their playlists
-.equ TOKEN_STRIDE,               40       ; 32 hex + NUL; the last byte flags a live stream
 .equ HIDE_TICKS,                 3        ; idle seconds before the controls leave a playing video
 .equ VIDEO_MAX_H,                2160     ; the tallest video stream picked
 .equ SKIP_SECONDS,               10
@@ -161,6 +569,7 @@ Lc\@:	.asciz	"\text"
 .equ RENDER_FAILED,              2        ; AVQueuedSampleBufferRenderingStatusFailed
 .equ WAIT_TRIES,                 2000     ; 5 ms polls for the first picture before the clock starts anyway
 .equ WAIT_NS,                    5000000
+.equ LEAD_MS,                    350      ; a picture queued at most this far ahead (net_tick asks again every eighth of a second; 2x speed still has a tick to spare)
 .equ AUDIO_PREROLL,              2        ; packets decoded before a seek target, so the decoder has its overlap
 .equ TRACKS,                     8
 .equ RQS,                        16       ; requests at once
@@ -173,7 +582,7 @@ Lc\@:	.asciz	"\text"
 .equ BOX_MAX,                    0x1000000 ; the largest box collected (moov, moof, sidx)
 .equ RETRY_NS,                   1000000000
 .equ NET_TRIES,                  3
-.equ TICK_NS,                    250000000 ; the network check: a stall holds the clock until STALL_FULL ms are in
+.equ TICK_NS,                    125000000 ; the network check: a stall holds the clock until STALL_FULL ms are in
 .equ STALL_LOW,                  250
 .equ STALL_FULL,                 2000
 .equ BPS_START,                  4000000  ; HLS starts with the best variant under this, then follows the measured speed
@@ -185,6 +594,7 @@ Lc\@:	.asciz	"\text"
 .equ AFS_DOFF,                   0x646f6666 ; 'doff': where the sound data starts
 .equ AFS_PCNT,                   0x70636e74 ; 'pcnt': its packets
 .equ AFS_BRAT,                   0x62726174 ; 'brat': its bit rate
+.equ AFS_PNFO,                   0x706e666f ; 'pnfo': its priming and remainder frames
 ; seg_scan's result: a media playlist's segment.
 .equ SG_URI,                     0        ; its URI line, and the line's end
 .equ SG_URIE,                    8
@@ -276,8 +686,8 @@ Lc\@:	.asciz	"\text"
 .equ TR_ROT,                     304      ; w: the picture's turn from its matrix, degrees counterclockwise (0, 90, 180, -90)
 .equ TR_DW,                      308      ; w: its shown size, pixel aspect and clean aperture applied
 .equ TR_DH,                      312
-.equ TR_AFLAG,                   316      ; w: a sound file's next parse: 1 after a seek (a discontinuity)
 .equ TR_SNAP,                    320      ; a saved cursor
+.equ TR_PRIM,                    384      ; w: a sound file's encoder priming, frames (cut from its timeline)
 .equ TR_SIZE,                    512
 
 ; Stream: one URL's bytes from the network, parsed as they come.
@@ -336,7 +746,7 @@ Lc\@:	.asciz	"\text"
 .equ ST_VHEVC,                   412      ; w: the picture is HEVC
 .equ ST_TSN,                     416      ; w: bytes of a partial TS packet
 .equ ST_PSNEW,                   420      ; w: parameter sets changed: a new format before the next picture
-.equ ST_STALE,                   424      ; w: the live playlist is due again
+.equ ST_STALE,                   424      ; w: its playlist is due again, until a new one comes
 .equ ST_KEY,                     432      ; AES key and IV, 16 bytes each
 .equ ST_IV,                      448
 .equ ST_VT,                      464      ; the TS picture and sound tracks
@@ -371,16 +781,14 @@ Lc\@:	.asciz	"\text"
 .equ JOB_ERR,                    24       ; char*, why it failed, or NULL
 .equ JOB_KIND,                   32       ; int, KIND_*
 .equ JOB_GEN,                    36       ; int, G_PLAYGEN when asked
-.equ JOB_ITEM,                   40       ; AVPlayerItem for This Mac, retained, or nil
 .equ JOB_TRACK,                  48       ; Track
 .equ JOB_AFMT,                   JOB_TRACK + T_SIZE ; Fmt of the sound stream
 .equ JOB_VFMT,                   JOB_AFMT + FMT_SIZE ; and of the picture stream
 .equ JOB_MSG,                    JOB_VFMT + FMT_SIZE ; char[128], an error message
 .equ JOB_URL,                    JOB_MSG + 128      ; char[4096], the media URL
 .equ JOB_VURL,                   JOB_URL + 4096     ; char[4096], the video stream's URL, or ""
-.equ JOB_TVFMT,                  JOB_VURL + 4096    ; Fmt of the picture for a TV (H.264, up to 1080p)
-.equ JOB_TVURL,                  JOB_TVFMT + FMT_SIZE ; char[4096], its URL, or ""
-.equ JOB_SIZE,                   JOB_TVURL + 4096
+.equ JOB_HLS,                    JOB_VURL + 4096    ; char[4096], YouTube's own HLS, or ""
+.equ JOB_SIZE,                   JOB_HLS + 4096
 .equ KIND_YOUTUBE,               0        ; a YouTube link or search
 .equ KIND_WEB,                   1        ; any other web address, played as it is
 .equ KIND_FILE,                  2        ; a file on this Mac (JOB_QUERY is its path)
@@ -447,10 +855,7 @@ Lc\@:	.asciz	"\text"
 .equ G_APP,                      0
 .equ G_CTRL,                     8
 .equ G_PLAYER,                   32       ; AVPlayer
-.equ G_LAN,                      40       ; mask << 32 | address, network order, one atomic word
 .equ G_LOCK,                     48       ; os_unfair_lock
-.equ G_PORT,                     52       ; proxy port
-.equ G_SLOTI,                    80       ; next stream slot (lock)
 .equ G_PLAYGEN,                  84       ; the newest play (written on main)
 .equ G_LTDUR,                    96       ; This Mac's duration (main)
 .equ G_TICK,                     104      ; timer ticks since launch
@@ -486,8 +891,7 @@ Lc\@:	.asciz	"\text"
 .equ G_IMGPAUSE,                 336
 .equ G_IMGMUTED,                 344
 .equ G_IMGUNMUTED,               352
-.equ G_SLOTURL,                  360      ; char*[SLOTS], media URLs or playlists (lock)
-.equ G_SECOND,                   G_SLOTURL + 8 * SLOTS ; colors (main)
+.equ G_SECOND,                   360      ; colors (main)
 .equ G_TEXT,                     G_SECOND + 8
 .equ G_YEL,                      G_TEXT + 8
 .equ G_RED,                      G_YEL + 8
@@ -524,19 +928,17 @@ Lc\@:	.asciz	"\text"
 .equ G_MUTED,                    G_VOLPCT + 4
 .equ G_SEEKPEND,                 G_MUTED + 4 ; a seek is queued for the engine
 .equ G_SEEKTO,                   G_SEEKPEND + 8 ; its target, ms
-.equ G_SIZE,                     G_SEEKTO + 8
+.equ G_CLOCKQ,                   G_SEEKTO + 8 ; a serial queue for the clock's slow stops
+.equ G_SHOWPOS,                  G_CLOCKQ + 8 ; the position show_time was given, drawn or not (main)
+.equ G_SIZE,                     G_SHOWPOS + 8
 
 ; ---- Data ----
 
 	.section __DATA,__data
 	.p2align 3
-G:	.space	G_SIZE
-Lf_100:	.float	100.0                     ; volume percent, 8-aligned after G
-	.float	0.0
 
 ; B: the large buffers, at fixed offsets from x27.
-.equ B_SLOTTOK,                  0        ; stream tokens (lock)
-.equ B_UIMSG,                    B_SLOTTOK + SLOTS * TOKEN_STRIDE ; char[256], status message (main)
+.equ B_UIMSG,                    0        ; char[256], status message (main)
 .equ B_UIARTIST,                 B_UIMSG + 256 ; char[256], last rendered artist (main)
 .equ B_UIART,                    B_UIARTIST + 256 ; char[2048], artwork shown or loading (main)
 .equ B_UITITLE,                  B_UIART + 2048 ; char[512], last rendered title (main)
@@ -544,407 +946,455 @@ Lf_100:	.float	100.0                     ; volume percent, 8-aligned after G
 .equ B_REG,                      (B_LTTRACK + T_SIZE + 4095) & ~4095 ; the registry, 4 KiB-aligned: one add reaches it
 
 
-; SYM / OBJC name — an imported symbol / class in the registry (FN, defined with each pass, is a function called by name).
-.macro SYM name
-	REG	F_\name, "\name"
+; SYM / OBJC name, pieces — an imported symbol / class in the registry, its name whole or in pieces that spell it (FN, defined with each pass, is a function called by name).
+.macro SYM name, a, b, c, d, e, f, g, h, i, j, k, l, m
+	SPELL	F_\name, \name, \a, \b, \c, \d, \e, \f, \g, \h, \i, \j, \k, \l, \m
 .endm
-.macro OBJC name                          ; found with objc_getClass
-	REG	C_\name, "\name"
+.macro OBJC name, a, b, c, d, e, f, g, h, i, j, k, l, m ; found with objc_getClass
+	SPELL	C_\name, \name, \a, \b, \c, \d, \e, \f, \g, \h, \i, \j, \k, \l, \m
+.endm
+.macro SPELL sym, name, a, b, c, d, e, f, g, h, i, j, k, l, m
+	.ifb	\a
+	REG	\sym, \name
+	.else
+	.ifnc	\name, \a\b\c\d\e\f\g\h\i\j\k\l\m
+	.error	"the pieces do not spell the name"
+	.endif
+	REG	\sym, \a, \b, \c, \d, \e, \f, \g, \h, \i, \j, \k, \l, \m
+	.endif
 .endm
 
 ; REGISTRY — imported symbols, classes, then selectors, looked up by name once at launch into B.
 .macro REGISTRY
-	FN	CFArrayGetValueAtIndex
-	FN	CFDictionarySetValue
-	FN	CFRelease
-	FN	CMAudioFormatDescriptionCreateFromBigEndianSoundDescriptionData
-	FN	CMBlockBufferCreateWithBufferReference
-	FN	CMBlockBufferCreateWithMemoryBlock
-	FN	CMSampleBufferCreateReady
-	FN	CMSampleBufferGetSampleAttachmentsArray
-	FN	CMSetAttachment
-	FN	CMTimeCopyAsDictionary
-	FN	CMVideoFormatDescriptionCreateFromBigEndianImageDescriptionData
-	FN	CMVideoFormatDescriptionCreateFromH264ParameterSets
-	FN	CMVideoFormatDescriptionCreateFromHEVCParameterSets
-	FN	CMAudioFormatDescriptionCreate
-	FN	CMAudioSampleBufferCreateReadyWithPacketDescriptions
-	FN	CMBlockBufferGetDataPointer
-	FN	CMFormatDescriptionCreate
-	FN	CMFormatDescriptionGetMediaSubType
-	FN	CMSampleBufferGetDataBuffer
-	FN	CMSampleBufferGetDuration
-	FN	CMSampleBufferGetFormatDescription
-	FN	CMSampleBufferGetPresentationTimeStamp
-	FN	CMVideoFormatDescriptionGetPresentationDimensions
-	FN	AudioFileStreamClose
-	FN	AudioFileStreamGetProperty
-	FN	AudioFileStreamGetPropertyInfo
-	FN	AudioFileStreamOpen
-	FN	AudioFileStreamParseBytes
-	FN	AudioFileStreamSeek
-	FN	VTDecompressionSessionCreate
-	FN	VTDecompressionSessionInvalidate
-	FN	CCCrypt
-	FN	accept
-	FN	arc4random_buf
-	FN	arc4random_uniform
-	FN	asprintf
-	FN	bind
+	SYM	CFArrayGetValueAtIndex, CF,Array,Get,Value,At,In,dex
+	SYM	CFDictionarySetValue, CFDi,ction,ary,Set,Value
+	FN	CFRelease, CFR,elease
+	SYM	CMAudioFormatDescriptionCreateFromBigEndianSoundDescriptionData, CM,Audio,FormatDescriptionCreateFrom,BigEndianS,ound,Description,Data
+	SYM	CMBlockBufferCreateWithBufferReference, CM,Block,Buffer,Create,With,Buffer,Reference
+	FN	CMBlockBufferCreateWithMemoryBlock, CM,Block,Buffer,Create,With,Memory,Block
+	SYM	CMSampleBufferCreateReady, CM,SampleBuffer,Create,Ready
+	SYM	CMSampleBufferGetSampleAttachmentsArray, CM,SampleBuffer,Get,Sa,mple,Attachment,s,Array
+	SYM	CMSetAttachment, CM,Set,Attachment
+	SYM	CMTimeCopyAsDictionary, CM,Time,CopyAsDi,ction,ary
+	SYM	CMVideoFormatDescriptionCreateFromBigEndianImageDescriptionData, CMVideo,FormatDescriptionCreateFrom,BigEndian,Image,Description,Data
+	FN	CMVideoFormatDescriptionCreateFromH264ParameterSets, CMVideo,FormatDescriptionCreateFrom,H264Par,ame,ter,Set,s
+	FN	CMVideoFormatDescriptionCreateFromHEVCParameterSets, CMVideo,FormatDescriptionCreateFrom,HEVCPar,ame,ter,Set,s
+	SYM	CMAudioFormatDescriptionCreate, CM,Audio,FormatDescription,Create
+	SYM	CMAudioSampleBufferCreateReadyWithPacketDescriptions, CM,Audio,SampleBuffer,Create,Ready,With,P,ack,et,Description,s
+	FN	CMBlockBufferGetDataPointer, CM,Block,Buffer,Get,Data,Po,in,ter
+	FN	CMFormatDescriptionCreate, CM,FormatDescription,Create
+	FN	CMFormatDescriptionGetMediaSubType, CM,FormatDescription,Get,Media,Sub,Type
+	FN	CMSampleBufferGetDataBuffer, CM,SampleBuffer,Get,Data,Buffer
+	SYM	CMSampleBufferGetDuration, CM,SampleBuffer,Get,Dur,ation
+	SYM	CMSampleBufferGetFormatDescription, CM,SampleBuffer,Get,FormatDescription
+	SYM	CMSampleBufferGetPresentationTimeStamp, CM,SampleBuffer,Get,P,res,ent,ation,Time,Stamp
+	SYM	CMVideoFormatDescriptionGetPresentationDimensions, CMVideo,FormatDescription,Get,P,res,ent,ation,D,ime,n,sion,s
+	SYM	AudioFileStreamClose, AudioFileStream,Close
+	FN	AudioFileStreamGetProperty, AudioFileStream,Get,Pro,per,ty
+	SYM	AudioFileStreamGetPropertyInfo, AudioFileStream,Get,Pro,per,ty,In,fo
+	SYM	AudioFileStreamOpen, AudioFileStream,Open
+	FN	AudioFileStreamParseBytes, AudioFileStream,ParseBy,tes
+	SYM	AudioFileStreamSeek, AudioFileStream,Seek
+	SYM	VTDecompressionSessionCreate, VTDecompression,Session,Create
+	SYM	VTDecompressionSessionInvalidate, VTDecompression,Session,In,val,id,ate
+	SYM	CCCrypt
+	SYM	arc4random_uniform, arc4random_uni,for,m
+	FN	asprintf, aspr,in,tf
 	FN	bzero
-	FN	calloc
-	FN	clock_gettime_nsec_np
+	SYM	calloc, cal,loc
+	FN	clock_gettime_nsec_np, c,loc,k_gett,ime,_nsec_np
 	FN	close
-	FN	dispatch_after_f
-	FN	dispatch_async_f
-	FN	dispatch_semaphore_create
-	FN	dispatch_semaphore_signal
-	FN	dispatch_semaphore_wait
-	FN	dispatch_sync_f
-	FN	dispatch_time
+	FN	dispatch_after_f, dispatch_,af,ter,_f
+	FN	dispatch_async_f, dispatch_,async_f
+	SYM	dispatch_semaphore_create, dispatch_,semaphore_,cre,ate
+	SYM	dispatch_semaphore_signal, dispatch_,semaphore_,signal
+	SYM	dispatch_semaphore_wait, dispatch_,semaphore_,wait
+	SYM	dispatch_sync_f, dispatch_,sync_f
+	FN	dispatch_time, dispatch_,t,ime
 	FN	free
-	FN	freeifaddrs
-	FN	fstat
-	FN	getifaddrs
-	FN	getsockname
-	FN	listen
-	FN	madvise
-	FN	malloc
+	SYM	fstat
+	SYM	madvise, madv,is,e
+	FN	malloc, mal,loc
 	FN	memcmp
 	FN	memcpy
-	FN	memmove
-	FN	mmap
+	SYM	memmove
+	SYM	mmap
 	FN	munmap
-	FN	objc_autoreleasePoolPop
-	FN	objc_autoreleasePoolPush
-	FN	objc_getClass
-	FN	objc_msgSend
-	FN	open
-	FN	os_unfair_lock_lock
-	FN	os_unfair_lock_unlock
-	FN	pthread_create
-	FN	pthread_detach
-	FN	realloc
-	FN	recv
-	FN	sel_registerName
-	FN	setsockopt
-	FN	snprintf
-	FN	socket
-	FN	strcasestr
-	FN	strchr
-	FN	strcmp
-	FN	strcspn
-	FN	strdup
-	FN	strlcpy
-	FN	strlen
-	FN	strncmp
-	FN	strnstr
-	FN	strstr
-	FN	strtod
-	FN	strtol
-	FN	usleep
-	FN	write
-	SYM	NSFontWeightMedium
-	SYM	NSFontWeightRegular
-	SYM	NSFontWeightSemibold
-	SYM	VTIsHardwareDecodeSupported
-	SYM	_NSConcreteGlobalBlock
-	SYM	_dispatch_main_q
-	SYM	class_addMethod
-	SYM	dispatch_get_global_queue
-	SYM	dispatch_queue_attr_make_with_autorelease_frequency
-	SYM	dispatch_queue_attr_make_with_qos_class
-	SYM	dispatch_queue_create
+	FN	objc_autoreleasePoolPop, objc_,au,tor,elease,PoolPop
+	FN	objc_autoreleasePoolPush, objc_,au,tor,elease,PoolPush
+	SYM	objc_getClass, objc_,getC,lass
+	FN	objc_msgSend, objc_,msgSend
+	SYM	open
+	SYM	os_unfair_lock_lock, os_unfair_lock_,loc,k
+	SYM	os_unfair_lock_unlock, os_unfair_lock_,un,loc,k
+	FN	realloc, rea,l,loc
+	FN	sel_registerName, sel_,register,N,ame
+	FN	snprintf, snpr,in,tf
+	SYM	strcasestr, str,case,str
+	FN	strchr, str,chr
+	FN	strcmp, str,cmp
+	FN	strcspn, str,cspn
+	FN	strdup, str,dup
+	FN	strlcpy, str,lcpy
+	FN	strlen, str,len
+	FN	strncmp, str,ncmp
+	FN	strnstr, str,n,str
+	FN	strstr, str,str
+	SYM	strtod, str,tod
+	FN	strtol, str,tol
+	SYM	NSFontWeightMedium, NSFontWeight,Medium
+	SYM	NSFontWeightRegular, NSFontWeight,Regular
+	SYM	NSFontWeightSemibold, NSFontWeight,Semibold
+	SYM	VTIsHardwareDecodeSupported, VTIsHardwareDec,ode,Supported
+	SYM	_NSConcreteGlobalBlock, _,NS,ConcreteGlobal,Block
+	SYM	_dispatch_main_q, _,dispatch_,ma,in,_q
+	SYM	class_addMethod, c,lass,_,add,Method
+	SYM	dispatch_get_global_queue, dispatch_,get_global_q,ueue
+	SYM	dispatch_queue_attr_make_with_autorelease_frequency, dispatch_,queue_attr_make_with_,au,tor,elease,_frequency
+	SYM	dispatch_queue_attr_make_with_qos_class, dispatch_,queue_attr_make_with_,qos_c,lass
+	SYM	dispatch_queue_create, dispatch_,q,ueue,_cre,ate
 	SYM	kCFBooleanTrue
-	SYM	kCMImageDescriptionFlavor_ISOFamily
-	SYM	kCMSampleAttachmentKey_DoNotDisplay
-	SYM	kCMSampleAttachmentKey_NotSync
-	SYM	kCMSampleBufferAttachmentKey_TrimDurationAtStart
-	SYM	kCMSoundDescriptionFlavor_ISOFamily
-	SYM	objc_allocateClassPair
-	SYM	objc_registerClassPair
-	SYM	signal
+	SYM	kCMImageDescriptionFlavor_ISOFamily, k,CM,Image,Description,Flavor_ISOFamily
+	SYM	kCMSampleAttachmentKey_DoNotDisplay, kCMSampleAttachmentKey_,DoNot,Display
+	SYM	kCMSampleAttachmentKey_NotSync, kCMSampleAttachmentKey_,NotSync
+	SYM	kCMSampleBufferAttachmentKey_TrimDurationAtStart, k,CM,SampleBuffer,Attachment,Key_TrimDur,ation,AtStart
+	SYM	kCMSoundDescriptionFlavor_ISOFamily, k,CM,S,ound,Description,Flavor_ISOFamily
+	SYM	objc_allocateClassPair, objc_,al,loc,ate,C,lass,Pair
+	SYM	objc_registerClassPair, objc_,register,C,lass,Pair
 	REGCLS
-	OBJC	AVPlayer
-	OBJC	AVPlayerItem
-	OBJC	AVPictureInPictureController
-	OBJC	AVPictureInPictureControllerContentSource
-	OBJC	AVPlayerLayer
-	OBJC	AVRoutePickerView
-	OBJC	AVSampleBufferAudioRenderer
-	OBJC	AVSampleBufferDisplayLayer
-	OBJC	AVSampleBufferRenderSynchronizer
-	OBJC	CALayer
-	OBJC	CATextLayer
-	OBJC	CATransaction
-	OBJC	NSAppearance
-	OBJC	NSApplication
-	OBJC	NSArray
-	OBJC	NSButton
-	OBJC	NSCharacterSet
-	OBJC	NSColor
-	OBJC	NSCursor
-	OBJC	NSData
-	OBJC	NSFont
-	OBJC	NSImage
-	OBJC	NSImageSymbolConfiguration
-	OBJC	NSImageView
-	OBJC	NSJSONSerialization
-	OBJC	NSLocale
-	OBJC	NSMenu
-	OBJC	NSMenuItem
-	OBJC	NSMutableURLRequest
-	OBJC	NSObject
-	OBJC	NSOpenPanel
-	OBJC	NSOperationQueue
-	OBJC	NSProgressIndicator
-	OBJC	NSSlider
-	OBJC	NSString
-	OBJC	NSTextField
-	OBJC	NSTimer
-	OBJC	NSTrackingArea
-	OBJC	NSURL
-	OBJC	NSURLSession
-	OBJC	NSURLSessionConfiguration
-	OBJC	NSView
-	OBJC	NSWindow
-	OBJC	UTType
+	OBJC	AVPlayer, AV,Player
+	OBJC	AVPlayerItem, AV,Player,Item
+	OBJC	AVPictureInPictureController, AV,Picture,InPictureController
+	OBJC	AVPictureInPictureControllerContentSource, AV,Picture,InPictureController,Content,Source
+	OBJC	AVPlayerLayer, AV,Player,Layer
+	OBJC	AVRoutePickerView, AV,RoutePicker,View
+	OBJC	AVSampleBufferAudioRenderer, AV,SampleBuffer,Audio,Render,er
+	OBJC	AVSampleBufferDisplayLayer, AV,SampleBuffer,Display,Layer
+	OBJC	AVSampleBufferRenderSynchronizer, AV,SampleBuffer,Render,Synchron,ize,r
+	OBJC	CALayer, CA,Layer
+	OBJC	CATextLayer, CA,Text,Layer
+	OBJC	CATransaction, CA,Trans,a,ction
+	OBJC	NSAppearance, NS,A,ppear,ance
+	OBJC	NSApplication, NS,A,pplication
+	OBJC	NSArray, NS,Array
+	OBJC	NSButton, NS,Button
+	OBJC	NSCharacterSet, NS,Character,Set
+	OBJC	NSColor, NS,C,olor
+	OBJC	NSCursor, NS,Cursor
+	OBJC	NSData, NS,Data
+	OBJC	NSFont, NS,F,ont
+	OBJC	NSImage, NS,Image
+	OBJC	NSImageSymbolConfiguration, NS,Image,Symbol,Configuration
+	OBJC	NSImageView, NS,Image,View
+	OBJC	NSJSONSerialization, NS,JSO,NS,erializ,ation
+	OBJC	NSLocale, NS,Lo,cale
+	OBJC	NSMenu, NS,M,enu
+	OBJC	NSMenuItem, NS,M,enu,Item
+	OBJC	NSMutableURLRequest, NS,Mut,able,URL,R,equest
+	OBJC	NSObject, NS,Object
+	OBJC	NSOpenPanel, NS,OpenPanel
+	OBJC	NSOperationQueue, NS,O,per,ation,Q,ueue
+	OBJC	NSProgressIndicator, NS,Prog,res,s,In,dica,tor
+	OBJC	NSSlider, NS,Sli,der
+	OBJC	NSString, NS,String
+	OBJC	NSTextField, NS,Text,Field
+	OBJC	NSTimer, NS,Time,r
+	OBJC	NSTrackingArea, NS,Tr,ack,ing,A,rea
+	OBJC	NSURL, NS,URL
+	OBJC	NSURLSession, NS,URL,Session
+	OBJC	NSURLSessionConfiguration, NS,URL,Session,Configuration
+	OBJC	NSView, NS,View
+	OBJC	NSWindow, NS,Window
+	OBJC	UTType, UT,Type
 	REGSEL
-	REG	S_systemFontOfSize_weight_, "systemFontOfSize:weight:"
-	REG	S_monospacedDigitSystemFontOfSize_weight_, "monospacedDigitSystemFontOfSize:weight:"
-	REG	S_JSONObjectWithData_options_error_, "JSONObjectWithData:options:error:"
-	REG	S_URLWithString_, "URLWithString:"
-	REG	S_UTF8String, "UTF8String"
-	REG	S_CGColor, "CGColor"
-	REG	S_URL, "URL"
-	REG	S_URLByDeletingPathExtension, "URLByDeletingPathExtension"
-	REG	S_absoluteString, "absoluteString"
-	REG	S_activate, "activate"
-	REG	S_addItem_, "addItem:"
-	REG	S_addItemWithTitle_action_keyEquivalent_, "addItemWithTitle:action:keyEquivalent:"
-	REG	S_addSubview_, "addSubview:"
-	REG	S_addTrackingArea_, "addTrackingArea:"
-	REG	S_alloc, "alloc"
-	REG	S_animator, "animator"
-	REG	S_appearanceNamed_, "appearanceNamed:"
-	REG	S_arrayWithObject_, "arrayWithObject:"
-	REG	S_assetTrack, "assetTrack"
-	REG	S_bounds, "bounds"
-	REG	S_buttonWithImage_target_action_, "buttonWithImage:target:action:"
-	REG	S_cancelOperation_, "cancelOperation:"
-	REG	S_cell, "cell"
-	REG	S_center, "center"
-	REG	S_clickCount, "clickCount"
-	REG	S_colorWithSRGBRed_green_blue_alpha_, "colorWithSRGBRed:green:blue:alpha:"
-	REG	S_componentsSeparatedByString_, "componentsSeparatedByString:"
-	REG	S_configurationWithPointSize_weight_, "configurationWithPointSize:weight:"
-	REG	S_currentEvent, "currentEvent"
-	REG	S_currentItem, "currentItem"
-	REG	S_currentTime, "currentTime"
-	REG	S_dataWithBytes_length_, "dataWithBytes:length:"
-	REG	S_dataWithBytesNoCopy_length_freeWhenDone_, "dataWithBytesNoCopy:length:freeWhenDone:"
-	REG	S_doubleValue, "doubleValue"
-	REG	S_draggingPasteboard, "draggingPasteboard"
-	REG	S_duration, "duration"
-	REG	S_fileURLWithPath_, "fileURLWithPath:"
-	REG	S_firstObject, "firstObject"
-	REG	S_host, "host"
-	REG	S_imageViewWithImage_, "imageViewWithImage:"
-	REG	S_imageWithSystemSymbolName_accessibilityDescription_, "imageWithSystemSymbolName:accessibilityDescription:"
-	REG	S_initWithContentRect_styleMask_backing_defer_, "initWithContentRect:styleMask:backing:defer:"
-	REG	S_initWithData_, "initWithData:"
-	REG	S_initWithFrame_, "initWithFrame:"
-	REG	S_initWithRect_options_owner_userInfo_, "initWithRect:options:owner:userInfo:"
-	REG	S_initWithTitle_, "initWithTitle:"
-	REG	S_intValue, "intValue"
-	REG	S_isEnabled, "isEnabled"
-	REG	S_isEqualToString_, "isEqualToString:"
-	REG	S_isExternalPlaybackActive, "isExternalPlaybackActive"
-	REG	S_isFileURL, "isFileURL"
-	REG	S_labelWithString_, "labelWithString:"
-	REG	S_lastPathComponent, "lastPathComponent"
-	REG	S_layer, "layer"
-	REG	S_locationInWindow, "locationInWindow"
-	REG	S_makeFirstResponder_, "makeFirstResponder:"
-	REG	S_makeKeyAndOrderFront_, "makeKeyAndOrderFront:"
-	REG	S_maxValue, "maxValue"
-	REG	S_mediaType, "mediaType"
-	REG	S_menu, "menu"
-	REG	S_new, "new"
-	REG	S_openPanel, "openPanel"
-	REG	S_path, "path"
-	REG	S_pause, "pause"
-	REG	S_play, "play"
-	REG	S_playerItemWithURL_, "playerItemWithURL:"
-	REG	S_playerLayerWithPlayer_, "playerLayerWithPlayer:"
-	REG	S_presentationSize, "presentationSize"
-	REG	S_readObjectsForClasses_options_, "readObjectsForClasses:options:"
-	REG	S_registerForDraggedTypes_, "registerForDraggedTypes:"
-	REG	S_release, "release"
-	REG	S_replaceCurrentItemWithPlayerItem_, "replaceCurrentItemWithPlayerItem:"
-	REG	S_retain, "retain"
-	REG	S_run, "run"
-	REG	S_runModal, "runModal"
-	REG	S_scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_, "scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"
-	REG	S_seekToTime_toleranceBefore_toleranceAfter_, "seekToTime:toleranceBefore:toleranceAfter:"
-	REG	S_selectText_, "selectText:"
-	REG	S_separatorItem, "separatorItem"
-	REG	S_setAction_, "setAction:"
-	REG	S_setActivationPolicy_, "setActivationPolicy:"
-	REG	S_setAlignment_, "setAlignment:"
-	REG	S_setAllowedContentTypes_, "setAllowedContentTypes:"
-	REG	S_setAlphaValue_, "setAlphaValue:"
-	REG	S_setAppearance_, "setAppearance:"
-	REG	S_setAutoresizingMask_, "setAutoresizingMask:"
-	REG	S_setBackgroundColor_, "setBackgroundColor:"
-	REG	S_setBezeled_, "setBezeled:"
-	REG	S_setBordered_, "setBordered:"
-	REG	S_setClipsToBounds_, "setClipsToBounds:"
-	REG	S_setCollectionBehavior_, "setCollectionBehavior:"
-	REG	S_setContentMinSize_, "setContentMinSize:"
-	REG	S_setContentSize_, "setContentSize:"
-	REG	S_setContentTintColor_, "setContentTintColor:"
-	REG	S_setContents_, "setContents:"
-	REG	S_setContentsGravity_, "setContentsGravity:"
-	REG	S_setContentsRect_, "setContentsRect:"
-	REG	S_setControlSize_, "setControlSize:"
-	REG	S_setCornerCurve_, "setCornerCurve:"
-	REG	S_setCornerRadius_, "setCornerRadius:"
-	REG	S_setDelegate_, "setDelegate:"
-	REG	S_setDisplayedWhenStopped_, "setDisplayedWhenStopped:"
-	REG	S_setDoubleValue_, "setDoubleValue:"
-	REG	S_setDrawsBackground_, "setDrawsBackground:"
-	REG	S_setEnabled_, "setEnabled:"
-	REG	S_setFocusRingType_, "setFocusRingType:"
-	REG	S_setFont_, "setFont:"
-	REG	S_setFrame_, "setFrame:"
-	REG	S_setFrameOrigin_, "setFrameOrigin:"
-	REG	S_setHidden_, "setHidden:"
-	REG	S_setHiddenUntilMouseMoves_, "setHiddenUntilMouseMoves:"
-	REG	S_setImage_, "setImage:"
-	REG	S_setKeyEquivalentModifierMask_, "setKeyEquivalentModifierMask:"
-	REG	S_setLayer_, "setLayer:"
-	REG	S_setLineBreakMode_, "setLineBreakMode:"
-	REG	S_setMainMenu_, "setMainMenu:"
-	REG	S_setMaxValue_, "setMaxValue:"
-	REG	S_setMovableByWindowBackground_, "setMovableByWindowBackground:"
-	REG	S_setMuted_, "setMuted:"
-	REG	S_setPlaceholderString_, "setPlaceholderString:"
-	REG	S_setScrollable_, "setScrollable:"
-	REG	S_setState_, "setState:"
-	REG	S_setStringValue_, "setStringValue:"
-	REG	S_setStyle_, "setStyle:"
-	REG	S_setSubmenu_, "setSubmenu:"
-	REG	S_setSymbolConfiguration_, "setSymbolConfiguration:"
-	REG	S_setTarget_, "setTarget:"
-	REG	S_setTextColor_, "setTextColor:"
-	REG	S_setTitle_, "setTitle:"
-	REG	S_setTitleVisibility_, "setTitleVisibility:"
-	REG	S_setTitlebarAppearsTransparent_, "setTitlebarAppearsTransparent:"
-	REG	S_setTolerance_, "setTolerance:"
-	REG	S_setToolTip_, "setToolTip:"
-	REG	S_setTrackFillColor_, "setTrackFillColor:"
-	REG	S_setUsesSingleLineMode_, "setUsesSingleLineMode:"
-	REG	S_setVolume_, "setVolume:"
-	REG	S_setWantsLayer_, "setWantsLayer:"
-	REG	S_setWindowsMenu_, "setWindowsMenu:"
-	REG	S_sharedApplication, "sharedApplication"
-	REG	S_startAnimation_, "startAnimation:"
-	REG	S_status, "status"
-	REG	S_stopAnimation_, "stopAnimation:"
-	REG	S_stringByTrimmingCharactersInSet_, "stringByTrimmingCharactersInSet:"
-	REG	S_stringForType_, "stringForType:"
-	REG	S_stringValue, "stringValue"
-	REG	S_stringWithUTF8String_, "stringWithUTF8String:"
-	REG	S_timeControlStatus, "timeControlStatus"
-	REG	S_toggleFullScreen_, "toggleFullScreen:"
-	REG	S_tracks, "tracks"
-	REG	S_type, "type"
-	REG	S_typeWithIdentifier_, "typeWithIdentifier:"
-	REG	S_whitespaceAndNewlineCharacterSet, "whitespaceAndNewlineCharacterSet"
-	REG	S_count, "count"
-	REG	S_isHidden, "isHidden"
-	REG	S_setPlayer_, "setPlayer:"
-	REG	S_setRoutePickerButtonBordered_, "setRoutePickerButtonBordered:"
-	REG	S_setRoutePickerButtonColor_forState_, "setRoutePickerButtonColor:forState:"
-	REG	S_initWithPlayerLayer_, "initWithPlayerLayer:"
-	REG	S_isPictureInPictureActive, "isPictureInPictureActive"
-	REG	S_startPictureInPicture, "startPictureInPicture"
-	REG	S_stopPictureInPicture, "stopPictureInPicture"
-	REG	S_keyCode, "keyCode"
-	REG	S_styleMask, "styleMask"
-	REG	S_tag, "tag"
-	REG	S_setTag_, "setTag:"
-	REG	S_itemArray, "itemArray"
-	REG	S_removeAllItems, "removeAllItems"
-	REG	S_options, "options"
-	REG	S_displayName, "displayName"
-	REG	S_asset, "asset"
-	REG	S_mediaSelectionGroupForMediaCharacteristic_, "mediaSelectionGroupForMediaCharacteristic:"
-	REG	S_currentMediaSelection, "currentMediaSelection"
-	REG	S_selectedMediaOptionInMediaSelectionGroup_, "selectedMediaOptionInMediaSelectionGroup:"
-	REG	S_selectMediaOption_inMediaSelectionGroup_, "selectMediaOption:inMediaSelectionGroup:"
-	REG	S_setDefaultRate_, "setDefaultRate:"
-	REG	S_setRate_, "setRate:"
-	REG	S_act_option_, "act_option:"
-	REG	S_invalidate, "invalidate"
-	REG	S_objectAtIndex_, "objectAtIndex:"
-	REG	S_setContentView_, "setContentView:"
-	REG	S_size, "size"
-	REG	S_sliderWithTarget_action_, "sliderWithTarget:action:"
-	REG	S_addRenderer_, "addRenderer:"
-	REG	S_enqueueSampleBuffer_, "enqueueSampleBuffer:"
-	REG	S_flush, "flush"
-	REG	S_flushWithRemovalOfDisplayedImage_completionHandler_, "flushWithRemovalOfDisplayedImage:completionHandler:"
-	REG	S_isReadyForDisplay, "isReadyForDisplay"
-	REG	S_isReadyForMoreMediaData, "isReadyForMoreMediaData"
-	REG	S_requestMediaDataWhenReadyOnQueue_usingBlock_, "requestMediaDataWhenReadyOnQueue:usingBlock:"
-	REG	S_sampleBufferRenderer, "sampleBufferRenderer"
-	REG	S_setAudioTimePitchAlgorithm_, "setAudioTimePitchAlgorithm:"
-	REG	S_setRate_time_, "setRate:time:"
-	REG	S_stopRequestingMediaData, "stopRequestingMediaData"
-	REG	S_bytes, "bytes"
-	REG	S_cancel, "cancel"
-	REG	S_dataTaskWithRequest_, "dataTaskWithRequest:"
-	REG	S_defaultSessionConfiguration, "defaultSessionConfiguration"
-	REG	S_length, "length"
-	REG	S_requestWithURL_, "requestWithURL:"
-	REG	S_response, "response"
-	REG	S_resume, "resume"
-	REG	S_sessionWithConfiguration_delegate_delegateQueue_, "sessionWithConfiguration:delegate:delegateQueue:"
-	REG	S_setAssumesHTTP3Capable_, "setAssumesHTTP3Capable:"
-	REG	S_setHTTPBody_, "setHTTPBody:"
-	REG	S_setHTTPMethod_, "setHTTPMethod:"
-	REG	S_setTimeoutInterval_, "setTimeoutInterval:"
-	REG	S_setUnderlyingQueue_, "setUnderlyingQueue:"
-	REG	S_setValue_forHTTPHeaderField_, "setValue:forHTTPHeaderField:"
-	REG	S_statusCode, "statusCode"
-	REG	S_valueForHTTPHeaderField_, "valueForHTTPHeaderField:"
-	REG	S_URLWithString_relativeToURL_, "URLWithString:relativeToURL:"
-	REG	S_addPeriodicTimeObserverForInterval_queue_usingBlock_, "addPeriodicTimeObserverForInterval:queue:usingBlock:"
-	REG	S_addSublayer_, "addSublayer:"
-	REG	S_backingScaleFactor, "backingScaleFactor"
-	REG	S_begin, "begin"
-	REG	S_commit, "commit"
-	REG	S_currentLocale, "currentLocale"
-	REG	S_localizedStringForLanguageCode_, "localizedStringForLanguageCode:"
-	REG	S_preferredFrameSize, "preferredFrameSize"
-	REG	S_setAlignmentMode_, "setAlignmentMode:"
-	REG	S_setContentsScale_, "setContentsScale:"
-	REG	S_setDisableActions_, "setDisableActions:"
-	REG	S_setFontSize_, "setFontSize:"
-	REG	S_setShadowOpacity_, "setShadowOpacity:"
-	REG	S_setString_, "setString:"
-	REG	S_setWrapped_, "setWrapped:"
-	REG	S_setAffineTransform_, "setAffineTransform:"
-	REG	S_setBounds_, "setBounds:"
-	REG	S_setPosition_, "setPosition:"
-	REG	S_setVideoGravity_, "setVideoGravity:"
-	REG	S_initWithSampleBufferDisplayLayer_playbackDelegate_, "initWithSampleBufferDisplayLayer:playbackDelegate:"
-	REG	S_initWithContentSource_, "initWithContentSource:"
+	REG	S_systemFontOfSize_weight_, systemF,ont,Of,Size:,weight:
+	REG	S_monospacedDigitSystemFontOfSize_weight_, monospacedDigitSystemF,ont,Of,Size:,weight:
+	REG	S_JSONObjectWithData_options_error_, JSON,Object,With,Data,:op,tion,s:error:
+	REG	S_URLWithString_, URL,With,String,:
+	REG	S_UTF8String, UTF8,String
+	REG	S_CGColor, CGC,olor
+	REG	S_URL, URL
+	REG	S_URLByDeletingPathExtension, URL,ByD,ele,t,ing,PathExten,sion
+	REG	S_absoluteString, absolute,String
+	REG	S_activate, a,ctiv,ate
+	REG	S_addItem_, add,Item,:
+	REG	S_addItemWithTitle_action_keyEquivalent_, add,Item,With,Title,:a,ction,:keyEqui,val,ent,:
+	REG	S_addSubview_, add,Subview:
+	REG	S_addTrackingArea_, add,Tr,ack,ing,A,rea,:
+	REG	S_alloc, al,loc
+	REG	S_animator, anima,tor
+	REG	S_appearanceNamed_, a,ppear,ance,Nam,ed:
+	REG	S_arrayWithObject_, array,With,Object,:
+	REG	S_assetTrack, as,set,Tr,ack
+	REG	S_bounds, b,ound,s
+	REG	S_buttonWithImage_target_action_, button,With,Image,:t,arget:,a,ction,:
+	REG	S_cancelOperation_, c,ance,lO,per,ation,:
+	REG	S_cell, cell
+	REG	S_center, cen,ter
+	REG	S_clickCount, clickCount
+	REG	S_colorWithSRGBRed_green_blue_alpha_, c,olor,With,SRGBR,ed:,green:blue:alpha:
+	REG	S_componentsSeparatedByString_, compon,ent,sSepar,ate,dBy,String,:
+	REG	S_configurationWithPointSize_weight_, configur,ation,With,Po,in,t,Size:,weight:
+	REG	S_currentEvent, current,Ev,ent
+	REG	S_currentItem, current,Item
+	REG	S_currentTime, current,Time
+	REG	S_dataWithBytes_length_, data,With,By,tes,:,length,:
+	REG	S_dataWithBytesNoCopy_length_freeWhenDone_, data,With,By,tes,NoCopy:,length,:freeWhenDone:
+	REG	S_doubleValue, double,Value
+	REG	S_draggingPasteboard, dragg,ing,Pasteboard
+	REG	S_duration, dur,ation
+	REG	S_fileURLWithPath_, file,URL,With,Path:
+	REG	S_firstObject, first,Object
+	REG	S_host, host
+	REG	S_imageViewWithImage_, image,View,With,Image,:
+	REG	S_imageWithSystemSymbolName_accessibilityDescription_, image,With,System,Symbol,N,ame,:accessibility,Description,:
+	REG	S_initWithContentRect_styleMask_backing_defer_, initWith,Content,Rect:styleM,ask,:b,ack,ing,:def,er:
+	REG	S_initWithData_, initWith,Data,:
+	REG	S_initWithFrame_, initWith,Fr,ame,:
+	REG	S_initWithRect_options_owner_userInfo_, initWith,Rect:op,tion,s:own,er:,use,r,In,fo:
+	REG	S_initWithTitle_, initWith,Title,:
+	REG	S_intValue, in,t,Value
+	REG	S_isEnabled, is,En,able,d
+	REG	S_isEqualToString_, is,EqualTo,String,:
+	REG	S_isExternalPlaybackActive, is,Ex,ter,nalP,lay,b,ack,A,ctiv,e
+	REG	S_isFileURL, is,File,URL
+	REG	S_labelWithString_, label,With,String,:
+	REG	S_lastPathComponent, lastPathCompon,ent
+	REG	S_layer, lay,er
+	REG	S_locationInWindow, loc,ation,In,Window
+	REG	S_makeFirstResponder_, make,FirstResponder,:
+	REG	S_makeKeyAndOrderFront_, makeKeyAndOr,der,Fr,ont,:
+	REG	S_maxValue, max,Value
+	REG	S_mediaType, media,Type
+	REG	S_menu, m,enu
+	REG	S_new, new
+	REG	S_openPanel, open,Panel
+	REG	S_path, path
+	REG	S_pause, pa,use
+	REG	S_play, p,lay
+	REG	S_playerItemWithURL_, p,lay,er,Item,With,URL,:
+	REG	S_playerLayerWithPlayer_, p,lay,er,Layer,With,Player,:
+	REG	S_presentationSize, p,res,ent,ation,S,ize
+	REG	S_readObjectsForClasses_options_, rea,d,Object,s,For,C,lass,es:op,tion,s:
+	REG	S_registerForDraggedTypes_, register,For,Dragged,Type,s:
+	REG	S_release, r,elease
+	REG	S_replaceCurrentItemWithPlayerItem_, replaceCurr,ent,Item,With,Player,Item,:
+	REG	S_retain, reta,in
+	REG	S_run, run
+	REG	S_runModal, runModal
+	REG	S_scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_, scheduled,Time,r,With,Time,Interval:,t,arget:,select,or:,use,r,In,fo:repeats:
+	REG	S_seekToTime_toleranceBefore_toleranceAfter_, seekTo,Time,:toler,ance,Be,for,e:toler,ance,Aft,er:
+	REG	S_selectText_, select,Text,:
+	REG	S_separatorItem, separa,tor,Item
+	REG	S_setAction_, set,A,ction,:
+	REG	S_setActivationPolicy_, set,A,ctiv,ation,Policy:
+	REG	S_setAlignment_, set,Alignm,ent,:
+	REG	S_setAllowedContentTypes_, set,Allowed,Content,Type,s:
+	REG	S_setAlphaValue_, set,Alpha,Value,:
+	REG	S_setAppearance_, set,A,ppear,ance,:
+	REG	S_setAutoresizingMask_, set,Auto,res,iz,ing,M,ask,:
+	REG	S_setBackgroundColor_, set,B,ack,gr,ound,C,olor,:
+	REG	S_setBezeled_, set,Bezel,ed:
+	REG	S_setBordered_, set,Bor,der,ed:
+	REG	S_setClipsToBounds_, set,ClipsToB,ound,s:
+	REG	S_setCollectionBehavior_, set,Colle,ction,Behavior:
+	REG	S_setContentMinSize_, set,Content,M,in,Size:
+	REG	S_setContentSize_, set,Content,Size:
+	REG	S_setContentTintColor_, set,Content,T,in,tC,olor,:
+	REG	S_setContents_, set,Content,s:
+	REG	S_setContentsGravity_, set,Content,sGrav,ity:
+	REG	S_setContentsRect_, set,Content,sRect:
+	REG	S_setControlSize_, set,C,ontrol,Size:
+	REG	S_setCornerCurve_, set,CornerCurve:
+	REG	S_setCornerRadius_, set,CornerRadius:
+	REG	S_setDelegate_, set,D,ele,g,ate:
+	REG	S_setDisplayedWhenStopped_, set,Display,edWhenStopp,ed:
+	REG	S_setDoubleValue_, set,Double,Value,:
+	REG	S_setDrawsBackground_, set,DrawsB,ack,gr,ound,:
+	REG	S_setEnabled_, set,En,able,d:
+	REG	S_setFocusRingType_, set,FocusR,ing,Type,:
+	REG	S_setFont_, set,F,ont,:
+	REG	S_setFrameSize_, set,Fr,ame,Size:
+	REG	S_setFrame_, set,Fr,ame,:
+	REG	S_setFrameOrigin_, set,Fr,ame,Orig,in,:
+	REG	S_setHidden_, set,Hidden,:
+	REG	S_setHiddenUntilMouseMoves_, set,Hidden,UntilMo,use,Moves:
+	REG	S_setImage_, set,Image,:
+	REG	S_setKeyEquivalentModifierMask_, set,KeyEqui,val,ent,ModifierM,ask,:
+	REG	S_setLayer_, set,Layer,:
+	REG	S_setLineBreakMode_, set,L,in,eB,rea,kM,ode,:
+	REG	S_setMainMenu_, set,Ma,in,M,enu,:
+	REG	S_setMaxValue_, set,Max,Value,:
+	REG	S_setMovableByWindowBackground_, set,Mov,able,By,Window,B,ack,gr,ound,:
+	REG	S_setMuted_, set,Mut,ed:
+	REG	S_setPlaceholderString_, set,Placehol,der,String,:
+	REG	S_setScrollable_, set,Scroll,able,:
+	REG	S_setState_, set,St,ate:
+	REG	S_setStringValue_, set,String,Value,:
+	REG	S_setStyle_, set,Style:
+	REG	S_setSubmenu_, set,Subm,enu,:
+	REG	S_setSymbolConfiguration_, set,Symbol,Configuration,:
+	REG	S_setTarget_, set,T,arget:
+	REG	S_setTextColor_, set,Text,C,olor,:
+	REG	S_setTitle_, set,Title,:
+	REG	S_setTitleVisibility_, set,Title,V,is,ibil,ity:
+	REG	S_setTitlebarAppearsTransparent_, set,Title,barA,ppear,s,Trans,par,ent,:
+	REG	S_setTolerance_, set,Toler,ance,:
+	REG	S_setToolTip_, set,ToolTip:
+	REG	S_setTrackFillColor_, set,Tr,ack,FillC,olor,:
+	REG	S_setUsesSingleLineMode_, set,UsesS,ing,leL,in,eM,ode,:
+	REG	S_setVolume_, set,Volume:
+	REG	S_setWantsLayer_, set,Wants,Layer,:
+	REG	S_setWindowsMenu_, set,Window,sM,enu,:
+	REG	S_sharedApplication, sharedA,pplication
+	REG	S_startAnimation_, startAnim,ation,:
+	REG	S_status, status
+	REG	S_stopAnimation_, stop,Anim,ation,:
+	REG	S_stringByTrimmingCharactersInSet_, str,ing,ByTrimm,ing,Character,s,In,Set,:
+	REG	S_stringForType_, str,ing,For,Type,:
+	REG	S_stringValue, str,ing,Value
+	REG	S_stringWithUTF8String_, str,ing,With,UTF8,String,:
+	REG	S_timeControlStatus, t,ime,C,ontrol,Status
+	REG	S_toggleFullScreen_, toggleFullScreen:
+	REG	S_tracks, tr,ack,s
+	REG	S_type, type
+	REG	S_typeWithIdentifier_, type,With,Id,ent,ifi,er:
+	REG	S_whitespaceAndNewlineCharacterSet, whi,tes,paceAndNewl,in,e,Character,Set
+	REG	S_count, count
+	REG	S_isHidden, is,Hidden
+	REG	S_occlusionState, occlu,sion,St,ate
+	REG	S_setPlayer_, set,Player,:
+	REG	S_setRoutePickerButtonBordered_, set,RoutePicker,Button,Bor,der,ed:
+	REG	S_setRoutePickerButtonColor_forState_, set,RoutePicker,Button,C,olor,:,for,St,ate:
+	REG	S_initWithPlayerLayer_, initWith,Player,Layer,:
+	REG	S_isPictureInPictureActive, is,Picture,In,Picture,A,ctiv,e
+	REG	S_startPictureInPicture, start,Picture,In,Picture
+	REG	S_stopPictureInPicture, stop,Picture,In,Picture
+	REG	S_keyCode, keyC,ode
+	REG	S_styleMask, styleM,ask
+	REG	S_tag, tag
+	REG	S_setTag_, set,Tag:
+	REG	S_itemArray, item,Array
+	REG	S_removeAllItems, removeAll,Item,s
+	REG	S_removeTimeObserver_, remove,Time,Observ,er:
+	REG	S_options, op,tion,s
+	REG	S_displayName, d,is,p,lay,N,ame
+	REG	S_asset, as,set
+	REG	S_mediaSelectionGroupForMediaCharacteristic_, media,SelectionGroup,For,Media,Character,is,tic:
+	REG	S_currentMediaSelection, current,Media,S,ele,ction
+	REG	S_selectedMediaOptionInMediaSelectionGroup_, select,ed,Media,Op,tion,In,Media,SelectionGroup,:
+	REG	S_selectMediaOption_inMediaSelectionGroup_, select,Media,Op,tion,:,in,Media,SelectionGroup,:
+	REG	S_setDefaultRate_, set,DefaultR,ate:
+	REG	S_setRate_, set,R,ate:
+	REG	S_objectAtIndex_, objectAt,In,dex:
+	REG	S_setContentView_, set,Content,View,:
+	REG	S_size, s,ize
+	REG	S_sliderWithTarget_action_, sli,der,With,T,arget:,a,ction,:
+	REG	S_addRenderer_, add,Render,er:
+	REG	S_enqueueSampleBuffer_, enq,ueue,SampleBuffer,:
+	REG	S_displayIfNeeded, d,is,p,lay,IfNeeded
+	REG	S_flush, flush
+	REG	S_flushWithRemovalOfDisplayedImage_completionHandler_, flush,With,Remo,val,Of,Display,ed,Image,:,completionHandler:
+	REG	S_isReadyForDisplay, is,Ready,For,Display
+	REG	S_isReadyForMoreMediaData, is,Ready,For,More,Media,Data
+	REG	S_requestMediaDataWhenReadyOnQueue_usingBlock_, r,equest,Media,Data,When,Ready,OnQ,ueue,:us,ing,Block,:
+	REG	S_sampleBufferRenderer, sa,mple,Buffer,Render,er
+	REG	S_setAudioTimePitchAlgorithm_, set,Audio,Time,PitchAlgorithm:
+	REG	S_setRate_time_, set,R,ate:,t,ime,:
+	REG	S_stopRequestingMediaData, stop,R,equest,ing,Media,Data
+	REG	S_bytes, by,tes
+	REG	S_cancel, c,ance,l
+	REG	S_dataTaskWithRequest_, data,T,ask,With,R,equest,:
+	REG	S_defaultSessionConfiguration, default,Session,Configuration
+	REG	S_length, length
+	REG	S_requestWithURL_, r,equest,With,URL,:
+	REG	S_response, res,ponse
+	REG	S_resume, res,ume
+	REG	S_sessionWithConfiguration_delegate_delegateQueue_, ses,sion,With,Configuration,:d,ele,g,ate:,d,ele,g,ate,Q,ueue,:
+	REG	S_setAssumesHTTP3Capable_, set,Assumes,HTTP,3Cap,able,:
+	REG	S_setHTTPBody_, set,HTTP,Body:
+	REG	S_setHTTPMethod_, set,HTTP,Method:
+	REG	S_setTimeoutInterval_, set,Time,out,Interval:
+	REG	S_setUnderlyingQueue_, set,Un,der,ly,ing,Q,ueue,:
+	REG	S_setValue_forHTTPHeaderField_, set,Value,:,for,HTTPHeaderField:
+	REG	S_statusCode, statusC,ode
+	REG	S_valueForHTTPHeaderField_, val,ue,For,HTTPHeaderField:
+	REG	S_URLWithString_relativeToURL_, URL,With,String,:relativeTo,URL,:
+	REG	S_addPeriodicTimeObserverForInterval_queue_usingBlock_, add,Periodic,Time,Observer,For,Interval:,q,ueue,:us,ing,Block,:
+	REG	S_addSublayer_, add,Sub,lay,er:
+	REG	S_backingScaleFactor, b,ack,ing,S,cale,Fac,tor
+	REG	S_begin, beg,in
+	REG	S_commit, commit
+	REG	S_currentLocale, current,Lo,cale
+	REG	S_localizedStringForLanguageCode_, loc,al,ize,d,String,For,LanguageC,ode,:
+	REG	S_preferredFrameSize, preferredFr,ame,S,ize
+	REG	S_setAlignmentMode_, set,Alignm,ent,M,ode,:
+	REG	S_setContentsScale_, set,Content,sS,cale,:
+	REG	S_setDisableActions_, set,D,is,able,A,ction,s:
+	REG	S_setFontSize_, set,F,ont,Size:
+	REG	S_setShadowOpacity_, set,ShadowOpac,ity:
+	REG	S_setString_, set,String,:
+	REG	S_setWrapped_, set,Wrapp,ed:
+	REG	S_setAffineTransform_, set,Aff,in,e,Trans,for,m:
+	REG	S_setBounds_, set,B,ound,s:
+	REG	S_setPosition_, set,Posi,tion,:
+	REG	S_setVideoGravity_, set,VideoGrav,ity:
+	REG	S_initWithSampleBufferDisplayLayer_playbackDelegate_, initWith,SampleBuffer,Display,Layer,:p,lay,b,ack,D,ele,g,ate:
+	REG	S_initWithContentSource_, initWith,Content,Source:
+	REGACT
+	REG	S_URLSession_dataTask_didReceiveData_, URL,Session,:,data,T,ask,:didReceive,Data,:
+	REG	S_URLSession_task_didCompleteWithError_, URL,Session,:t,ask,:didCo,mple,te,With,Error:
+	REG	S_acceptsFirstResponder, accepts,FirstResponder
+	REG	S_act_aonly_, act_,aonly:
+	REG	S_act_back_, act_,b,ack,:
+	REG	S_act_focus_, act_,focus:
+	REG	S_act_fwd_, act_,fwd:
+	REG	S_act_mute_, act_,mute:
+	REG	S_act_open_, act_,open,:
+	REG	S_act_option_, act_,op,tion,:
+	REG	S_act_pip_, act_,pip:
+	REG	S_act_play_, act_,p,lay,:
+	REG	S_act_seek_, act_,seek:
+	REG	S_act_speed_, act_,spe,ed:
+	REG	S_act_stop_, act_,stop,:
+	REG	S_act_tick_, act_,tick:
+	REG	S_act_toggle_, act_,toggle:
+	REG	S_act_vol_, act_,vol:
+	REG	S_act_voldown_, act_,voldown:
+	REG	S_act_volup_, act_,volup:
+	REG	S_application_openURLs_, a,pplication,:,open,URL,s:
+	REG	S_applicationShouldTerminateAfterLastWindowClosed_, a,pplication,ShouldTerm,in,ate,Af,ter,Last,Window,Clos,ed:
+	REG	S_control_textView_doCommandBySelector_, c,ontrol,:text,View,:doCommandByS,ele,c,tor,:
+	REG	S_copy_, copy:
+	REG	S_cut_, cut:
+	REG	S_draggingEntered_, dragg,ing,En,ter,ed:
+	REG	S_hide_, hide:
+	REG	S_hideOtherApplications_, hideOtherA,pplication,s:
+	REG	S_keyDown_, keyDown:
+	REG	S_menuNeedsUpdate_, m,enu,NeedsUpd,ate:
+	REG	S_mouseDown_, mo,use,Down:
+	REG	S_mouseMoved_, mo,use,Mov,ed:
+	REG	S_orderFrontStandardAboutPanel_, or,der,Fr,ont,StandardAboutPanel:
+	REG	S_paste_, paste:
+	REG	S_performClose_, per,for,mClose:
+	REG	S_performDragOperation_, per,for,mDragO,per,ation,:
+	REG	S_performMiniaturize_, per,for,mM,in,iatur,ize,:
+	REG	S_performZoom_, per,for,mZoom:
+	REG	S_pictureInPictureController_didTransitionToRenderSize_, picture,InPictureController,:did,Trans,i,tion,To,Render,Size:
+	REG	S_pictureInPictureController_setPlaying_, picture,InPictureController,:,set,P,lay,ing,:
+	REG	S_pictureInPictureController_skipByInterval_completionHandler_, picture,InPictureController,:skipBy,Interval:,completionHandler:
+	REG	S_pictureInPictureControllerIsPlaybackPaused_, picture,InPictureController,IsP,lay,b,ack,Paus,ed:
+	REG	S_pictureInPictureControllerTimeRangeForPlayback_, picture,InPictureController,Time,Range,For,P,lay,b,ack,:
+	REG	S_redo_, redo:
+	REG	S_routePickerViewWillBeginPresentingRoutes_, routePicker,View,WillBeg,in,P,res,ent,ing,Rou,tes,:
+	REG	S_selectAll_, select,All:
+	REG	S_terminate_, ter,m,in,ate:
+	REG	S_undo_, undo:
+	REG	S_unhideAllApplications_, unhideAllA,pplication,s:
+	REG	S_windowDidResize_, w,in,dowDidRes,ize,:
 .endm
 .set Lnreg, 0
-.macro REG sym, name
+.macro REG sym, parts:vararg
 	.set	\sym, B_REG + 8 * Lnreg
 	.set	Lnreg, Lnreg + 1
 .endm
@@ -954,8 +1404,11 @@ Lf_100:	.float	100.0                     ; volume percent, 8-aligned after G
 .macro REGCLS
 	.set	B_CLS, B_REG + 8 * Lnreg      ; the first class
 .endm
-.macro FN name                            ; its stub jumps through the slot
-	REG	F_\name, "\name"
+.macro REGACT
+	.set	B_ACT, B_REG + 8 * Lnreg      ; the first selector of the UI programs' actions and methods
+.endm
+.macro FN name, a, b, c, d, e, f, g, h, i, j, k, l, m ; its stub jumps through the slot
+	REG	F_\name
 	.pushsection __TEXT,__text,regular,pure_instructions
 _\name:
 	ldr	x16, [x27, #F_\name]
@@ -966,6 +1419,7 @@ _\name:
 	.purgem	REG
 	.purgem	REGSEL
 	.purgem	REGCLS
+	.purgem	REGACT
 	.purgem	FN
 .equ B_ENG,                      B_REG + 8 * Lnreg ; the engine (media queue)
 .equ E_SYNC,                     B_ENG    ; AVSampleBufferRenderSynchronizer
@@ -973,7 +1427,12 @@ _\name:
 .equ E_VR,                       E_AR + 8 ; and picture renderer
 .equ E_SESSION,                  E_VR + 8 ; the NSURLSession; its delegate calls run on the media queue
 .equ E_WAITGEN,                  E_SESSION + 8 ; w: the newest wait for a first picture
-.equ E_CLR,                      E_WAITGEN + 8 ; from here, cleared when media closes
+.equ E_SLOW,                     E_WAITGEN + 4 ; w: paused when net_tick last ran: its ticks slow down and no picture is held to its lead
+.equ E_SUBOBS,                   E_WAITGEN + 8 ; the subtitles' periodic observer, while a subtitle track is shown
+.equ E_HOLDGEN,                  E_SUBOBS + 8 ; w: the newest hold sent to the clock queue, the one it started, the one it finished
+.equ E_HOLDGO,                   E_HOLDGEN + 4
+.equ E_HOLDDONE,                 E_HOLDGO + 4
+.equ E_CLR,                      E_HOLDDONE + 8 ; from here, cleared when media closes
 .equ E_PARENT,                   E_CLR    ; the CMBlockBuffer over the mapped file
 .equ E_MAP,                      E_PARENT + 8
 .equ E_LEN,                      E_MAP + 8
@@ -993,12 +1452,14 @@ _\name:
 .equ E_MASTER,                   E_T0 + 8  ; the master playlist and its URL
 .equ E_MURL,                     E_MASTER + 8
 .equ E_BPS,                      E_MURL + 8 ; the measured network speed, bits per second
-.equ E_FIRSTMS,                  E_BPS + 8 ; the first picture shown after a seek, ms (+1), 0 none yet
+.equ E_FIRSTMS,                  E_BPS + 8 ; the first picture shown after a seek, ms (+1), 0 none yet; bit 63: ready on a poll already
 .equ E_LIVE,                     E_FIRSTMS + 8 ; w: a YouTube broadcast: Audio Only swaps its streams
+.equ E_PREV,                     E_LIVE + 4 ; w: a stream's seek showed its first picture already
 .equ E_SUBT,                     E_LIVE + 8 ; the subtitle track shown, 0 none
 .equ E_SUBN,                     E_SUBT + 8 ; its next cue, taken early (retained)
 .equ E_SUBEND,                   E_SUBN + 8 ; when the cue shown ends, track units
 .equ E_SUBON,                    E_SUBEND + 8 ; w: a cue is shown
+.equ E_M4A,                      E_SUBON + 4 ; w: 1 while AudioFileStream tries an M4A, 2 once it could not
 .equ E_CCT,                      E_SUBON + 4 + 4 ; the CC1 caption track, made when picked
 .equ E_CC,                       E_CCT + 8 ; its CEA-608 decoder and the captions waiting for presentation order (CC_*)
 .equ CC_MODE,                    0        ; w: 0 pop-on, 1 roll-up, 2 paint-on
@@ -1016,20 +1477,19 @@ _\name:
 .equ E_CLRN,                     E_TR + TRACKS * TR_SIZE - E_CLR
 .equ B_RQT,                      E_TR + TRACKS * TR_SIZE ; {task, record}[RQS]: requests running (media queue)
 .equ B_LTPATH,                   B_RQT + 16 * RQS ; char[1024], This Mac's file, for AVPlayer when the engine cannot play it (main)
-.equ B_LTVURL,                   B_LTPATH + 1024 ; char[4096], This Mac's picture: our HLS or a broadcast's own, or "" (main)
+.equ B_LTVURL,                   B_LTPATH + 1024 ; char[4096], YouTube's own HLS, for AirPlay, or "" (main)
 .equ B_VISITOR,                  B_LTVURL + 4096 ; char[288], the visitorData member once YouTube gave it (lock)
 .equ B_SUBL,                     B_VISITOR + 288 ; the subtitle layer, made on first use (main)
 .equ B_PIC,                      B_SUBL + 8 ; w: the picture's turn, width and height, as the view lays it out (main)
 .equ B_PIPE,                     B_PIC + 16 ; the engine picture's Picture in Picture controller, made on first use (main)
-.equ B_AIRK,                     B_PIPE + 8 ; w: what the dormant AVPlayer would play over AirPlay: 0 nothing, 1 B_LTPATH's file, 2 its URL, 3 B_LTVURL, 4 B_AIR's TV HLS (main)
-.equ B_AIR,                      B_AIRK + 8 ; a YouTube video for a TV: the picture's and sound's URLs and Fmts (main)
-.equ AIR_V,                      0        ; char[4096]
-.equ AIR_A,                      4096     ; char[4096]
-.equ AIR_VF,                     8192     ; Fmt
-.equ AIR_AF,                     AIR_VF + FMT_SIZE
-.equ AIR_SIZE,                   AIR_AF + FMT_SIZE
-.equ B_SIZE,                     B_AIR + AIR_SIZE
-	.lcomm	B, B_SIZE, 4
+.equ B_AIRK,                     B_PIPE + 8 ; w: what the dormant AVPlayer would play over AirPlay: 0 nothing, 1 B_LTPATH's file, 2 its URL, 3 B_LTVURL (main)
+.equ B_VTW,                      B_AIRK + 8 ; eng_init's parameter sets: pointers, sizes, the format, a session (media queue)
+.equ B_AFF,                      B_VTW + 64 ; pic_layout's turn: a, b, c, d, tx, ty (main)
+.equ B_TIMEB,                    B_AFF + 48 ; show_time's text (main)
+.equ B_MNEXT,                    B_TIMEB + 32 ; media_next's line after the one found
+.equ B_UJ,                       B_MNEXT + 8 ; char[4096], url_join's URI (media queue)
+.equ B_SIZE,                     B_UJ + 4096
+.equ GB_SIZE,                    ((G_SIZE + 15) & ~15) + B_SIZE ; G, then B, in one zeroed block from main
 
 	.text
 
@@ -1060,8 +1520,35 @@ Lpro1:
 Lsave1:
 	stp	x19, x20, [x29, #-16]
 	ret
+Lpro4m:
+	mov	x29, sp
+	sub	sp, sp, #64
+	stp	x25, x26, [x29, #-64]
+	b	Lsave3m
+Lpro3m:
+	mov	x29, sp
+	sub	sp, sp, #48
+Lsave3m:
+	stp	x23, x24, [x29, #-48]
+	b	Lsave2m
+Lpro2m:
+	mov	x29, sp
+	sub	sp, sp, #32
+Lsave2m:
+	stp	x21, x22, [x29, #-32]
+	b	Lsave1m
+Lpro1m:
+	mov	x29, sp
+	sub	sp, sp, #16
+Lsave1m:
+	stp	x19, x20, [x29, #-16]
+	mov	x19, x0
+	mov	x20, x1
+	ret
 
-; Lret<n> — epilogue of a FRAME with n pairs.
+; Lret<n> — epilogue of a FRAME with n pairs (Lnil4: returning 0).
+Lnil4:
+	mov	x0, #0
 Lret4:
 	ldp	x25, x26, [x29, #-64]
 Lret3:
@@ -1075,12 +1562,59 @@ Lret0:
 	ldp	x29, x30, [sp], #16
 	ret
 
+; L<selector> — objc_msgSend with that selector: stubs for the selectors sent most.
+LS_UTF8String:
+	ldr	x1, [x27, #S_UTF8String]
+	b	_objc_msgSend
+LS_stopRequestingMediaData:
+	ldr	x1, [x27, #S_stopRequestingMediaData]
+	b	_objc_msgSend
+LS_release:
+	ldr	x1, [x27, #S_release]
+	b	_objc_msgSend
+LS_response:
+	ldr	x1, [x27, #S_response]
+	b	_objc_msgSend
+LS_setValue_forHTTPHeaderField_:
+	ldr	x1, [x27, #S_setValue_forHTTPHeaderField_]
+	b	_objc_msgSend
+LS_retain:
+	ldr	x1, [x27, #S_retain]
+	b	_objc_msgSend
+LS_absoluteString:
+	ldr	x1, [x27, #S_absoluteString]
+	b	_objc_msgSend
+LS_bounds:
+	ldr	x1, [x27, #S_bounds]
+	b	_objc_msgSend
+LS_setRate_:
+	ldr	x1, [x27, #S_setRate_]
+	b	_objc_msgSend
+LS_statusCode:
+	ldr	x1, [x27, #S_statusCode]
+	b	_objc_msgSend
+LS_flush:
+	ldr	x1, [x27, #S_flush]
+	b	_objc_msgSend
+LS_currentItem:
+	ldr	x1, [x27, #S_currentItem]
+	b	_objc_msgSend
+LS_status:
+	ldr	x1, [x27, #S_status]
+	b	_objc_msgSend
+LS_setMuted_:
+	ldr	x1, [x27, #S_setMuted_]
+	b	_objc_msgSend
+
+; vm_entry — a method that is a UI program (x9): vm_run with x28 = G and x27 = B.
+vm_entry:
+	adr	x16, vm_run
 ; tramp — run x16 with x28 = G and x27 = B, keeping the caller's.
 tramp:
 	stp	x27, x28, [sp, #-32]!
 	str	x30, [sp, #16]
-	ADDR	x28, G
-	ADDR	x27, B
+	ADDR	x28, Ldl
+	ldp	x28, x27, [x28, #8]
 	blr	x16
 	ldr	x30, [sp, #16]
 	ldp	x27, x28, [sp], #32
@@ -1088,15 +1622,22 @@ tramp:
 
 ; Strings used in more than one place.
 	.pushsection __DATA,__data
-Ls_slash:	.asciz	"/"               ; Ls_slash+1 is ""
-Ls_crlf:	.asciz	"\r\n"
+Ls_slash:	.ascii	"/"
+Ls_empty:	.byte	0
 Ls_sep:	.asciz	"://"
-Ls_stream:	.asciz	"/stream/"
-Ls_mp4:	.asciz	"audio/mp4"
-Ls_range:	.asciz	"%lld-%lld"
-Ls_200:	.asciz	"HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lld\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
-Ls_206:	.asciz	"HTTP/1.1 206 Partial Content\r\nContent-Type: %s\r\nContent-Length: %lld\r\nContent-Range: bytes %lld-%lld/%lld\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
-Ls_404:	.asciz	"404 Not Found"
+Ls_xstream:	.asciz	"#EXT-X-STREAM-INF:"
+Ls_taudio:	.asciz	"TYPE=AUDIO"
+Ls_uri:	.asciz	"URI="
+Ls_bytes:	.asciz	"bytes=%lld-%lld"
+Ls_group:	.asciz	"GROUP-ID="
+Ls_tsubs:	.asciz	"TYPE=SUBTITLES"
+Ls_xmedia:	.asciz	"#EXT-X-MEDIA:"
+Ls_vmp4:	.asciz	"\"video/mp4"
+Ls_gvideo:	.asciz	"googlevideo"
+Ls_aac:	.asciz	"mp4a.40.2"
+Ls_url:	.asciz	"\"url\":"
+Ls_range:	.asciz	"Range"
+Ls_qend:	.asciz	"&?/#"
 	.popsection
 
 ; ---- Small utilities ----
@@ -1128,32 +1669,15 @@ Lbc_fail:
 	mov	x0, #0
 	b	Lret2
 
-; send_all(fd, data, len) — write every byte; w0 = 1 on success.
-send_all:
-	FRAME	2
-	mov	w19, w0
-	mov	x20, x1
-	mov	x21, x2
-Lsa_loop:
-	mov	w0, #1
-	cbz	x21, Lret2
-	mov	w0, w19
-	mov	x1, x20
-	mov	x2, x21
-	bl	_write
-	cmp	x0, #0
-	b.gt	Lsa_adv
-	mov	w0, #0
-	b	Lret2
-Lsa_adv:
-	add	x20, x20, x0
-	sub	x21, x21, x0
-	b	Lsa_loop
+; strtol10(text) -> its decimal number.
+strtol10:
+	mov	x1, #0
+	mov	w2, #10
+	b	_strtol
 
 ; nextstr(p) -> the string after p in a packed list.
 nextstr:
-	FRAME	1
-	mov	x19, x0
+	FRAME	1, 0, 1
 	bl	_strlen
 	add	x0, x19, x0
 	add	x0, x0, #1
@@ -1162,10 +1686,10 @@ nextstr:
 ; lock / unlock — take or release G's lock.
 lock:
 	add	x0, x28, #G_LOCK
-	b	_os_unfair_lock_lock
+	JUMPF	os_unfair_lock_lock
 unlock:
 	add	x0, x28, #G_LOCK
-	b	_os_unfair_lock_unlock
+	JUMPF	os_unfair_lock_unlock
 
 ; post_main(work, context) — run work(context) on the main thread.
 post_main:
@@ -1177,8 +1701,7 @@ post_main:
 
 ; play_resolve(job) — resolve the link, report to main.
 	ENTRY	play_resolve
-	FRAME	2
-	mov	x19, x0
+	FRAME	2, 0, 1
 	bl	_objc_autoreleasePoolPush
 	mov	x21, x0
 	mov	x0, x19
@@ -1211,93 +1734,7 @@ make_item:
 	SEND	S_retain
 	b	Lret0
 
-; slot_uri(text, out[256]) — serve a playlist under a fresh random token; out = its URL at loopback.
-slot_uri:
-	FRAME	3, 96
-	mov	x19, x0
-	mov	x21, x1
-	mov	x0, sp                    ; 128 random bits, printed as 32 hex digits
-	mov	x1, #16
-	bl	_arc4random_buf
-	ldp	x9, x10, [sp]
-	stp	x9, x10, [sp]
-	add	x0, sp, #48
-	mov	x1, #TOKEN_STRIDE
-	CSTR	x2, "%016llx%016llx"
-	bl	_snprintf
-	LOCK
-	ldr	w23, [x28, #G_SLOTI]
-	add	w9, w23, #1
-	and	w9, w9, #(SLOTS - 1)
-	str	w9, [x28, #G_SLOTI]
-	BADDR	x0, B_SLOTTOK
-	mov	x9, #TOKEN_STRIDE
-	madd	x0, x23, x9, x0
-	add	x1, sp, #48
-	mov	x2, #TOKEN_STRIDE
-	bl	_memcpy
-	add	x24, x28, #G_SLOTURL
-	ldr	x0, [x24, x23, lsl #3]
-	bl	_free                     ; the oldest is retired
-	mov	x0, x19
-	bl	_strdup
-	str	x0, [x24, x23, lsl #3]
-	UNLOCK
-	ldr	w9, [x28, #G_PORT]
-	add	x10, sp, #48
-	stp	x9, x10, [sp]
-	mov	x0, x21
-	mov	x1, #256
-	CSTR	x2, "http://127.0.0.1:%u/stream/%s.m3u8"
-	bl	_snprintf
-	b	Lret3
-
-; ---- Media proxy: streams YouTube to This Mac's player ----
-
-; respond(fd, status, message) — a complete plain-text response, e.g. status "404 Not Found".
-respond:
-	FRAME	2, 560
-	mov	w19, w0
-	mov	x20, x2
-	str	x1, [sp]
-	mov	x0, x2
-	bl	_strlen
-	stp	x0, x20, [sp, #8]
-	add	x0, sp, #48
-	mov	x1, #512
-	CSTR	x2, "HTTP/1.1 %s\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %zu\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n%s"
-	bl	_snprintf
-	mov	w2, w0
-	mov	w0, w19
-	add	x1, sp, #48
-	bl	send_all
-	b	Lret2
-
-; text_stream(fd, text, head) — a playlist made here.
-text_stream:
-	FRAME	2, 160
-	mov	w19, w0
-	mov	x20, x1
-	mov	w21, w2
-	mov	x0, x20
-	bl	_strlen
-	mov	x22, x0
-	str	x0, [sp]
-	add	x0, sp, #16
-	mov	x1, #144
-	CSTR	x2, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: %zu\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
-	bl	_snprintf
-	mov	w2, w0
-	mov	w0, w19
-	add	x1, sp, #16
-	bl	send_all
-	cbz	w0, Lret2
-	cbnz	w21, Lret2                ; HEAD
-	mov	w0, w19
-	mov	x1, x20
-	mov	x2, x22
-	bl	send_all
-	b	Lret2
+; ---- ISO BMFF boxes ----
 
 ; box_find(p, end, type) — x0 = the payload of the first box of that type in [p, end), x1 = its end; x0 = 0 if none. Uses x9-x13 only.
 box_find:
@@ -1335,179 +1772,6 @@ Lbf_none:
 	mov	x0, #0
 	ret
 
-; handle_conn(fd) — read one request and answer with the playlist its token names: the LAN server serves AirPlay receivers text only.
-	.equ H_REQ,	16
-	.equ H_SIZE,	H_REQ + REQ_MAX
-handle_conn:
-	FRAME	3, H_SIZE
-	mov	w19, w0
-	add	x20, sp, #H_REQ
-	mov	x21, #0
-Lhc_recv:
-	mov	x9, #(REQ_MAX - 1)
-	cmp	x21, x9
-	b.hs	Lhc_parse                 ; full: parse what there is
-	mov	w0, w19
-	add	x1, x20, x21
-	sub	x2, x9, x21
-	mov	w3, #0
-	bl	_recv
-	cmp	x0, #0
-	b.le	Lhc_close                 ; closed, error or SO_RCVTIMEO
-	add	x21, x21, x0
-	strb	wzr, [x20, x21]
-	mov	x0, x20
-	CSTR	x1, "\r\n\r\n"
-	bl	_strstr
-	cbz	x0, Lhc_recv
-Lhc_parse:
-	mov	x0, x20
-	mov	w1, #' '
-	bl	_strchr                   ; the path follows the method
-	CSTR	x1, "400 Bad Request"
-	cbz	x0, Lhc_reply
-	add	x21, x0, #1
-	mov	x0, x21
-	GADDR	x1, Ls_stream
-	mov	x2, #8
-	bl	_strncmp
-	GADDR	x1, Ls_404
-	cbnz	w0, Lhc_reply
-	add	x21, x21, #8              ; the token
-	mov	x22, #0                   ; a private copy of the text
-	LOCK
-	BADDR	x23, B_SLOTTOK
-	add	x24, x28, #G_SLOTURL
-Lhc_find:
-	mov	x0, x21
-	mov	x1, x23
-	mov	x2, #32
-	bl	_strncmp
-	cbz	w0, Lhc_hit
-	add	x23, x23, #TOKEN_STRIDE
-	add	x24, x24, #8
-	add	x9, x28, #(G_SLOTURL + 8 * SLOTS)
-	cmp	x24, x9
-	b.lo	Lhc_find
-	b	Lhc_unlock
-Lhc_hit:
-	ldr	x0, [x24]
-	cbz	x0, Lhc_unlock
-	bl	_strdup
-	mov	x22, x0
-Lhc_unlock:
-	UNLOCK
-	GADDR	x1, Ls_404
-	CSTR	x2, "unknown stream"
-	cbz	x22, Lhc_reply2
-	ldrb	w9, [x20]
-	cmp	w9, #'H'
-	cset	w2, eq                    ; HEAD: the response head only
-	mov	w0, w19
-	mov	x1, x22
-	bl	text_stream
-	mov	x0, x22
-	bl	_free
-	b	Lhc_close
-Lhc_reply:
-	GADDR	x2, Ls_slash+1
-Lhc_reply2:
-	mov	w0, w19
-	bl	respond
-Lhc_close:
-	mov	w0, w19
-	bl	_close
-	b	Lret3
-
-; server_run(fd) — accept this Mac and its LAN, one connection at a time.
-	ENTRY	server_run
-	FRAME	2, 48
-	mov	w19, w0
-Lsr_accept:
-	mov	w9, #16
-	str	w9, [sp, #32]
-	mov	w0, w19
-	add	x1, sp, #16
-	add	x2, sp, #32
-	bl	_accept
-	tbz	w0, #31, Lsr_peer
-	mov	w0, #ACCEPT_BACKOFF_US    ; e.g. out of descriptors: do not spin
-	bl	_usleep
-	b	Lsr_accept
-Lsr_peer:
-	mov	w20, w0
-	ldr	w9, [sp, #20]             ; the peer, network order like G_LAN
-	ldr	x10, [x28, #G_LAN]        ; one atomic load: address and mask agree
-	lsr	x11, x10, #32
-	eor	w12, w9, w10
-	tst	w12, w11
-	ccmp	w11, #0, #4, eq
-	b.ne	Lsr_ok                    ; same subnet
-	and	w12, w9, #0xff            ; the first octet
-	cmp	w12, #127
-	b.eq	Lsr_ok                    ; loopback
-	bl	_close
-	b	Lsr_accept
-Lsr_ok:
-	mov	x9, #CLIENT_TIMEOUT_S
-	stp	x9, xzr, [sp]             ; struct timeval
-	mov	w0, w20
-	mov	w1, #SOL_SOCKET
-	mov	w2, #SO_RCVTIMEO          ; a silent client cannot hold the server
-	mov	x3, sp
-	mov	w4, #16
-	bl	_setsockopt
-	mov	w0, w20
-	bl	handle_conn
-	b	Lsr_accept
-
-; server_start() — listen on an OS-assigned port and start the accept thread; w0 = 1 if listening.
-server_start:
-	FRAME	1, 48
-	mov	w0, #AF_INET
-	mov	w1, #SOCK_STREAM
-	mov	w2, #0
-	bl	_socket
-	mov	w19, w0
-	tbnz	w0, #31, Lss_fail
-	mov	w9, #SOCKADDR_IN_HEAD
-	stp	w9, wzr, [sp, #16]
-	str	xzr, [sp, #24]
-	add	x1, sp, #16
-	mov	w2, #16
-	bl	_bind                     ; every address (an AirPlay receiver fetches from the LAN one), on a port the system picks
-	cbnz	w0, Lss_close
-	mov	w0, w19
-	mov	w1, #64
-	bl	_listen
-	cbnz	w0, Lss_close
-	mov	w9, #16
-	str	w9, [sp, #32]
-	mov	w0, w19
-	add	x1, sp, #16
-	add	x2, sp, #32
-	bl	_getsockname
-	cbnz	w0, Lss_close
-	ldrh	w9, [sp, #18]
-	rev16	w9, w9
-	str	w9, [x28, #G_PORT]
-	add	x0, sp, #40
-	mov	x1, #0
-	adr	x2, server_run
-	mov	x3, x19
-	bl	_pthread_create
-	cbnz	w0, Lss_close
-	ldr	x0, [sp, #40]
-	bl	_pthread_detach
-	mov	w0, #1
-	b	Lret1
-Lss_close:
-	mov	w0, w19
-	bl	_close
-Lss_fail:
-	mov	w0, #0
-	b	Lret1
-
 ; ---- Resolver: a link or search text -> media URL and metadata (worker queue) ----
 
 ; is_link(text) — w0 = 1 for a link (no spaces, with a '.' and a '/'), 0 for search words.
@@ -1543,9 +1807,7 @@ Lid_keys:	.asciz	"v="
 	.byte	0
 	.popsection
 video_id:
-	FRAME	3
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	3, 0, 1
 	GADDR	x21, Lid_keys
 Lvi_key:
 	ldrb	w9, [x21]
@@ -1561,7 +1823,7 @@ Lvi_key:
 	cbz	x0, Lvi_key
 	add	x22, x0, x23              ; past the key
 	mov	x0, x22
-	CSTR	x1, "&?/#"
+	GADDR	x1, Ls_qend
 	bl	_strcspn
 	cmp	x0, #11
 	b.lo	Lvi_key
@@ -1590,9 +1852,7 @@ jfind:
 
 ; jstr(value, out, cap) — decode the JSON string at value into out; "" when it is not one.
 jstr:
-	FRAME	2
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	2, 0, 1
 	mov	x21, x2
 	strb	wzr, [x20]
 	cbz	x19, Lret2
@@ -1657,100 +1917,117 @@ Lje_end:
 
 ; resolve_file(job) -> PLAY_OK: a file on this Mac, by path or file URL; its name is the title.
 resolve_file:
-	FRAME	2
-	mov	x19, x0
-	mov	w9, #KIND_FILE
-	str	w9, [x19, #JOB_KIND]
-	ldr	x20, [x19, #JOB_QUERY]
-	ldrb	w9, [x20]
-	cmp	w9, #'/'
-	b.eq	Lrf_path
-	mov	x0, x20                   ; a file URL: its path becomes the query
-	bl	mkurl
-	SEND	S_path
-	SEND	S_UTF8String
-	cbz	x0, Lrf_path
-	bl	_strdup
-	cbz	x0, Lrf_path
-	mov	x21, x0
-	mov	x0, x20
-	bl	_free
-	str	x21, [x19, #JOB_QUERY]
-	mov	x20, x21
-Lrf_path:
-	mov	x0, x20
-	bl	mkstr
-	mov	x2, x0
-	CLASS	x0, NSURL
-	SEND	S_fileURLWithPath_
-	mov	x21, x0
-	SEND	S_absoluteString
-	SEND	S_UTF8String
-	mov	x1, x0
-	add	x0, x19, #JOB_URL
-	mov	x2, #4096
-	bl	_strlcpy
-	mov	x0, x21
-	mov	x1, x19
-	bl	url_title
-	b	Lret2
+	VM	Lp_rfile
+	.pushsection __DATA,__data
+Lp_rfile:
+	IMM	KIND_FILE
+	STW	0, JOB_KIND
+	GL	0
+	LDX	JOB_QUERY
+	SL	1
+	LDB	0
+	EQ	'/'
+	JNZ	Lp_rfile_path
+	NCALL	mkurl, "=b"               ; a file URL: its path becomes the query
+	MSG	S_path, "="
+	MSG	S_UTF8String, "="
+	JZ	Lp_rfile_path
+	CALL	F_strdup, "=V"
+	JZ	Lp_rfile_path
+	SL	2
+	CALL	F_free, "b"
+	GL	2
+	STX	0, JOB_QUERY
+	SL	1
+	HERE	Lp_rfile_path
+	NCALL	mkstr, "=b"
+	SL	2
+	CLS	NSURL
+	MSG	S_fileURLWithPath_, "=c"
+	SL	3
+	MSG	S_absoluteString, "="
+	MSG	S_UTF8String, "="
+	SL	2
+	GL	0
+	ADDH	JOB_URL
+	SL	4
+	CALL	F_strlcpy, "ecH"
+	.short	4096
+	NCALL	url_title, "=da"
+	OP_END
+	.popsection
 
 ; resolve_web(job) -> PLAY_OK for any other web address (https when it has no scheme), played as it is; PLAY_FAILED if it is not one.
+	.pushsection __DATA,__data
+Ls_https:	.asciz	"https://"
+Ls_notweb:	.asciz	"this is not a web address"
+	.popsection
 resolve_web:
-	FRAME	2, 16
-	mov	x19, x0
-	mov	w9, #KIND_WEB
-	str	w9, [x19, #JOB_KIND]
-	ldr	x20, [x19, #JOB_QUERY]
-	mov	x0, x20
-	GADDR	x1, Ls_sep
-	bl	_strstr
-	CSTR	x9, "https://"
-	GADDR	x10, Ls_slash+1
-	cmp	x0, #0
-	csel	x9, x10, x9, ne
-	stp	x9, x20, [sp]
-	add	x0, x19, #JOB_URL
-	mov	x1, #4096
-	CSTR	x2, "%s%s"
-	bl	_snprintf
-	add	x0, x19, #JOB_URL
-	bl	mkurl
-	cbz	x0, Lrw_bad
-	mov	x20, x0
-	SEND	S_host                    ; the site, where an artist would be
-	SEND	S_UTF8String
-	cbz	x0, Lrw_title
-	mov	x1, x0
-	add	x0, x19, #(JOB_TRACK + T_ARTIST)
-	mov	x2, #256
-	bl	_strlcpy
-Lrw_title:
-	mov	x0, x20
-	mov	x1, x19
-	bl	url_title
-	b	Lret2
-Lrw_bad:
-	CSTR	x9, "this is not a web address"
-	str	x9, [x19, #JOB_ERR]
-	mov	w0, #PLAY_FAILED
-	b	Lret2
+	VMT
+	IMM	KIND_WEB
+	STW	0, JOB_KIND
+	GL	0
+	LDX	JOB_QUERY
+	SL	1                         ; b: the address as typed
+	GL	0
+	ADDH	JOB_URL
+	SL	2                         ; c: where its URL goes
+	CALL	F_strstr, "=bP"
+	.long	Ls_sep - Lvm_base
+	JNZ	Lrw_copy
+	CALL	F_strlcpy, "cPH"          ; no scheme: https
+	.long	Ls_https - Lvm_base
+	.short	4096
+	GL	2
+	ADDI	8
+	SL	2
+	HERE	Lrw_copy
+	CALL	F_strlcpy, "cbH"
+	.short	4088
+	GL	0
+	ADDH	JOB_URL
+	NCALL	mkurl, "=V"
+	JZ	Lrw_bad
+	SL	3                         ; d: the URL
+	MSG	S_host, "="               ; the site, where an artist would be
+	MSG	S_UTF8String, "="
+	JZ	Lrw_title
+	SL	4
+	GL	0
+	ADDH	JOB_TRACK + T_ARTIST
+	SL	5
+	CALL	F_strlcpy, "feH"
+	.short	256
+	HERE	Lrw_title
+	NCALL	url_title, "=da"
+	OP_END
+	HERE	Lrw_bad
+	LEA	Ls_notweb
+	STX	0, JOB_ERR
+	IMM	PLAY_FAILED
+	OP_END
+	.p2align 2
 
 ; url_title(url, job) -> PLAY_OK, with the URL's last path component, without its extension, as the job's title.
 url_title:
-	FRAME	1
-	mov	x19, x1
-	SEND	S_URLByDeletingPathExtension
-	SEND	S_lastPathComponent
-	SEND	S_UTF8String
-	cbz	x0, Lut_ok
-	mov	x1, x0
-	add	x0, x19, #(JOB_TRACK + T_TITLE)
-	mov	x2, #512
-	bl	_strlcpy
-Lut_ok:
-	mov	w0, #PLAY_OK
-	b	Lret1
+	VM	Lp_utitle
+	.pushsection __DATA,__data
+Lp_utitle:
+	GL	0
+	MSG	S_URLByDeletingPathExtension, "="
+	MSG	S_lastPathComponent, "="
+	MSG	S_UTF8String, "="
+	JZ	Lp_utitle_ok
+	SL	2
+	GL	1
+	ADDH	JOB_TRACK + T_TITLE
+	SL	3
+	CALL	F_strlcpy, "dcH"
+	.short	512
+	HERE	Lp_utitle_ok
+	IMM	PLAY_OK
+	OP_END
+	.popsection
 
 ; resolve's frame, which api fills.
 	.equ RS_BUF,	16                ; {data, len}
@@ -1762,23 +2039,33 @@ Lut_ok:
 	.equ RS_SIZE,	2672
 
 ; api(endpoint, client, tail, frame) — POST to InnerTube as a client, into resolve's RS_BUF; w0 = 1 on success.
-	.equ AP_BODY,	32
+	.equ AP_NUM,	64                ; the name's number
+	.equ AP_BODY,	72
 api:
-	FRAME	4, 48
+	FRAME	4, 80
 	mov	x21, x0
 	mov	x20, x1
 	mov	x22, x2
 	add	x23, x3, #RS_BUF
 	add	x24, x3, #RS_VIS
-	mov	x0, x20
+	mov	x0, x20                   ; the client's fields: name, version (also a header), OS, its version, others, the name's number
 	bl	nextstr
-	mov	x25, x0                   ; context fields
+	str	x0, [sp]
 	bl	nextstr
-	mov	x26, x0                   ; the client's headers
-	stp	x25, x20, [sp]
-	stp	x24, x22, [sp, #16]
+	mov	x26, x0
+	str	x0, [sp, #8]
+	bl	nextstr
+	str	x0, [sp, #16]
+	bl	nextstr
+	str	x0, [sp, #24]
+	bl	nextstr
+	str	x0, [sp, #32]
+	bl	nextstr
+	str	x0, [sp, #AP_NUM]
+	stp	x20, x24, [sp, #40]
+	str	x22, [sp, #56]
 	add	x0, sp, #AP_BODY
-	CSTR	x1, "{\"context\":{\"client\":{%s\"hl\":\"en\",\"gl\":\"US\",\"userAgent\":\"%s\"%s}}%s"
+	CSTR	x1, "{\"context\":{\"client\":{\"clientName\":\"%s\",\"clientVersion\":\"%s\",\"osName\":\"%s\",\"osVersion\":\"%s\",%s\"hl\":\"en\",\"gl\":\"US\",\"userAgent\":\"%s\"%s}}%s"
 	bl	_asprintf
 	mov	w22, #0
 	ldr	x9, [sp, #AP_BODY]
@@ -1806,8 +2093,9 @@ Lapi_try:
 	mov	x0, x19                   ; headers: every request's, the client's, the endpoint's field mask
 	ADDR	x1, Lapi_headers
 	bl	hdrs
-	mov	x1, x26
-	bl	hdrs
+	ldr	x1, [sp, #AP_NUM]
+	mov	x2, x26
+	bl	ythdrs
 	mov	x0, x21
 	bl	nextstr
 	mov	x1, x0
@@ -1822,6 +2110,9 @@ Lapi_try:
 	mov	x2, x22
 	mov	x0, x19
 	SEND	S_setValue_forHTTPHeaderField_
+	mov	x0, x19                   ; Google's front end speaks QUIC: one round trip less to connect
+	mov	w2, #1
+	SEND	S_setAssumesHTTP3Capable_
 	mov	x0, x19
 	mov	x1, x23
 	bl	fetch
@@ -1834,6 +2125,24 @@ Lapi_free:
 	bl	_free
 	mov	w0, w22
 	b	Lret4
+
+; ythdrs(request, number, version) — YouTube's client headers.
+ythdrs:
+	VM	Lp_ythdrs
+	.pushsection __DATA,__data
+Lp_ythdrs:
+	NCALL	mkstr, "=b"
+	SL	3
+	GL	0
+	MSG	S_setValue_forHTTPHeaderField_, "dS"
+	.asciz	"X-YouTube-Client-Name"
+	NCALL	mkstr, "=c"
+	SL	3
+	GL	0
+	MSG	S_setValue_forHTTPHeaderField_, "dS"
+	.asciz	"X-YouTube-Client-Version"
+	OP_END
+	.popsection
 
 ; within(needle) — the needle in parse_player's current format [x21, x25), or NULL.
 within:
@@ -1854,9 +2163,7 @@ jnum:
 	ldrb	w9, [x0]
 	cmp	w9, #'"'
 	cinc	x0, x0, eq
-	mov	x1, #0
-	mov	w2, #10
-	bl	_strtol
+	bl	strtol10
 	b	Lret0
 
 ; fmt_info(start, end, fmt) — a format's init and index byte ranges, bitrate and codecs, from its JSON [start, end).
@@ -1891,9 +2198,7 @@ Lfi_rate:
 	bl	within
 	cbz	x0, Lfi_codecs
 	add	x0, x0, #10
-	mov	x1, #0
-	mov	w2, #10
-	bl	_strtol
+	bl	strtol10
 	str	x0, [x19, #FMT_RATE]
 Lfi_codecs:
 	CSTR	x0, "codecs=\\\""            ; in the JSON text: codecs=\"...\"
@@ -1918,14 +2223,10 @@ Lfi_codecs:
 Lk_itag:	.asciz	"\"itag\":"
 	.popsection
 parse_player:
-	FRAME	4, 80                     ; the best picture's "url" value and score, its JSON span, the sound's span, the TV's picture's value, score, span
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	4, 48, 1	; the best picture's "url" value and score, its JSON span, the sound's span
 	stp	xzr, xzr, [sp]
 	stp	xzr, xzr, [sp, #16]
 	stp	xzr, xzr, [sp, #32]
-	stp	xzr, xzr, [sp, #48]
-	stp	xzr, xzr, [sp, #64]
 	mov	x0, x1
 	CSTR	x1, "\"streamingData\":"
 	bl	_strstr
@@ -1939,9 +2240,7 @@ Lpp_fmt:
 	bl	jfind
 	cbz	x0, Lpp_picked
 	mov	x21, x0
-	mov	x1, #0
-	mov	w2, #10
-	bl	_strtol
+	bl	strtol10
 	mov	x24, x0
 	mov	x0, x21
 	GADDR	x1, Lk_itag
@@ -1953,14 +2252,14 @@ Lpp_fmt:
 	bl	_strstr
 	mov	x25, x0
 Lpp_one:
-	CSTR	x0, "\"url\":"
+	GADDR	x0, Ls_url
 	bl	within
 	cbz	x0, Lpp_fmt               ; no plain URL (a cipher or SABR)
 	add	x26, x0, #6
 	CSTR	x0, "mp4a"
 	bl	within
 	cbz	x0, Lpp_video             ; not AAC: the HLS made here carries AAC
-	CSTR	x0, "\"video/mp4"
+	GADDR	x0, Ls_vmp4
 	bl	within
 	cbnz	x0, Lpp_fmt
 	cmp	x24, #140                 ; score: the original track 8, itag 140 4, audio only 2, no loudness compression 1
@@ -1988,7 +2287,7 @@ Lpp_score:
 	stp	x21, x25, [sp, #32]
 	b	Lpp_fmt
 Lpp_video:
-	CSTR	x0, "\"video/mp4"         ; a picture: MP4, SDR, H.264 (or AV1 where it decodes in hardware)
+	GADDR	x0, Ls_vmp4         ; a picture: MP4, SDR, H.264 (or AV1 where it decodes in hardware)
 	bl	within
 	cbz	x0, Lpp_fmt
 	CSTR	x0, "HDR"
@@ -2009,9 +2308,7 @@ Lpp_height:
 	bl	within
 	cbz	x0, Lpp_fmt
 	add	x0, x0, #9
-	mov	x1, #0
-	mov	w2, #10
-	bl	_strtol
+	bl	strtol10
 	cmp	x0, #VIDEO_MAX_H
 	b.gt	Lpp_fmt
 	add	x24, x24, x0, lsl #2      ; score: height, then 60 fps, then the codec
@@ -2019,23 +2316,12 @@ Lpp_height:
 	bl	within
 	cbz	x0, Lpp_vscore
 	add	x0, x0, #6
-	mov	x1, #0
-	mov	w2, #10
-	bl	_strtol
+	bl	strtol10
 	cmp	x0, #30
 	cset	x9, gt
 	add	x24, x24, x9, lsl #1
 Lpp_vscore:
-	tbnz	x24, #0, 1f               ; a TV's: the best H.264 up to 1080p
-	mov	x9, #((1080 << 2) | 3)
-	cmp	x24, x9
-	b.hi	1f
-	ldr	x9, [sp, #56]
-	cmp	x24, x9
-	b.le	1f
-	stp	x26, x24, [sp, #48]
-	stp	x21, x25, [sp, #64]
-1:	ldr	x9, [sp, #8]
+	ldr	x9, [sp, #8]
 	cmp	x24, x9
 	b.le	Lpp_fmt
 	stp	x26, x24, [sp]
@@ -2050,15 +2336,7 @@ Lpp_picked:
 	add	x2, x19, #JOB_VFMT
 	cbz	x0, 1f
 	bl	fmt_info
-1:	ldp	x0, x1, [sp, #64]
-	ADDO	x2, x19, JOB_TVFMT
-	cbz	x0, 1f
-	bl	fmt_info
-1:	ldr	x0, [sp, #48]
-	ADDO	x1, x19, JOB_TVURL
-	mov	x2, #4096
-	bl	jstr
-	ldr	x0, [sp]
+1:	ldr	x0, [sp]
 	ADDO	x1, x19, JOB_VURL
 	mov	x2, #4096
 	bl	jstr
@@ -2095,7 +2373,7 @@ Lpp_picked:
 	mov	x22, #0
 Lpp_thumb:
 	mov	x0, x21
-	CSTR	x1, "\"url\":"
+	GADDR	x1, Ls_url
 	bl	_strstr
 	cbz	x0, Lpp_tpick
 	cmp	x0, x25
@@ -2113,11 +2391,15 @@ Lpp_thumbed:
 	CSTR	x1, "\"lengthSeconds\":\""
 	bl	jfind
 	cbz	x0, Lpp_live
-	mov	x1, #0
-	mov	w2, #10
-	bl	_strtol
+	bl	strtol10
 	str	x0, [x19, #JOB_DUR]
 Lpp_live:
+	mov	x0, x20                   ; YouTube's own HLS, when offered: AirPlay's, and a live broadcast's picture
+	CSTR	x1, "\"hlsManifestUrl\":"
+	bl	jfind
+	ADDO	x1, x19, JOB_HLS
+	mov	x2, #4096
+	bl	jstr
 	mov	x0, x20
 	CSTR	x1, "\"isLive\":true"
 	bl	_strstr
@@ -2126,12 +2408,10 @@ Lpp_live:
 	str	w9, [x19, #JOB_LIVE]
 	cbz	w9, Lpp_yes
 	str	xzr, [x19, #JOB_DUR]      ; a live broadcast has no length
-	mov	x0, x20                   ; its picture: YouTube's own HLS, when offered
-	CSTR	x1, "\"hlsManifestUrl\":"
-	bl	jfind
-	ADDO	x1, x19, JOB_VURL
+	ADDO	x0, x19, JOB_VURL
+	ADDO	x1, x19, JOB_HLS
 	mov	x2, #4096
-	bl	jstr
+	bl	_strlcpy
 Lpp_yes:
 	mov	w0, #1
 	b	Lret4
@@ -2142,8 +2422,7 @@ Lpp_no:
 	add	x1, x19, #JOB_MSG
 	mov	x2, #128
 	bl	jstr
-	mov	w0, #0
-	b	Lret4
+	b	Lnil4
 
 ; resolve(job) -> PLAY_OK with the job's stream and track filled, or PLAY_FAILED (JOB_ERR says why, when known).
 resolve:
@@ -2170,12 +2449,12 @@ resolve:
 	cmp	x0, #0
 	csel	x23, x9, x22, ne
 	mov	x0, x23
-	CSTR	x1, "&?/#"
+	GADDR	x1, Ls_qend
 	bl	_strcspn
 	add	x24, x23, x0
 	mov	x0, x23
 	CSTR	x1, "youtu"
-	bl	_strcasestr
+	CALLF	strcasestr
 	cmp	x0, #0
 	ccmp	x0, x24, #2, ne
 	b.lo	Lrs_tube
@@ -2273,7 +2552,7 @@ Lrs_player:
 	mov	w24, #16
 Lrs_cpn:
 	mov	w0, #64
-	bl	_arc4random_uniform
+	CALLF	arc4random_uniform
 	CSTR	x9, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
 	ldrb	w9, [x9, w0, uxtw]
 	strb	w9, [x23], #1
@@ -2341,8 +2620,7 @@ mkstr:
 
 ; setstr(control, cstr) — control.stringValue = cstr.
 setstr:
-	FRAME	1
-	mov	x19, x0
+	FRAME	1, 0, 1
 	mov	x0, x1
 	bl	mkstr
 	mov	x2, x0
@@ -2365,57 +2643,274 @@ frame_rect:
 	scvtf	d3, w9
 	ret
 
-; ui_run(program) — run a UI program (written with the OP_END STO LD ADDV CLS CALL MSG macros, argument kinds in Lk_table).
+; ui_run(program) — run a UI program (written with the macros of the Tables, argument kinds in Lk_table, operations in Lop_table).
 	.equ VM_INT,	0                 ; x0-x7
 	.equ VM_DBL,	64                ; d0-d5
-	.equ VM_SIZE,	112
+	.equ VM_LOC,	112               ; locals a-h
+	.equ VM_F,	176               ; the caller's d8: the programs' double accumulator f
+	.equ VM_SIZE,	192
+	.equ OP_CALL,	5                 ; operations told apart inside their handlers
+	.equ OP_JMP,	14
+	.equ OP_IMM,	17
+	.equ OP_MSGR,	64
+	.equ OP_LDX,	68
+	.equ OP_SL,	23
 ui_run:
+	mov	x9, x0
+; vm_run(arguments, program x9) -> x0 = the program's current object at its end; its locals a-h start as x0-x7.
+vm_run:
+Lvm_base:
 	FRAME	4, VM_SIZE
-	mov	x19, x0
+	stp	x0, x1, [sp, #VM_LOC]
+	stp	x2, x3, [sp, #(VM_LOC + 16)]
+	stp	x4, x5, [sp, #(VM_LOC + 32)]
+	stp	x6, x7, [sp, #(VM_LOC + 48)]
+	str	d8, [sp, #VM_F]
+	mov	x19, x9
 Lvm_op:
 	ldrb	w9, [x19], #1
-	cbz	w9, Lret4
-	cmp	w9, #3
-	b.hi	Lvm_reg
-	b.eq	Lvm_add
+	adr	x10, Lop_table
+	ldrb	w10, [x10, x9]
+	adr	x11, Lop_base
+	add	x11, x11, x10, lsl #2
+	br	x11
+Lop_base:
+Lop_end:
+	mov	x0, x20
+	ldr	d8, [sp, #VM_F]
+	b	Lret4
+Lop_fls:
+	ldrb	w10, [x19], #1            ; f and a local: FL loads, FS stores
+	add	x10, sp, x10, lsl #3
+	tbnz	w9, #0, 1f
+	ldr	d8, [x10, #VM_LOC]
+	b	Lvm_op
+1:	str	d8, [x10, #VM_LOC]
+	b	Lvm_op
+Lop_fk:
+	ldrh	w10, [x19], #2            ; f = n / 16
+	ucvtf	d8, w10, #4
+	b	Lvm_op
+Lop_fi:
+	tbz	w9, #0, 1f                ; FI: f = current; FT: current = f, truncated
+	scvtf	d8, x20
+	b	Lvm_op
+1:	fcvtzs	x20, d8
+	b	Lvm_op
+Lop_fop:
+	ldrb	w11, [x19], #1            ; f = f op a local (FOP) or n / 16 (FOPK)
+	tbz	w9, #0, 1f
 	ldrb	w10, [x19], #1
+	add	x10, sp, x10, lsl #3
+	ldr	d1, [x10, #VM_LOC]
+	b	2f
+1:	ldrh	w10, [x19], #2
+	ucvtf	d1, w10, #4
+2:	adr	x12, Lfop_base
+	add	x12, x12, x11, lsl #3
+	br	x12
+Lfop_base:
+	fadd	d8, d8, d1                ; 0
+	b	Lvm_op
+	fsub	d8, d8, d1                ; 1
+	b	Lvm_op
+	fmul	d8, d8, d1                ; 2
+	b	Lvm_op
+	fdiv	d8, d8, d1                ; 3
+	b	Lvm_op
+	fmin	d8, d8, d1                ; 4
+	b	Lvm_op
+	fmax	d8, d8, d1                ; 5
+	b	Lvm_op
+	fcmp	d8, d1                    ; 6: current = f > it
+	b	Lfop_gt
+	frintp	d8, d8                    ; 7: up to a whole number
+	b	Lvm_op
+	frintm	d8, d8                    ; 8: down
+	b	Lvm_op
+	fabd	d8, d8, d1                ; 9: the distance
+	b	Lvm_op
+Lfop_gt:
+	cset	x20, gt
+	b	Lvm_op
+Lop_slot:
+	ldrb	w10, [x19], #1            ; a G slot
 	add	x10, x28, x10, lsl #3
-	cmp	w9, #1
-	b.ne	Lvm_load
+Lop_ls:
+	tbz	w9, #0, 1f                ; odd operations store, even ones load
 	str	x20, [x10]
 	b	Lvm_op
-Lvm_load:
-	ldr	x20, [x10]
+1:	ldr	x20, [x10]
 	b	Lvm_op
-Lvm_add:
+Lop_field:
+	ldrh	w10, [x19], #2            ; a B field
+	add	x10, x27, x10
+	b	Lop_ls
+Lop_wfield:
+	ldrh	w10, [x19], #2            ; a B word
+	add	x10, x27, x10
+	b	Lop_wls
+Lop_word:
+	ldrb	w10, [x19], #1            ; a G word, at 4 * n
+	add	x10, x28, x10, lsl #2
+Lop_wls:
+	tbz	w9, #0, 1f
+	ldr	w20, [x10]
+	b	Lvm_op
+1:	str	w20, [x10]
+	b	Lvm_op
+Lop_local:
+	sub	w10, w9, #OP_SL           ; a local a-h: store, load, compare, add, subtract
+	and	w11, w10, #7
+	add	x11, sp, x11, lsl #3
+	ldr	x12, [x11, #VM_LOC]
+	lsr	w10, w10, #3
+	cbnz	w10, 1f
+	str	x20, [x11, #VM_LOC]
+	b	Lvm_op
+1:	cmp	w10, #2
+	b.lo	Lop_set
+	b.eq	Lop_eq
+	cmp	w10, #4
+	b.eq	2f
+	add	x20, x20, x12
+	b	Lvm_op
+2:	sub	x20, x20, x12
+	b	Lvm_op
+Lop_slotc:
+	ldrb	w10, [x19], #1            ; compared with a G slot
+	ldr	x12, [x28, x10, lsl #3]
+Lop_eq:
+	cmp	x20, x12
+	cset	x20, eq
+	b	Lvm_op
+Lop_imm:
+	ldrsb	x12, [x19], #1            ; a small number: set, add, compare, a bit, a shift
+	sub	w10, w9, #OP_IMM
+	cbz	w10, Lop_set
+	cmp	w10, #2
+	b.lo	1f
+	b.eq	Lop_eq
+	cmp	w10, #4
+	b.lo	2f
+	b.eq	3f
+	lsl	x20, x20, x12
+	b	Lvm_op
+1:	add	x20, x20, x12
+	b	Lvm_op
+2:	cmp	x20, x12
+	cset	x20, lt
+	b	Lvm_op
+3:	lsr	x20, x20, x12
+	and	x20, x20, #1
+	b	Lvm_op
+Lop_set:
+	mov	x20, x12
+	b	Lvm_op
+Lop_mem:
+	sub	w10, w9, #OP_LDX          ; memory at current or at a local, plus an offset
+	cmp	w10, #9
+	b.lo	1f
+	ldrb	w11, [x19], #1            ; stores: into local n's pointer
+	add	x11, sp, x11, lsl #3
+	ldr	x11, [x11, #VM_LOC]
+1:	ldrh	w12, [x19], #2
+	adr	x13, Lmem_base
+	add	x13, x13, x10, lsl #3
+	br	x13
+Lmem_base:
+	ldr	x20, [x20, x12]           ; LDX
+	b	Lvm_op
+	ldr	w20, [x20, x12]           ; LDW
+	b	Lvm_op
+	ldrb	w20, [x20, x12]           ; LDB
+	b	Lvm_op
+	add	x20, x20, x12             ; ADDH
+	b	Lvm_op
+	mul	x20, x20, x12             ; MULH
+	b	Lvm_op
+	sdiv	x20, x20, x12             ; DIVH
+	b	Lvm_op
+	and	x20, x20, x12             ; ANDH
+	b	Lvm_op
+	add	x20, x27, x12             ; LEAB
+	b	Lvm_op
+	b	Lop_be                    ; LDBE
+	nop
+	str	x20, [x11, x12]           ; STX
+	b	Lvm_op
+	str	w20, [x11, x12]           ; STW
+	b	Lvm_op
+Lop_be:
+	ldr	w20, [x20, x12]           ; a big-endian word
+	rev	w20, w20
+	b	Lvm_op
+Lop_jump:
+	ldrsb	x10, [x19], #1            ; from the next operation
+	cmp	w9, #OP_JMP
+	b.eq	1f
+	cmp	x20, #0
+	cset	w11, ne
+	eor	w11, w11, w9              ; JZ is even, JNZ odd
+	tbnz	w11, #0, Lvm_op
+1:	add	x19, x19, x10
+	b	Lvm_op
+Lop_add:
 	ldr	x0, [x28, #G_CONTENT]
 	mov	x2, x20
 	SEND	S_addSubview_
 	b	Lvm_op
-Lvm_reg:
+Lop_reg:
 	ldrb	w10, [x19], #1            ; an index
-	cmp	w9, #5
-	b.hi	Lvm_msg
 	add	x11, x27, #B_REG
-	ldr	x24, [x11, x10, lsl #3]   ; 4: a class, 5: a function
-	b.eq	Lvm_call
+	ldr	x24, [x11, x10, lsl #3]   ; a class, or a function
+	cmp	w9, #OP_CALL
+	b.eq	Lop_call
 	mov	x20, x24
 	b	Lvm_op
-Lvm_call:
+Lop_lea:
+	ldrsw	x10, [x19], #4            ; an address here, in bytes from Lvm_base
+	adr	x20, Lvm_base
+	add	x20, x20, x10
+	b	Lvm_op
+Lop_native:
+	ldrsw	x10, [x19], #4            ; a function here, in bytes from Lvm_base
+	adr	x24, Lvm_base
+	add	x24, x24, x10
+Lop_call:
 	mov	x22, #0                   ; its arguments start at x0
 	b	Lvm_args
-Lvm_msg:
+Lop_method:
+	ldr	x24, [x27, #F_class_addMethod] ; a method of the current class
+	mov	x22, #0
+	adr	x21, Lk_method
+	b	Lvm_fixed
+Lop_item:
+	ldr	x20, [x28, #G_T1]         ; an item of the current menu
+	ldr	x1, [x27, #S_addItemWithTitle_action_keyEquivalent_]
+	adr	x21, Lk_item
+	b	Lvm_recv
+Lop_msgk:
+	adr	x21, Lk_short - 2 * OP_MSGR ; kinds "=", "I", "O" or none
+	add	x21, x21, x9, lsl #1
+	b	1f
+Lop_msg:
+	mov	x21, #0
+1:	ldrb	w10, [x19], #1
 	BADDR	x11, B_SEL
 	ldr	x1, [x11, x10, lsl #3]
+Lvm_recv:
 	stp	x20, x1, [sp, #VM_INT]    ; receiver, selector
 	ldr	x24, [x27, #F_objc_msgSend]
 	mov	x22, #2
+	cbnz	x21, Lvm_fixed
 Lvm_args:
-	ldrb	w26, [x19]                ; '=': the result becomes current
-	mov	x21, x19                  ; kinds
+	mov	x21, x19                  ; kinds, then their arguments
 	mov	x0, x19
 	bl	nextstr
-	mov	x19, x0                   ; arguments
+	mov	x19, x0
+Lvm_fixed:
+	ldrb	w26, [x21]                ; '=': the result becomes current
 	mov	x23, #0
 Lvm_kind:
 	ldrb	w9, [x21], #1
@@ -2475,6 +2970,23 @@ Lvm_d:
 Lk_byte:
 	ldrb	w0, [x19], #1
 	b	Lvm_i
+Lk_sbyte:
+	ldrsb	x0, [x19], #1
+	b	Lvm_i
+Lk_half:
+	ldrh	w0, [x19], #2
+	b	Lvm_i
+Lk_mem:
+	ldrb	w9, [x19], #1             ; inline bytes: their address
+	mov	x0, x19
+	add	x19, x19, x9
+	b	Lvm_i
+Lk_locd:
+	ldrb	w9, [x19], #1             ; a local, as a double
+	add	x9, sp, x9, lsl #3
+	ldr	x9, [x9, #VM_LOC]
+	scvtf	d0, x9
+	b	Lvm_d
 Lk_word:
 	ldr	w0, [x19], #4
 	b	Lvm_i
@@ -2486,6 +2998,45 @@ Lk_quad:
 Lk_buf:
 	ldrh	w9, [x19], #2
 	add	x0, x27, x9
+	b	Lvm_i
+Lk_field:
+	ldrh	w9, [x19], #2             ; a B field's value
+	ldr	x0, [x27, x9]
+	b	Lvm_i
+Lk_code:
+	ldrsw	x9, [x19], #4             ; a function here
+	adr	x0, Lvm_base
+	add	x0, x0, x9
+	b	Lvm_i
+Lk_ldbl:
+	ldrb	w9, [x19], #1             ; a local: a double (Z) or a float (W)
+	add	x10, sp, x9, lsl #3
+	ldr	d0, [x10, #VM_LOC]
+	b	Lvm_d
+Lk_lflt:
+	ldrb	w9, [x19], #1
+	add	x10, sp, x9, lsl #3
+	ldr	d0, [x10, #VM_LOC]
+	fcvt	s0, d0
+	b	Lvm_d
+Lk_f:
+	fmov	d0, d8                    ; f
+	b	Lvm_d
+Lk_act:
+	ldrb	w9, [x19], #1             ; an action's or method's selector
+	BADDR	x10, B_ACT
+	ldr	x0, [x10, x9, lsl #3]
+	b	Lvm_i
+Lk_loc:
+	sub	w9, w9, #'a'              ; a local
+	add	x9, sp, x9, lsl #3
+	ldr	x0, [x9, #VM_LOC]
+	b	Lvm_i
+Lk_types:
+	ldrb	w9, [x19]                 ; a method's types: "" for - (void)action:(id)sender
+	cbnz	w9, Lk_cstr
+	add	x19, x19, #1
+	adr	x0, Lk_action
 	b	Lvm_i
 Lk_cur:
 	mov	x0, x20
@@ -2523,10 +3074,24 @@ Lvm_send:
 	ldp	d2, d3, [sp, #(VM_DBL + 16)]
 	ldp	d4, d5, [sp, #(VM_DBL + 32)]
 	blr	x24
-	cmp	w26, #'='
+	cmp	w26, #'='                 ; '=': the result becomes current, '>': its low word, '@': d0 truncated
 	csel	x20, x0, x20, eq
+	cmp	w26, #'>'
+	b.ne	1f
+	mov	w20, w0
+1:	cmp	w26, #'@'
+	b.ne	1f
+	fcvtzs	x20, d0
+1:	cmp	w26, #'?'                 ; '?': x0 current, x1 into local h; '^': d0-d3 into e-h
+	b.ne	1f
+	mov	x20, x0
+	str	x1, [sp, #(VM_LOC + 56)]
+1:	cmp	w26, #'^'
+	b.ne	Lvm_op
+	stp	d0, d1, [sp, #(VM_LOC + 32)]
+	stp	d2, d3, [sp, #(VM_LOC + 48)]
 	b	Lvm_op
-; Lk_table — the handler of each kind from '=' to 'X', in instructions after Lk_base.
+; Lk_table — the handler of each kind from '=' to 'h', in instructions after Lk_base.
 .macro KIND handler
 	.byte	(\handler - Lk_base) >> 2
 .endm
@@ -2539,35 +3104,75 @@ Lk_table:
 	KIND	Lk_buf                    ; B
 	KIND	Lk_cstr                   ; C
 	KIND	Lk_dbl                    ; D
-	KIND	Lk_skip
+	KIND	Lk_field                  ; E
 	KIND	Lk_ext                    ; F
 	KIND	Lk_skip
-	KIND	Lk_skip
+	KIND	Lk_half                   ; H
 	KIND	Lk_byte                   ; I
-	KIND	Lk_skip
+	KIND	Lk_sbyte                  ; J
 	KIND	Lk_unit                   ; K
 	KIND	Lk_sel                    ; L
-	KIND	Lk_skip
+	KIND	Lk_mem                    ; M
 	KIND	Lk_raw                    ; N
 	KIND	Lk_slot                   ; O
-	KIND	Lk_skip
+	KIND	Lk_code                   ; P
 	KIND	Lk_quad                   ; Q
 	KIND	Lk_rect                   ; R
 	KIND	Lk_str                    ; S
-	KIND	Lk_skip
-	KIND	Lk_skip
+	KIND	Lk_types                  ; T
+	KIND	Lk_locd                   ; U
 	KIND	Lk_cur                    ; V
-	KIND	Lk_skip
+	KIND	Lk_lflt                   ; W
 	KIND	Lk_word                   ; X
+	KIND	Lk_act                    ; Y
+	KIND	Lk_ldbl                   ; Z
+	KIND	Lk_f                      ; [
+	.rept	5                         ; \ to `
+	KIND	Lk_skip
+	.endr
+	.rept	8                         ; a to h
+	KIND	Lk_loc
+	.endr
+; Lop_table — the handler of each operation, in instructions after Lop_base.
+.macro OP handler, n=1
+	.rept	\n
+	.byte	(\handler - Lop_base) >> 2
+	.endr
+.endm
+Lop_table:
+	OP	Lop_end                   ; 0
+	OP	Lop_slot, 2               ; 1 STO, 2 LD
+	OP	Lop_add                   ; 3 ADDV
+	OP	Lop_reg, 2                ; 4 CLS, 5 CALL
+	OP	Lop_msg                   ; 6 MSG
+	OP	Lop_method                ; 7 METHOD
+	OP	Lop_item                  ; 8 ITEM
+	OP	Lop_field, 2              ; 9 STE, 10 LDE
+	OP	Lop_native                ; 11 NCALL
+	OP	Lop_jump, 3               ; 12 JZ, 13 JNZ, 14 JMP
+	OP	Lop_word, 2               ; 15 LW, 16 SW
+	OP	Lop_imm, 6                ; 17 IMM, 18 ADDI, 19 EQ, 20 LT, 21 BIT, 22 SHL
+	OP	Lop_local, 40             ; 23 SL, 31 GL, 39 EQL, 47 ADDL, 55 SUBL, of a-h
+	OP	Lop_slotc                 ; 63 EQS
+	OP	Lop_msgk, 4               ; 64-67: MSG with kinds "=", "I", "O", none
+	OP	Lop_mem, 11               ; 68 LDX, 69 LDW, 70 LDB at current + offset, 71 ADDH, 72 MULH, 73 DIVH, 74 ANDH, 75 LEAB, 76 LDBE, 77 STX, 78 STW into a local + offset
+	OP	Lop_wfield, 2             ; 79 LDEW, 80 STEW
+	OP	Lop_lea                   ; 81 LEA
+	OP	Lop_fls, 2                ; 82 FL, 83 FS
+	OP	Lop_fk                    ; 84 FK
+	OP	Lop_fi, 2                 ; 85 FI, 86 FT
+	OP	Lop_fop, 2                ; 87 FOP, 88 FOPK
+Lk_short:	.ascii	"=\0I\0O\0\0\0"
+Lk_method:	.asciz	"VYPT"                    ; class_addMethod(class, sel, imp, types)
+Lk_item:	.asciz	"=SYS"                      ; addItemWithTitle:action:keyEquivalent:
+Lk_action:	.asciz	"v@:@"
 	.p2align 2
 
 ; ---- Rendering ----
 
 ; cache_update(cache, text, cap) — w0 = 1, and copy, if text changed.
 cache_update:
-	FRAME	2
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	2, 0, 1
 	mov	x21, x2
 	bl	_strcmp
 	cbz	w0, Lret2
@@ -2580,365 +3185,471 @@ cache_update:
 
 ; show_track(title, artist) — the track in the bar and as the window's title (Window menu, Mission Control), when it changed.
 show_track:
-	FRAME	3
-	mov	x19, x0
-	mov	x20, x1
-	BADDR	x0, B_UITITLE
-	mov	x1, x19
-	mov	x2, #512
-	bl	cache_update
-	mov	w21, w0
-	BADDR	x0, B_UIARTIST
-	mov	x1, x20
-	mov	x2, #256
-	bl	cache_update
-	orr	w0, w0, w21
-	cbz	w0, Lret3
-	mov	x22, x19
-	ldrb	w9, [x19]
-	cbnz	w9, Ltr_show
-	CSTR	x22, "Beam"
-Ltr_show:
-	ldr	x0, [x28, #G_TITLE]
-	mov	x1, x19
-	bl	setstr
-	ldr	x0, [x28, #G_ARTIST]
-	mov	x1, x20
-	bl	setstr
-	ldrb	w9, [x20]                 ; a lone title sits in the middle of its row
-	mov	w10, #(ROW2_C + 1)
-	mov	w11, #(ROW2_C - 9)
-	cmp	w9, #0
-	csel	w9, w10, w11, ne
-	scvtf	d1, w9
-	fmov	d0, #16.0
-	ldr	x0, [x28, #G_TITLE]
-	SEND	S_setFrameOrigin_
-	mov	x0, x22
-	bl	mkstr
-	mov	x2, x0
-	ldr	x0, [x28, #G_WIN]
-	SEND	S_setTitle_
-	b	Lret3
+	VM	Lp_track
+	.pushsection __DATA,__data
+Lp_track:
+	NCALL	cache_update, "=BaH"
+	.short	B_UITITLE, 512
+	SL	2
+	NCALL	cache_update, "=BbH"
+	.short	B_UIARTIST, 256
+	ADDL	2
+	JZ	Lp_track_end
+	LD	G_TITLE
+	NCALL	setstr, "Va"
+	LD	G_ARTIST
+	NCALL	setstr, "Vb"
+	CALL	F_strlen, "=b"
+	JZ	Lp_track_lone
+	LD	G_TITLE
+	MSG	S_setFrameOrigin_, "DD"
+	.short	16 * 4, (ROW2_C + 1) * 4
+	JMP	Lp_track_win
+	HERE	Lp_track_lone
+	LD	G_TITLE                   ; a lone title sits in the middle of its row
+	MSG	S_setFrameOrigin_, "DD"
+	.short	16 * 4, (ROW2_C - 9) * 4
+	HERE	Lp_track_win
+	CALL	F_strlen, "=a"
+	JNZ	Lp_track_named
+	LD	G_WIN
+	MSG	S_setTitle_, "S"
+	.asciz	"Beam"
+	OP_END
+	HERE	Lp_track_named
+	NCALL	mkstr, "=a"
+	SL	2
+	LD	G_WIN
+	MSG	S_setTitle_, "c"
+	HERE	Lp_track_end
+	OP_END
+	.popsection
 
 ; show_art(url) — load new artwork on the worker queue when the URL changed ("" hides it).
 	.equ ART_GEN,	0                 ; request generation
 	.equ ART_BUF,	8                 ; {data, len}
 	.equ ART_URL,	24                ; the URL, inline
 show_art:
-	FRAME	2
-	mov	x1, x0
-	BADDR	x19, B_UIART
-	mov	x0, x19
-	mov	x2, #2048
-	bl	cache_update
-	cbz	w0, Lret2
-	ldr	x20, [x28, #G_ARTGEN]
-	add	x20, x20, #1
-	str	x20, [x28, #G_ARTGEN]     ; older downloads become stale
-	ldrb	w9, [x19]
-	cbz	w9, Lsw_hide
-	mov	x0, x19
-	bl	_strlen
-	add	x21, x0, #1               ; with its NUL
-	add	x0, x0, #(ART_URL + 1)
-	bl	_malloc
-	cbz	x0, Lret2
-	str	x20, [x0, #ART_GEN]
-	stp	xzr, xzr, [x0, #ART_BUF]
-	mov	x20, x0
-	add	x0, x0, #ART_URL
-	mov	x1, x19
-	mov	x2, x21
-	bl	_memcpy
-	WORKQ
-	mov	x1, x20
-	adr	x2, art_fetch
-	bl	_dispatch_async_f
-	b	Lret2
-Lsw_hide:
-	mov	x0, #0
-	mov	w1, #0
-	bl	art_show
-	b	Lret2
+	VM	Lp_art
+	.pushsection __DATA,__data
+Lp_art:
+	NCALL	cache_update, "=BaH"
+	.short	B_UIART, 2048
+	JZ	Lp_art_end
+	LD	G_ARTGEN
+	ADDI	1
+	STO	G_ARTGEN                  ; older downloads become stale
+	SL	1
+	CALL	F_strlen, "=B"
+	.short	B_UIART
+	JZ	Lp_art_hide
+	ADDI	1
+	SL	2                         ; c: the URL's size, with its NUL
+	ADDH	ART_URL
+	SL	3
+	CALL	F_calloc, "=Id"
+	.byte	1
+	JZ	Lp_art_end
+	SL	4
+	GL	1
+	STX	4, ART_GEN
+	GL	4
+	ADDH	ART_URL
+	SL	5
+	CALL	F_memcpy, "fBc"
+	.short	B_UIART
+	CALL	F_dispatch_async_f, "OeP"
+	.byte	G_WORKQ >> 3
+	.long	art_fetch - Lvm_base
+	OP_END
+	HERE	Lp_art_hide
+	NCALL	art_show, "II"
+	.byte	0, 0
+	HERE	Lp_art_end
+	OP_END
+	.popsection
 
 ; art_fetch(job) — download the artwork, then hand it to the main thread.
-	ENTRY	art_fetch
-	FRAME	1
-	mov	x20, x0
-	bl	_objc_autoreleasePoolPush
-	mov	x19, x0
-	add	x0, x20, #ART_URL
-	bl	mkreq
-	cbz	x0, Laf_done
-	add	x1, x20, #ART_BUF
-	bl	fetch
-Laf_done:
-	mov	x0, x19
-	bl	_objc_autoreleasePoolPop
-	adr	x0, art_apply
-	mov	x1, x20
-	bl	post_main
-	b	Lret1
+	VMENTRY	art_fetch, Lp_fetch
+	.pushsection __DATA,__data
+Lp_fetch:
+	CALL	F_objc_autoreleasePoolPush, "="
+	SL	1
+	GL	0
+	ADDH	ART_URL
+	NCALL	mkreq, "=V"
+	JZ	Lp_fetch_done
+	SL	2
+	GL	0
+	ADDH	ART_BUF
+	NCALL	fetch, "cV"
+	HERE	Lp_fetch_done
+	CALL	F_objc_autoreleasePoolPop, "b"
+	NCALL	post_main, "Pa"
+	.long	art_apply - Lvm_base
+	OP_END
+	.popsection
 
 ; art_show(image, letterboxed) — show an image on the artwork card at its own shape (nil leaves the empty card), cropping a 4:3 thumbnail's bars.
 art_show:
-	FRAME	2
-	mov	x19, x0
-	mov	w20, w1
-	ldr	x0, [x28, #G_ART]
-	SEND	S_layer
-	mov	x21, x0
-	fmov	d0, xzr                   ; contentsRect, in unit coordinates
-	fmov	d1, xzr
-	fmov	d2, #1.0
-	fmov	d3, #1.0
-	cbz	w20, Las_rect
-	fmov	d1, #0.125                ; skip 12.5% at the top and bottom
-	fmov	d3, #0.75
-Las_rect:
-	SEND	S_setContentsRect_
-	mov	x0, x21
-	mov	x2, x19
-	SEND	S_setContents_
-	cmp	x19, #0
-	cset	w9, ne
-	str	w9, [x28, #G_ARTOK]
-	fmov	d0, #1.0                  ; the card's height / width: square without an image
-	cbz	x19, Las_aspect
-	fmov	d0, #0.5625               ; 16:9 once the bars are cut
-	cbnz	w20, Las_aspect
-	mov	x0, x19
-	SEND	S_size
-	fdiv	d0, d1, d0
-Las_aspect:
-	str	d0, [x28, #G_ARTASP]
-	bl	layout_stage
-	bl	stage_update
-	b	Lret2
+	VM	Lp_ashow
+	.pushsection __DATA,__data
+Lp_ashow:
+	LD	G_ART
+	MSG	S_layer, "="
+	SL	2
+	GL	1
+	JNZ	Lp_ashow_cut
+	GL	2
+	MSG	S_setContentsRect_, "DDDD" ; contentsRect, in unit coordinates
+	.short	0, 0, 4, 4
+	JMP	Lp_ashow_rect
+	HERE	Lp_ashow_cut
+	FK	2                         ; skip 12.5% at the top and bottom
+	FS	4
+	FK	12
+	FS	5
+	GL	2
+	MSG	S_setContentsRect_, "DZDZ"
+	.short	0
+	.byte	4
+	.short	4
+	.byte	5
+	HERE	Lp_ashow_rect
+	GL	2
+	MSG	S_setContents_, "a"
+	GL	0
+	EQ	0
+	EQ	0
+	SW	G_ARTOK
+	FK	16                        ; the card's height / width: square without an image
+	GL	0
+	JZ	Lp_ashow_asp
+	FK	9                         ; 16:9 once the bars are cut
+	GL	1
+	JNZ	Lp_ashow_asp
+	GL	0
+	MSG	S_size, "^"
+	FL	5
+	FOP	3, 4
+	HERE	Lp_ashow_asp
+	FS	6
+	GL	6
+	STO	G_ARTASP
+	NCALL	layout_stage
+	NCALL	stage_update
+	OP_END
+	.popsection
 
 ; art_apply(job) — show the downloaded artwork, or the empty card if it is not an image.
-	ENTRY	art_apply
-	FRAME	2
-	mov	x19, x0
-	ldr	x9, [x28, #G_ARTGEN]
-	ldr	x10, [x19, #ART_GEN]
-	cmp	x9, x10
-	b.ne	Laa_free                  ; superseded by a newer track
-	ldp	x2, x3, [x19, #ART_BUF]
-	cbz	x2, Laa_hide
-	CLASS	x0, NSData
-	SEND	S_dataWithBytes_length_
-	mov	x20, x0
-	CLASS	x0, NSImage
-	SEND	S_alloc
-	mov	x2, x20
-	SEND	S_initWithData_
-	mov	x20, x0
-	cbz	x0, Laa_hide              ; not an image
-	SEND	S_size
-	fmov	d2, #3.0
-	fmul	d0, d0, d2
-	fmov	d2, #4.0
-	fmul	d1, d1, d2
-	fabd	d0, d0, d1                ; |3w - 4h| < 1: 4:3, a letterboxed 16:9 thumbnail
-	fmov	d1, #1.0
-	fcmp	d0, d1
-	cset	w1, mi
-	mov	x0, x20
-	bl	art_show
-	mov	x0, x20
-	SEND	S_release                 ; the layer keeps it
-	b	Laa_free
-Laa_hide:
-	mov	x0, #0
-	mov	w1, #0
-	bl	art_show
-Laa_free:
-	ldr	x0, [x19, #ART_BUF]
-	bl	_free
-	mov	x0, x19
-	bl	_free
-	b	Lret2
+	VMENTRY	art_apply, Lp_aapply
+	.pushsection __DATA,__data
+Lp_aapply:
+	GL	0
+	LDX	ART_GEN
+	EQS	G_ARTGEN
+	JZ	Lp_aapply_free            ; superseded by a newer track
+	GL	0
+	LDX	ART_BUF
+	SL	1
+	JZ	Lp_aapply_hide
+	GL	0
+	LDX	ART_BUF + 8
+	SL	2
+	CLS	NSData
+	MSG	S_dataWithBytes_length_, "=bc"
+	SL	1
+	CLS	NSImage
+	MSG	S_alloc, "="
+	MSG	S_initWithData_, "=b"
+	SL	1
+	JZ	Lp_aapply_hide            ; not an image
+	MSG	S_size, "^"
+	FL	4
+	FOPK	2, 48
+	FS	4
+	FL	5
+	FOPK	2, 64
+	FOP	9, 4
+	FS	4
+	FK	16
+	FOP	6, 4                      ; |3w - 4h| < 1: 4:3, a letterboxed 16:9 thumbnail
+	SL	2
+	NCALL	art_show, "bc"
+	GL	1
+	MSG	S_release                 ; the layer keeps it
+	JMP	Lp_aapply_free
+	HERE	Lp_aapply_hide
+	NCALL	art_show, "II"
+	.byte	0, 0
+	HERE	Lp_aapply_free
+	GL	0
+	LDX	ART_BUF
+	CALL	F_free, "V"
+	CALL	F_free, "a"
+	OP_END
+	.popsection
 
 ; layout_stage() — between the bar and the title bar: the artwork card as large as fits (at its shape), with the note, the spinner and the link field centered on it.
 layout_stage:
-	FRAME	0
-	ldr	x0, [x28, #G_CONTENT]
-	SEND	S_bounds                  ; d2 = width, d3 = height
-	mov	w9, #(STAGE_B + STAGE_T + 32)
-	scvtf	d4, w9
-	fsub	d3, d3, d4                ; the room's height, with some air
-	mov	w9, #96
-	scvtf	d4, w9
-	fsub	d2, d2, d4                ; and width
-	ldr	d5, [x28, #G_ARTASP]
-	fdiv	d1, d3, d5
-	fmin	d0, d2, d1                ; the widest card that fits both
-	mov	w9, #ART_MAX
-	scvtf	d4, w9
-	fmin	d0, d0, d4
-	mov	w9, #64
-	scvtf	d4, w9
-	fmax	d0, d0, d4
-	fmul	d1, d0, d5
-	fcvtzs	x0, d0
-	fcvtzs	x1, d1
-	ldr	x2, [x28, #G_ART]
-	bl	center_box
-	mov	x0, #96
-	mov	x1, #96
-	ldr	x2, [x28, #G_NOTE]
-	bl	center_box
-	mov	x0, #SPIN_S
-	mov	x1, #SPIN_S
-	ldr	x2, [x28, #G_SPIN]
-	bl	center_box
-	mov	x0, #URL_W
-	mov	x1, #URL_H
-	ldr	x2, [x28, #G_URLBOX]
-	bl	center_box
-	bl	pic_layout
-	b	Lret0
+	VM	Lp_lstage
+	.pushsection __DATA,__data
+Lp_lstage:
+	LD	G_CONTENT
+	MSG	S_bounds, "^"             ; g, h: width and height
+	LD	G_ARTASP
+	SL	0
+	FL	7
+	FOPK	1, (STAGE_B + STAGE_T + 32) * 16 ; the room's height, with some air
+	FOP	3, 0
+	FS	7
+	FL	6
+	FOPK	1, 96 * 16                ; and width
+	FOP	4, 7                      ; the widest card that fits both
+	FOPK	4, ART_MAX * 16
+	FOPK	5, 64 * 16
+	FT
+	SL	1
+	FOP	2, 0
+	FT
+	SL	2
+	LD	G_ART
+	NCALL	center_box, "bcV"
+	LD	G_NOTE
+	NCALL	center_box, "IIV"
+	.byte	96, 96
+	LD	G_SPIN
+	NCALL	center_box, "IIV"
+	.byte	SPIN_S, SPIN_S
+	LD	G_URLBOX
+	NCALL	center_box, "HHV"
+	.short	URL_W, URL_H
+	NCALL	pic_layout
+	OP_END
+	.popsection
 
 ; pic_layout — the engine's picture in its view: as large as fits at its shown shape, centered, turned as its track says.
 pic_layout:
-	FRAME	1, 80
-	ldr	x19, [x28, #G_SBLAYER]
-	cbz	x19, Lret1                ; not made yet
-	ldr	x0, [x28, #G_SBV]
-	SEND	S_bounds
-	stp	d2, d3, [sp]              ; the view's width and height
-	BADDR	x9, B_PIC
-	ldp	w10, w11, [x9, #4]
-	ucvtf	d4, w10
-	ucvtf	d5, w11
-	ldr	w12, [x9]
-	tst	w12, #2                   ; a quarter turn: on screen, height by width
-	fcsel	d6, d5, d4, ne
-	fcsel	d7, d4, d5, ne
-	fdiv	d16, d2, d6
-	fdiv	d17, d3, d7
-	fmin	d16, d16, d17             ; the scale that fits
-	fmul	d6, d6, d16
-	fmul	d7, d7, d16
-	cmp	w10, #0
-	ccmp	w11, #0, #4, ne           ; no size yet: the whole view
-	fcsel	d6, d2, d6, eq
-	fcsel	d7, d3, d7, eq
-	tst	w12, #2
-	fcsel	d4, d7, d6, ne            ; its own width and height, before the turn
-	fcsel	d5, d6, d7, ne
-	stp	d4, d5, [sp, #16]
-	mov	w9, #1                    ; the turn's cos and sin
-	cmp	w12, #180
-	cneg	w9, w9, eq
-	tst	w12, #2
-	csel	w9, wzr, w9, ne
-	asr	w10, w12, #31
-	orr	w10, w10, #1
-	csel	w10, w10, wzr, ne
-	scvtf	d0, w9
-	scvtf	d1, w10
-	fneg	d2, d1
-	stp	d0, d1, [sp, #32]         ; a, b, c, d (tx, ty: 0)
-	stp	d2, d0, [sp, #48]
-	CLASS	x0, CATransaction         ; at once
-	SEND	S_begin
-	CLASS	x0, CATransaction
-	mov	w2, #1
-	SEND	S_setDisableActions_
-	movi	d0, #0
-	movi	d1, #0
-	ldp	d2, d3, [sp, #16]
-	mov	x0, x19
-	SEND	S_setBounds_
-	ldp	d0, d1, [sp]
-	fmov	d2, #0.5
-	fmul	d0, d0, d2
-	fmul	d1, d1, d2
-	mov	x0, x19
-	SEND	S_setPosition_
-	stp	xzr, xzr, [sp, #64]
-	add	x2, sp, #32
-	mov	x0, x19
-	SEND	S_setAffineTransform_
-	CLASS	x0, CATransaction
-	SEND	S_commit
-	b	Lret1
+	VM	Lp_piclay
+	.pushsection __DATA,__data
+Lp_piclay:
+	LD	G_SBLAYER
+	SL	0
+	JNZ	Lp_pic_made
+	OP_END                            ; not made yet
+	HERE	Lp_pic_made
+	LD	G_SBV
+	MSG	S_bounds, "^"             ; g, h: the view's width and height
+	LEAB	B_PIC
+	SL	1
+	LDW	0
+	SL	2                         ; c: the turn
+	BIT	1
+	SL	3                         ; d: a quarter turn: on screen, height by width
+	GL	1
+	LDW	4
+	JZ	Lp_pic_whole
+	FI
+	FS	4
+	GL	1
+	LDW	8
+	JZ	Lp_pic_whole
+	FI
+	FS	5
+	GL	3
+	JZ	Lp_pic_fit
+	FL	4
+	FS	1
+	FL	5
+	FS	4
+	FL	1
+	FS	5
+	HERE	Lp_pic_fit
+	FL	6                         ; the scale that fits
+	FOP	3, 4
+	FS	1
+	FL	7
+	FOP	3, 5
+	FOP	4, 1
+	FS	1
+	FL	4
+	FOP	2, 1
+	FS	4
+	FL	5
+	FOP	2, 1
+	FS	5
+	JMP	Lp_pic_own
+	HERE	Lp_pic_whole
+	FL	6                         ; no size yet: the whole view
+	FS	4
+	FL	7
+	FS	5
+	HERE	Lp_pic_own
+	GL	3                         ; its own width and height, before the turn
+	JZ	Lp_pic_turn
+	FL	4
+	FS	1
+	FL	5
+	FS	4
+	FL	1
+	FS	5
+	HERE	Lp_pic_turn
+	GL	2                         ; cos: 1 at 0, -1 at 180
+	ADDI	-90
+	EQ	90
+	SL	1
+	GL	2
+	EQ	0
+	SUBL	1
+	FI
+	FS	1
+	GL	1
+	STE	B_AFF
+	STE	B_AFF + 24
+	IMM	0                         ; sin: 1 at 90, -1 at -90 (the turn's word is not sign-extended)
+	SL	1
+	GL	3
+	JZ	Lp_pic_sin
+	GL	2
+	EQ	90
+	SL	1
+	ADDL	1
+	ADDI	-1
+	SL	1
+	HERE	Lp_pic_sin
+	GL	1
+	FI
+	FS	1
+	GL	1
+	STE	B_AFF + 8
+	FK	0
+	FOP	1, 1
+	FS	1
+	GL	1
+	STE	B_AFF + 16
+	CLS	CATransaction             ; at once
+	MSG	S_begin
+	CLS	CATransaction
+	MSG	S_setDisableActions_, "I"
+	.byte	1
+	GL	0
+	MSG	S_setBounds_, "DDZZ"
+	.short	0, 0
+	.byte	4, 5
+	FL	6
+	FOPK	2, 8
+	FS	6
+	FL	7
+	FOPK	2, 8
+	FS	7
+	GL	0
+	MSG	S_setPosition_, "ZZ"
+	.byte	6, 7
+	GL	0
+	MSG	S_setAffineTransform_, "B"
+	.short	B_AFF
+	CLS	CATransaction
+	MSG	S_commit
+	OP_END
+	.popsection
 
 ; center_box(width, height, view) — give a view that size in the middle of the stage.
 center_box:
-	FRAME	1, 16
-	mov	x19, x2
-	stp	x0, x1, [sp]
-	ldr	x0, [x28, #G_CONTENT]
-	SEND	S_bounds
-	ldp	x9, x10, [sp]
-	scvtf	d4, x9
-	scvtf	d5, x10
-	fsub	d0, d2, d4
-	mov	w11, #(STAGE_B + STAGE_T)
-	scvtf	d6, w11
-	fsub	d1, d3, d6
-	fsub	d1, d1, d5
-	fmov	d6, #0.5
-	fmul	d0, d0, d6
-	fmul	d1, d1, d6
-	frintm	d0, d0                    ; whole points: crisp edges
-	frintm	d1, d1
-	mov	w11, #STAGE_B
-	scvtf	d6, w11
-	fadd	d1, d1, d6
-	fmov	d2, d4
-	fmov	d3, d5
-	mov	x0, x19
-	SEND	S_setFrame_
-	b	Lret1
+	VM	Lp_cbox
+	.pushsection __DATA,__data
+Lp_cbox:
+	LD	G_CONTENT
+	MSG	S_bounds, "^"             ; g, h: the stage's width and height
+	GL	0
+	FI
+	FS	0
+	GL	1
+	FI
+	FS	1
+	FL	6
+	FOP	1, 0
+	FOPK	2, 8
+	FOPK	8, 0                      ; whole points: crisp edges
+	FS	4
+	FL	7
+	FOPK	1, (STAGE_B + STAGE_T) * 16
+	FOP	1, 1
+	FOPK	2, 8
+	FOPK	8, 0
+	FOPK	0, STAGE_B * 16
+	FS	5
+	GL	2
+	MSG	S_setFrame_, "ZZZZ"
+	.byte	4, 5, 0, 1
+	OP_END
+	.popsection
 
 ; stage_update() — what the stage shows: This Mac's picture, else the artwork card while a track plays or loads.
 stage_update:
-	FRAME	2
-	mov	w19, #0                   ; the picture shows
-	ldr	w9, [x28, #G_AONLY]
-	cbnz	w9, Lsu_pic
-	ldr	w19, [x28, #G_HASVIDEO]
-Lsu_pic:
-	ldr	w20, [x28, #G_MODE]       ; the playing one's picture: the engine's or AVPlayer's
-	cmp	w20, #0
-	csel	w9, w19, wzr, eq
-	eor	w2, w9, #1
-	ldr	x0, [x28, #G_SBV]
-	SEND	S_setHidden_
-	cmp	w20, #0
-	csel	w9, w19, wzr, ne
-	eor	w2, w9, #1
-	ldr	x0, [x28, #G_VIDEO]
-	SEND	S_setHidden_
-	BADDR	x9, B_UITITLE
-	ldrb	w9, [x9]
-	cmp	w9, #0
-	cset	w20, ne                   ; a track, or one on its way
-	ldr	w9, [x28, #G_LOADING]
-	orr	w20, w20, w9
-	cmp	w19, #0
-	csel	w20, wzr, w20, ne         ; the card, unless the picture covers it
-	ldr	x0, [x28, #G_ART]
-	eor	w2, w20, #1
-	SEND	S_setHidden_
-	ldr	w9, [x28, #G_ARTOK]
-	eor	w10, w20, #1
-	orr	w2, w9, w10               ; the note, on a card without an image, unless the spinner is there
-	ldr	w9, [x28, #G_LOADING]
-	orr	w2, w2, w9
-	ldr	x0, [x28, #G_NOTE]
-	SEND	S_setHidden_
-	cbz	w19, Lsu_bar
-	ldr	w9, [x28, #G_PPSHOWN]
-	cbnz	w9, Lret2                 ; a playing picture may keep the bar away
-Lsu_bar:
-	bl	bar_show
-	b	Lret2
+	VM	Lp_stage
+	.pushsection __DATA,__data
+Lp_stage:
+	IMM	0
+	SL	0                         ; a: the picture shows
+	LW	G_AONLY
+	JNZ	Lp_stage_pic
+	LW	G_HASVIDEO
+	SL	0
+	HERE	Lp_stage_pic
+	IMM	1                         ; the playing one's picture: the engine's or AVPlayer's
+	SL	2
+	SL	3
+	GL	0
+	EQ	0
+	SL	4
+	LW	G_MODE
+	JNZ	Lp_stage_av
+	GL	4
+	SL	2
+	JMP	Lp_stage_hide
+	HERE	Lp_stage_av
+	GL	4
+	SL	3
+	HERE	Lp_stage_hide
+	LD	G_SBV
+	MSG	S_setHidden_, "c"
+	LD	G_VIDEO
+	MSG	S_setHidden_, "d"
+	CALL	F_strlen, "=B"            ; a track, or one on its way
+	.short	B_UITITLE
+	SL	4
+	LW	G_LOADING
+	ADDL	4
+	SL	4
+	GL	0
+	JZ	Lp_stage_card
+	IMM	0                         ; the card, unless the picture covers it
+	SL	4
+	HERE	Lp_stage_card
+	GL	4
+	EQ	0
+	SL	5
+	LD	G_ART
+	MSG	S_setHidden_, "f"
+	LW	G_ARTOK                   ; the note, on a card without an image, unless the spinner is there
+	ADDL	5
+	SL	6
+	LW	G_LOADING
+	ADDL	6
+	EQ	0
+	EQ	0
+	SL	6
+	LD	G_NOTE
+	MSG	S_setHidden_, "g"
+	GL	0
+	JZ	Lp_stage_bar
+	LW	G_PPSHOWN
+	JNZ	Lp_stage_end              ; a playing picture may keep the bar away
+	HERE	Lp_stage_bar
+	NCALL	bar_show
+	HERE	Lp_stage_end
+	OP_END
+	.popsection
 
 ; bar_show() — bring the control bar back.
 bar_show:
@@ -2960,47 +3671,43 @@ Lbs_ret:
 
 ; render_status() — the status message while it is fresh.
 render_status:
-	FRAME	1
-	BADDR	x1, B_UIMSG
-	ldr	w19, [x28, #G_MSGERR]
-	ldrb	w9, [x1]
-	cbz	w9, Lrs_hint
-	ldr	x9, [x28, #G_TICK]
-	ldr	x10, [x28, #G_MSGT]
-	cmp	x9, x10
-	b.le	Lrs_show
-	strb	wzr, [x1]                 ; expired
-Lrs_hint:
-	mov	w19, #0                   ; hints are not errors
-	GADDR	x1, Ls_slash+1
-Lrs_show:
-	ldr	x0, [x28, #G_STATUS]
-	bl	setstr
-	ldr	x9, [x28, #G_SECOND]
-	ldr	x10, [x28, #G_RED]
-	cmp	w19, #0
-	csel	x2, x10, x9, ne
-	ldr	x0, [x28, #G_STATUS]
-	SEND	S_setTextColor_
-	b	Lret1
+	VM	Lp_status
+	.pushsection __DATA,__data
+Lp_status:
+	LW	G_MSGERR
+	SL	0
+	CALL	F_strlen, "=B"
+	.short	B_UIMSG
+	JZ	Lp_status_hint
+	LD	G_MSGT
+	SL	1
+	LD	G_TICK
+	SUBL	1
+	LT	1
+	JNZ	Lp_status_show
+	CALL	F_bzero, "BI"             ; expired
+	.short	B_UIMSG
+	.byte	1
+	HERE	Lp_status_hint
+	IMM	0                         ; hints are not errors
+	SL	0
+	HERE	Lp_status_show
+	LD	G_STATUS
+	NCALL	setstr, "VB"
+	.short	B_UIMSG
+	LD	G_SECOND
+	SL	1
+	GL	0
+	JZ	Lp_status_color
+	LD	G_RED
+	SL	1
+	HERE	Lp_status_color
+	LD	G_STATUS
+	MSG	S_setTextColor_, "b"
+	OP_END
+	.popsection
 
-; add_item(menu, title, action, key) -> a new menu item; a nil target uses the responder chain.
-add_item:
-	FRAME	2
-	mov	x19, x0
-	mov	x20, x2
-	mov	x21, x3
-	mov	x0, x1
-	bl	mkstr
-	mov	x22, x0
-	mov	x0, x21
-	bl	mkstr
-	mov	x4, x0
-	mov	x0, x19
-	mov	x2, x22
-	mov	x3, x20
-	SEND	S_addItemWithTitle_action_keyEquivalent_
-	b	Lret2
+
 
 ; set_status(message, is_error) — show a message for STATUS_TICKS seconds.
 set_status:
@@ -3019,72 +3726,80 @@ set_status:
 
 ; ui_refresh(playing, position, volume, muted) — render This Mac's state and track.
 ui_refresh:
-	FRAME	4
-	mov	w21, w0
-	mov	x24, x1
-	mov	w20, w2
-	mov	w19, w3
-	BADDR	x0, B_LTTRACK
-	add	x1, x0, #T_ARTIST
-	bl	show_track
-	BADDR	x0, (B_LTTRACK + T_ART)
-	bl	show_art
-	ldr	w10, [x28, #G_PPSHOWN]
-	cmp	w10, w21
-	b.eq	Lur_enable
-	str	w21, [x28, #G_PPSHOWN]
-	ldr	x10, [x28, #G_IMGPAUSE]
-	ldr	x11, [x28, #G_IMGPLAY]
-	cmp	w21, #0
-	csel	x2, x10, x11, ne
-	ldr	x0, [x28, #G_PP]
-	SEND	S_setImage_
-Lur_enable:
-	ldr	x25, [x28, #G_LTDUR]
-	cmp	x25, #0
-	cset	w26, gt                   ; seekable: with a known duration
-	mov	x23, #G_BACK
-Lur_each:
-	ldr	x0, [x28, x23]
-	mov	w2, w26
-	SEND	S_setEnabled_
-	add	x23, x23, #8
-	cmp	x23, #G_PP
-	b.lo	Lur_each
-	ldr	w9, [x28, #G_SEEKDRAG]
-	cbnz	w9, Lur_volume            ; the user is dragging it
-	ldr	x9, [x28, #G_TICK]
-	ldr	x10, [x28, #G_SEEKH]
-	cmp	x9, x10
-	b.lo	Lur_volume                ; a seek is still settling
-	mov	x0, x24
-	mov	x1, x25
-	bl	show_time
-Lur_volume:
-	ldr	w9, [x28, #G_VOLDRAG]
-	cbnz	w9, Lur_mute
-	ldr	x9, [x28, #G_TICK]
-	ldr	x10, [x28, #G_VOLH]
-	cmp	x9, x10
-	b.lo	Lur_mute                  ; a volume change is still settling
-	scvtf	d0, w20
-	ldr	x0, [x28, #G_VOL]
-	SEND	S_setDoubleValue_
-Lur_mute:
-	ldr	w10, [x28, #G_MUTESHOWN]
-	cmp	w19, w10
-	b.eq	Lur_status
-	str	w19, [x28, #G_MUTESHOWN]
-	ldr	x10, [x28, #G_IMGMUTED]
-	ldr	x11, [x28, #G_IMGUNMUTED]
-	cmp	w19, #0
-	csel	x2, x10, x11, ne
-	ldr	x0, [x28, #G_MUTE]
-	SEND	S_setImage_
-Lur_status:
-	bl	render_status
-	bl	stage_update
-	b	Lret4
+	VM	Lp_refresh
+	.pushsection __DATA,__data
+Lp_refresh:
+	NCALL	show_track, "BB"
+	.short	B_LTTRACK, B_LTTRACK + T_ARTIST
+	NCALL	show_art, "B"
+	.short	B_LTTRACK + T_ART
+	LW	G_PPSHOWN
+	EQL	0
+	JNZ	Lp_refresh_enable
+	GL	0
+	SW	G_PPSHOWN
+	LD	G_IMGPLAY
+	SL	4
+	GL	0
+	JZ	Lp_refresh_pp
+	LD	G_IMGPAUSE
+	SL	4
+	HERE	Lp_refresh_pp
+	LD	G_PP
+	MSG	S_setImage_, "e"
+	HERE	Lp_refresh_enable
+	LD	G_LTDUR
+	SL	5
+	LT	1
+	EQ	0                         ; seekable: with a known duration
+	SL	4
+	LD	G_BACK
+	MSG	S_setEnabled_, "e"
+	LD	G_FWD
+	MSG	S_setEnabled_, "e"
+	LD	G_POS
+	MSG	S_setEnabled_, "e"
+	LW	G_SEEKDRAG
+	JNZ	Lp_refresh_volume         ; the user is dragging it
+	LD	G_SEEKH
+	SL	6
+	LD	G_TICK
+	SUBL	6
+	LT	0
+	JNZ	Lp_refresh_volume         ; a seek is still settling
+	NCALL	show_time, "bf"
+	HERE	Lp_refresh_volume
+	LW	G_VOLDRAG
+	JNZ	Lp_refresh_mute
+	LD	G_VOLH
+	SL	6
+	LD	G_TICK
+	SUBL	6
+	LT	0
+	JNZ	Lp_refresh_mute           ; a volume change is still settling
+	LD	G_VOL
+	MSG	S_setDoubleValue_, "U"
+	.byte	2
+	HERE	Lp_refresh_mute
+	LW	G_MUTESHOWN
+	EQL	3
+	JNZ	Lp_refresh_status
+	GL	3
+	SW	G_MUTESHOWN
+	LD	G_IMGUNMUTED
+	SL	4
+	GL	3
+	JZ	Lp_refresh_img
+	LD	G_IMGMUTED
+	SL	4
+	HERE	Lp_refresh_img
+	LD	G_MUTE
+	MSG	S_setImage_, "e"
+	HERE	Lp_refresh_status
+	NCALL	render_status
+	NCALL	stage_update
+	OP_END
+	.popsection
 
 ; fmt_time(seconds, out[16], hours) — "m:ss", or "h:mm:ss" from one hour up or when hours is set.
 fmt_time:
@@ -3113,233 +3828,250 @@ Lft_print:
 
 ; show_time(pos, dur) — position slider, elapsed time and time left.
 show_time:
-	FRAME	2, 32
-	mov	x19, x0
-	mov	x20, x1
-	mov	x9, #1
-	cmp	x20, #0
-	csel	x9, x20, x9, gt           ; range: the duration (1 when unknown)
-	scvtf	d0, x9
-	ldr	x0, [x28, #G_POS]
-	SEND	S_setMaxValue_
-	cmp	x19, x20
-	csel	x9, x19, x20, lt          ; within the track
-	cmp	x20, #0
-	csel	x9, x9, xzr, gt
-	scvtf	d0, x9
-	ldr	x0, [x28, #G_POS]
-	SEND	S_setDoubleValue_
-	mov	x0, x19
-	mov	x1, sp
-	mov	x2, #0
-	bl	fmt_time
-	cmp	x19, #0
-	ccmp	x20, #0, #0, le
-	b.gt	Lst_now
-	strb	wzr, [sp]
-Lst_now:
-	ldr	x0, [x28, #G_CUR]
-	mov	x1, sp
-	bl	setstr
-	GADDR	x1, Ls_slash+1
-	cmp	x20, #0
-	b.le	Lst_left
-	cmp	x19, x20
-	csel	x0, x19, x20, lt
-	sub	x0, x20, x0               ; time left
-	add	x1, sp, #1
-	mov	x2, #0
-	bl	fmt_time
-	mov	w9, #'-'
-	strb	w9, [sp]
-	mov	x1, sp
-Lst_left:
-	ldr	x0, [x28, #G_DUR]
-	bl	setstr
-	b	Lret2
+	VMT
+	GL	0
+	STO	G_SHOWPOS
+	IMM	1                         ; the range: the duration, 1 when unknown
+	SL	2
+	GL	1
+	LT	1
+	JNZ	Lp_time_range
+	GL	1
+	SL	2
+	HERE	Lp_time_range
+	LD	G_POS
+	MSG	S_setMaxValue_, "U"
+	.byte	2
+	LD	G_WIN
+	MSG	S_occlusionState, "="
+	BIT	1
+	JNZ	Lp_time_seen
+	OP_END                            ; out of sight: the position and times are not redrawn
+	HERE	Lp_time_seen
+	GL	0                         ; within the track
+	SL	3
+	SUBL	1
+	LT	0
+	JNZ	Lp_time_in
+	GL	1
+	SL	3
+	HERE	Lp_time_in
+	GL	1
+	LT	1
+	JZ	Lp_time_known
+	IMM	0
+	SL	3
+	HERE	Lp_time_known
+	LD	G_POS
+	MSG	S_setDoubleValue_, "U"
+	.byte	3
+	LEAB	B_TIMEB
+	SL	4
+	NCALL	fmt_time, "aeI"
+	.byte	0
+	GL	0
+	LT	1
+	JZ	Lp_time_now
+	GL	1
+	LT	1
+	JZ	Lp_time_now
+	IMM	0
+	STW	4, 0
+	HERE	Lp_time_now
+	LD	G_CUR
+	NCALL	setstr, "Ve"
+	IMM	0
+	STW	4, 0
+	GL	1
+	LT	1
+	JNZ	Lp_time_left
+	IMM	'-'                       ; time left
+	STW	4, 0
+	GL	1
+	SUBL	3
+	SL	5
+	GL	4
+	ADDI	1
+	SL	6
+	NCALL	fmt_time, "fgI"
+	.byte	0
+	HERE	Lp_time_left
+	LD	G_DUR
+	NCALL	setstr, "Ve"
+	OP_END
+	.p2align 2
 
 ; ui_play_done(job) — end loading, report the result, free the job.
-	ENTRY	ui_play_done
-	FRAME	2, 272
-	mov	x19, x0
-	ldr	w9, [x19, #JOB_GEN]
-	ldr	w10, [x28, #G_PLAYGEN]
-	cmp	w9, w10
-	b.ne	Lpd_free
-	str	wzr, [x28, #G_LOADING]
-	ldr	w20, [x19, #JOB_RESULT]
-	cbnz	w20, 1f
-	mov	x0, x19                   ; the engine starts first; the controls follow meanwhile
-	bl	local_play
-1:	ADDR	x0, Lprog_idle
-	bl	ui_run
-	cbnz	w20, Lpd_failed
-	ADDR	x0, Lprog_played
-	bl	ui_run
-	GADDR	x0, Ls_slash+1
-	mov	w1, #0
-	bl	set_status
-	b	Lpd_free
-Lpd_failed:
+	VMENTRY	ui_play_done, Lp_done
+	.pushsection __DATA,__data
+Lp_done:
+	GL	0
+	LDW	JOB_GEN
+	SL	1
+	LW	G_PLAYGEN
+	EQL	1
+	JZ	Lp_done_free
+	IMM	0
+	SW	G_LOADING
+	GL	0
+	LDW	JOB_RESULT
+	SL	2
+	JNZ	Lp_done_idle
+	NCALL	local_play, "a"           ; the engine starts first; the controls follow meanwhile
+	HERE	Lp_done_idle
+	LD	G_SPIN                    ; the spinner rests
+	MSG	S_stopAnimation_, "I"
+	.byte	0
+	GL	2
+	JNZ	Lp_done_failed
+	LD	G_FIELD                   ; played: the link field empties
+	MSG	S_setStringValue_, "S"
+	.asciz	""
+	NCALL	set_status, "CI"
+	.asciz	""
+	.byte	0
+	JMP	Lp_done_free
+	HERE	Lp_done_failed
+	NCALL	fail_status, "a"
+	HERE	Lp_done_free
+	GL	0
+	LDX	JOB_QUERY
+	CALL	F_free, "V"
+	CALL	F_free, "a"
+	NCALL	local_poll
+	OP_END
+	.popsection
+
+; fail_status(job) — the resolver's reason for a link that did not load, else a plain one, as an error.
+fail_status:
+	FRAME	0, 272
+	ldr	x9, [x0, #JOB_ERR]
 	CSTR	x0, "Could not load the link."
-	ldr	x9, [x19, #JOB_ERR]
-	cbz	x9, Lpd_error
+	cbz	x9, 1f
 	str	x9, [sp]                  ; the resolver's own explanation
 	add	x0, sp, #16
 	mov	x1, #256
 	CSTR	x2, "Could not load: %s"
 	bl	_snprintf
 	add	x0, sp, #16
-Lpd_error:
-	mov	w1, #1
+1:	mov	w1, #1
 	bl	set_status
-Lpd_free:
-	ldr	x0, [x19, #JOB_ITEM]
-	SEND	S_release
-	ldr	x0, [x19, #JOB_QUERY]
-	bl	_free
-	mov	x0, x19
-	bl	_free
-	bl	local_poll
-	b	Lret2
+	b	Lret0
 
 ; ---- This Mac: AVPlayer; macOS routes the sound to the chosen output (speakers, Bluetooth, AirPlay) ----
 
-; local_play(job) — play on This Mac: a file with the engine, anything else with the prepared AVPlayer item.
+; local_play(job) — play on This Mac with the engine: a file, web media, or a YouTube video's two streams.
 local_play:
-	FRAME	3
-	mov	x19, x0
-	BADDR	x0, B_LTTRACK
-	add	x1, x19, #JOB_TRACK
-	mov	x2, #T_SIZE
-	bl	_memcpy
-	ldr	x9, [x19, #JOB_DUR]
-	str	x9, [x28, #G_LTDUR]
-	ADDO	x1, x19, JOB_VURL         ; a broadcast's own HLS, for AirPlay
-	ldr	w9, [x19, #JOB_LIVE]
-	GADDR	x10, Ls_slash+1
-	cmp	w9, #0
-	csel	x1, x1, x10, ne
-	BADDR	x0, B_LTVURL
-	mov	x2, #4096
-	bl	_strlcpy
-	str	wzr, [x28, #G_FAILED]
-	str	wzr, [x28, #G_HASVIDEO]
-	str	wzr, [x28, #G_IDLE]       ; the controls stay a moment on a new track
-	ldr	w9, [x19, #JOB_KIND]
-	cmp	w9, #KIND_YOUTUBE
-	b.ne	Llp_engine
-	b	Llp_tube
-	mov	w9, #1                    ; AVPlayer plays it, the engine lets go
-	str	w9, [x28, #G_MODE]
-	adr	x0, eng_close
-	mov	x1, #0
-	bl	eng_cmd
-	ldr	x2, [x19, #JOB_ITEM]
-	cbz	x2, Llp_none
-	str	xzr, [x19, #JOB_ITEM]
-	mov	x20, x2
-	ldr	x0, [x28, #G_PLAYER]
-	SEND	S_replaceCurrentItemWithPlayerItem_
-	mov	x0, x20
-	SEND	S_release
-	ldr	x0, [x28, #G_PLAYER]
-	SEND	S_play
-	bl	local_poll
-	b	Lret3
-Llp_none:
-	CSTR	x0, "Could not play this media."
-	mov	w1, #1
-	bl	set_status
-	b	Lret3
-Llp_engine:
-	bl	eng_mode                  ; the engine plays a file or web media on This Mac
-	ldr	w9, [x19, #JOB_KIND]
-	ldr	x22, [x19, #JOB_QUERY]
-	adr	x23, eng_open
-	mov	w10, #1                   ; AirPlay takes the same file or URL
-	cmp	w9, #KIND_FILE
-	b.eq	1f
-	add	x22, x19, #JOB_URL
-	adr	x23, eng_web
-	mov	w10, #2
-1:	BADDR	x9, B_AIRK
-	str	w10, [x9]
-	BADDR	x0, B_LTPATH
-	mov	x1, x22
-	mov	x2, #1024
-	bl	_strlcpy
-	add	x20, x0, #1               ; the path's size
-	add	x0, x0, #9
-	bl	_malloc
-	cbz	x0, Lret3
-	ldr	w9, [x28, #G_PLAYGEN]
-	str	w9, [x0]
-	mov	x21, x0
-	add	x0, x0, #8
-	mov	x1, x22
-	mov	x2, x20
-	bl	_strlcpy
-	mov	x0, x23
-	mov	x1, x21
-	bl	eng_cmd
-	bl	local_poll
-	b	Lret3
-Llp_tube:
-	BADDR	x20, B_AIR                ; for AirPlay: a broadcast's HLS, else the TV's picture with the sound
-	ADDO	x1, x19, JOB_TVURL
-	mov	x0, x20
-	mov	x2, #4096
-	bl	_strlcpy
-	add	x0, x20, #AIR_A
-	add	x1, x19, #JOB_URL
-	mov	x2, #4096
-	bl	_strlcpy
-	ADDO	x0, x20, AIR_VF
-	ADDO	x1, x19, JOB_TVFMT
-	mov	x2, #FMT_SIZE
-	bl	_memcpy
-	ADDO	x0, x20, AIR_AF
-	add	x1, x19, #JOB_AFMT
-	mov	x2, #FMT_SIZE
-	bl	_memcpy
-	ldr	w9, [x19, #JOB_LIVE]
-	ldrb	w10, [x20]
-	cmp	w10, #0
-	mov	w10, #4
-	csel	w10, w10, wzr, ne
-	cmp	w9, #0
-	mov	w9, #3
-	csel	w9, w9, w10, ne
-	BADDR	x10, B_AIRK
-	str	w9, [x10]
-	bl	eng_mode                  ; a YouTube video: its two streams, straight to the engine
-	mov	x0, #32
-	bl	_malloc
-	cbz	x0, Lret3
-	mov	x20, x0
-	ldr	w9, [x28, #G_PLAYGEN]
-	str	w9, [x20, #YT_GEN]
-	ldr	w9, [x19, #JOB_LIVE]
-	str	w9, [x20, #YT_LIVE]
-	ldr	x9, [x19, #JOB_DUR]
-	mov	x10, #1000
-	mul	x9, x9, x10
-	str	x9, [x20, #YT_DUR]
-	str	xzr, [x20, #YT_V]
-	ADDO	x0, x19, JOB_VURL
-	ldrb	w9, [x0]
-	cbz	w9, 1f
-	bl	_strdup
-	str	x0, [x20, #YT_V]
-1:	add	x0, x19, #JOB_URL
-	bl	_strdup
-	str	x0, [x20, #YT_A]
-	adr	x0, eng_tube
-	mov	x1, x20
-	bl	eng_cmd
-	bl	local_poll
-	b	Lret3
+	VM	Lp_lplay
+	.pushsection __DATA,__data
+Lp_lplay:
+	GL	0
+	ADDH	JOB_TRACK
+	SL	1
+	CALL	F_memcpy, "BbH"
+	.short	B_LTTRACK, T_SIZE
+	GL	0
+	LDX	JOB_DUR
+	STO	G_LTDUR
+	GL	0
+	ADDH	JOB_HLS
+	SL	1
+	CALL	F_strlcpy, "BbH"          ; YouTube's own HLS, for AirPlay
+	.short	B_LTVURL, 4096
+	IMM	0
+	SW	G_FAILED
+	SW	G_HASVIDEO
+	SW	G_IDLE                    ; the controls stay a moment on a new track
+	NCALL	eng_mode
+	GL	0
+	LDW	JOB_KIND
+	SL	3
+	JNZ	Lp_lplay_engine
+	CALL	F_strlen, "=B"            ; YouTube: AirPlay takes its HLS, if it gave one
+	.short	B_LTVURL
+	JZ	Lp_lplay_air
+	IMM	3
+	HERE	Lp_lplay_air
+	STE	B_AIRK
+	CALL	F_malloc, "=I"
+	.byte	32
+	JZ	Lp_lplay_none
+	SL	5
+	LW	G_PLAYGEN
+	STW	5, YT_GEN
+	GL	0
+	LDW	JOB_LIVE
+	STW	5, YT_LIVE
+	GL	0
+	LDX	JOB_DUR
+	MULH	1000
+	STX	5, YT_DUR
+	IMM	0
+	STX	5, YT_V
+	GL	0
+	ADDH	JOB_VURL
+	SL	2
+	LDB	0
+	JZ	Lp_lplay_audio
+	CALL	F_strdup, "=c"
+	STX	5, YT_V
+	HERE	Lp_lplay_audio
+	GL	0
+	ADDH	JOB_URL
+	SL	2
+	CALL	F_strdup, "=c"
+	STX	5, YT_A
+	NCALL	eng_cmd, "Pf"
+	.long	eng_tube - Lvm_base
+	NCALL	local_poll
+	HERE	Lp_lplay_none
+	OP_END
+	HERE	Lp_lplay_engine
+	GL	0
+	LDX	JOB_QUERY
+	SL	2
+	IMM	1                         ; AirPlay takes the same file or URL
+	SL	4
+	GL	3
+	EQ	KIND_FILE
+	JNZ	Lp_lplay_src
+	GL	0
+	ADDH	JOB_URL
+	SL	2
+	IMM	2
+	SL	4
+	HERE	Lp_lplay_src
+	GL	4
+	STE	B_AIRK
+	CALL	F_strlcpy, "=BcH"
+	.short	B_LTPATH, 1024
+	ADDI	1
+	SL	4                         ; the source's size
+	ADDI	8
+	SL	5
+	CALL	F_malloc, "=f"
+	JZ	Lp_lplay_end
+	SL	5                         ; the request: the generation, then the source
+	LW	G_PLAYGEN
+	STW	5, 0
+	GL	5
+	ADDI	8
+	SL	6
+	CALL	F_strlcpy, "gce"
+	GL	3
+	EQ	KIND_FILE
+	JZ	Lp_lplay_web
+	NCALL	eng_cmd, "Pf"
+	.long	eng_open - Lvm_base
+	JMP	Lp_lplay_poll
+	HERE	Lp_lplay_web
+	NCALL	eng_cmd, "Pf"
+	.long	eng_web - Lvm_base
+	HERE	Lp_lplay_poll
+	NCALL	local_poll
+	HERE	Lp_lplay_end
+	OP_END
+	.popsection
 
 ; eng_mode — the engine plays: AVPlayer lets go.
 eng_mode:
@@ -3370,10 +4102,9 @@ Llq_poll:
 	b.ne	Llq_item
 	ldr	w9, [x28, #G_FAILED]
 	cbnz	w9, Llq_time
-	mov	w9, #1
-	str	w9, [x28, #G_FAILED]
-	CSTR	x0, "Could not play this media."
 	mov	w1, #1
+	str	w1, [x28, #G_FAILED]
+	CSTR	x0, "Could not play this media."
 	bl	set_status
 	b	Llq_time
 Llq_item:
@@ -3383,9 +4114,8 @@ Llq_item:
 	add	x8, sp, #16
 	SEND	S_duration
 	ldr	w9, [sp, #28]             ; flags: valid, and not indefinite or infinite
-	mov	w10, #0x1d
-	and	w9, w9, w10
-	cmp	w9, #1
+	tbz	w9, #0, Llq_size
+	tst	w9, #0x1c
 	b.ne	Llq_size
 	ldr	x9, [sp, #16]
 	ldrsw	x10, [sp, #24]
@@ -3498,77 +4228,90 @@ Llq_efail:
 	ccmp	x23, #RENDER_FAILED, #4, ne
 	b.ne	Llq_show
 	ldr	w0, [x28, #G_PLAYGEN]     ; a decoder refused it: AVPlayer tries
-	bl	Leng_fallback
+	bl	eng_fallback
 	b	Lret4
 
 ; video_tracks(item) — Audio Only turns the item's picture tracks off (nothing is decoded), and back on.
 video_tracks:
-	FRAME	3
-	SEND	S_tracks
-	mov	x19, x0
-	SEND	S_count
-	mov	x20, x0
-	ldr	w9, [x28, #G_AONLY]
-	eor	w21, w9, #1
-	CSTR	x0, "vide"
-	bl	mkstr
-	mov	x22, x0
-Lvt_next:
-	subs	x20, x20, #1
-	b.lt	Lret3
-	mov	x0, x19
-	mov	x2, x20
-	SEND	S_objectAtIndex_
-	mov	x23, x0
-	SEND	S_assetTrack
-	SEND	S_mediaType
-	mov	x2, x22
-	SEND	S_isEqualToString_
-	cbz	w0, Lvt_next
-	mov	x0, x23
-	SEND	S_isEnabled
-	cmp	w0, w21
-	b.eq	Lvt_next
-	mov	x0, x23
-	mov	w2, w21
-	SEND	S_setEnabled_
-	b	Lvt_next
+	VM	Lp_vtracks
+	.pushsection __DATA,__data
+Lp_vtracks:
+	LW	G_AONLY
+	EQ	0
+	SL	1                         ; b: on
+	GL	0
+	MSG	S_tracks, "="
+	SL	2
+	MSG	S_count, "="
+	SL	3
+	HERE	Lp_vtracks_next
+	GL	3
+	ADDI	-1
+	SL	3
+	LT	0
+	JNZ	Lp_vtracks_end
+	GL	2
+	MSG	S_objectAtIndex_, "=d"
+	SL	4
+	MSG	S_assetTrack, "="
+	MSG	S_mediaType, "="
+	MSG	S_isEqualToString_, ">S"
+	.asciz	"vide"
+	JZ	Lp_vtracks_next
+	GL	4
+	MSG	S_isEnabled, ">"
+	EQL	1
+	JNZ	Lp_vtracks_next
+	GL	4
+	MSG	S_setEnabled_, "b"
+	JMP	Lp_vtracks_next
+	HERE	Lp_vtracks_end
+	OP_END
+	.popsection
 
 ; local_toggle() — play or pause This Mac.
 local_toggle:
-	FRAME	0, 32
-	ldr	w9, [x28, #G_MODE]
-	cbnz	w9, Llt_av
-	ldr	w9, [x28, #G_PLAYING]
-	eor	w9, w9, #1
-	str	w9, [x28, #G_PLAYING]
-	cbz	w9, Llt_rate
-	bl	now_ms                    ; played again at the end: from the start
-	mov	x9, x0
-	ldr	x10, [x27, #E_DURMS]
-	cbz	x10, Llt_rate
-	cmp	x9, x10
-	b.lt	Llt_rate
-	mov	x0, #0
-	bl	local_seekms
-	b	Lret0
-Llt_rate:
-	adr	x0, eng_rate
-	mov	x1, #0
-	bl	eng_cmd
-	bl	local_poll
-	b	Lret0
-Llt_av:
-	ldr	x0, [x28, #G_PLAYER]
-	SEND	S_timeControlStatus
-	cmp	x0, #0                    ; paused: play
-	ldr	x9, [x27, #S_play]
-	ldr	x1, [x27, #S_pause]
-	csel	x1, x9, x1, eq
-	ldr	x0, [x28, #G_PLAYER]
-	bl	_objc_msgSend
-	bl	local_poll
-	b	Lret0
+	VM	Lp_toggle
+	.pushsection __DATA,__data
+Lp_toggle:
+	LW	G_MODE
+	JNZ	Lp_toggle_av
+	LW	G_PLAYING
+	EQ	0
+	SW	G_PLAYING
+	JZ	Lp_toggle_rate
+	NCALL	now_ms, "="               ; played again at the end: from the start
+	SL	0
+	LDE	E_DURMS
+	JZ	Lp_toggle_rate
+	SL	1
+	GL	0
+	SUBL	1
+	LT	0
+	JNZ	Lp_toggle_rate
+	NCALL	local_seekms, "I"
+	.byte	0
+	OP_END
+	HERE	Lp_toggle_rate
+	NCALL	eng_cmd, "PI"
+	.long	eng_rate - Lvm_base
+	.byte	0
+	NCALL	local_poll
+	OP_END
+	HERE	Lp_toggle_av
+	LD	G_PLAYER
+	MSG	S_timeControlStatus, "="
+	JNZ	Lp_toggle_pause           ; paused: play
+	LD	G_PLAYER
+	MSG	S_play
+	JMP	Lp_toggle_poll
+	HERE	Lp_toggle_pause
+	LD	G_PLAYER
+	MSG	S_pause
+	HERE	Lp_toggle_poll
+	NCALL	local_poll
+	OP_END
+	.popsection
 
 ; local_seek(seconds) — jump to a position on This Mac.
 local_seek:
@@ -3645,73 +4388,80 @@ local_mute:
 vol_apply:
 	FRAME	0
 	ldr	x0, [x28, #G_PLAYER]
-	ldr	w9, [x28, #G_VOLPCT]
-	scvtf	s0, w9
-	ldr	s1, [x28, #(Lf_100 - G)]
-	fdiv	s0, s0, s1
-	SEND	S_setVolume_
-	ldr	x0, [x28, #G_PLAYER]
-	ldr	w2, [x28, #G_MUTED]
-	SEND	S_setMuted_
+	bl	vol_to
 	adr	x0, eng_vol
 	mov	x1, #0
 	bl	eng_cmd
 	bl	local_poll
 	b	Lret0
 
+; vol_to(player) — an AVPlayer or the sound renderer takes G's volume and mute.
+vol_to:
+	VMT
+	LW	G_VOLPCT
+	FI
+	FOPK	3, 1600
+	FS	1
+	GL	0
+	MSG	S_setVolume_, "W"
+	.byte	1
+	LW	G_MUTED
+	SL	1
+	GL	0
+	MSG	S_setMuted_, "b"
+	OP_END
+	.p2align 2
+
 ; air_prepare(self, _cmd, picker) — AirPlay's routes are shown: the dormant AVPlayer gets This Mac's media, paused, so that a picked TV takes it.
-	ENTRY	air_prepare
-	FRAME	1
-	ldr	w9, [x28, #G_MODE]
-	cbnz	w9, Lret1                 ; AVPlayer plays it already
-	ldr	x0, [x28, #G_PLAYER]
-	SEND	S_currentItem
-	cbnz	x0, Lret1
-	BADDR	x9, B_AIRK
-	ldr	w9, [x9]
-	cmp	w9, #4
-	b.eq	Lap_tv
-	BADDR	x19, B_LTPATH
-	cmp	w9, #3
-	b.hi	Lret1
-	b.lo	1f
-	BADDR	x19, B_LTVURL             ; a broadcast's own HLS
-1:	cmp	w9, #1
-	b.lo	Lret1
-	b.ne	2f
-	mov	x0, x19                   ; a file
-	bl	mkstr
-	mov	x2, x0
-	CLASS	x0, NSURL
-	SEND	S_fileURLWithPath_
-	mov	x2, x0
-	CLASS	x0, AVPlayerItem
-	SEND	S_playerItemWithURL_
-	SEND	S_retain
-	b	air_item
-2:	mov	x0, x19
-	bl	make_item
-	b	air_item
-Lap_tv:
-	ldr	w9, [x28, #G_PORT]        ; YouTube: the LAN server, started on first use
-	cbnz	w9, 1f
-	bl	server_start
-	cbz	w0, Lret1
-1:	mov	x0, #(8 + AIR_SIZE)       ; the TV's HLS made on a worker, from a copy
-	bl	_malloc
-	cbz	x0, Lret1
-	mov	x19, x0
-	ldr	w9, [x28, #G_PLAYGEN]
-	str	w9, [x19]
-	add	x0, x19, #8
-	BADDR	x1, B_AIR
-	mov	x2, #AIR_SIZE
-	bl	_memcpy
-	WORKQ
-	mov	x1, x19
-	adr	x2, tv_build
-	bl	_dispatch_async_f
-	b	Lret1
+	VMENTRY	air_prepare, Lp_air
+	.pushsection __DATA,__data
+Lp_air:
+	LW	G_MODE
+	JNZ	Lp_air_end                ; AVPlayer plays it already
+	LD	G_PLAYER
+	MSG	S_currentItem, "="
+	JNZ	Lp_air_end
+	LDE	B_AIRK
+	SL	3
+	JZ	Lp_air_end
+	EQ	1
+	JZ	Lp_air_url
+	NCALL	mkstr, "=B"               ; a file
+	.short	B_LTPATH
+	SL	4
+	CLS	NSURL
+	MSG	S_fileURLWithPath_, "=e"
+	SL	4
+	CLS	AVPlayerItem
+	MSG	S_playerItemWithURL_, "=e"
+	MSG	S_retain, "="
+	JMP	Lp_air_item
+	HERE	Lp_air_url
+	GL	3
+	EQ	2
+	JNZ	Lp_air_web
+	GL	3
+	EQ	3
+	JZ	Lp_air_end
+	NCALL	make_item, "=B"           ; YouTube's own HLS
+	.short	B_LTVURL
+	JMP	Lp_air_item
+	HERE	Lp_air_web
+	NCALL	make_item, "=B"
+	.short	B_LTPATH
+	HERE	Lp_air_item
+	JZ	Lp_air_end
+	SL	4                         ; the dormant AVPlayer holds it, silent
+	LD	G_PLAYER
+	MSG	S_setMuted_, "I"
+	.byte	1
+	LD	G_PLAYER
+	MSG	S_replaceCurrentItemWithPlayerItem_, "e"
+	GL	4
+	MSG	S_release
+	HERE	Lp_air_end
+	OP_END
+	.popsection
 
 ; air_handoff — AirPlay took the dormant AVPlayer: the engine stops, AVPlayer plays on from the engine's moment, at its speed and volume.
 air_handoff:
@@ -3734,358 +4484,29 @@ air_handoff:
 1:	bl	stage_update
 	b	Lret1
 
-; air_item(item) — the dormant AVPlayer holds it (retained here), silent (in a FRAME 1 of air_prepare or tv_ready).
-air_item:
-	cbz	x0, Lret1
-	mov	x19, x0
-	ldr	x0, [x28, #G_PLAYER]
-	mov	w2, #1
-	SEND	S_setMuted_
-	ldr	x0, [x28, #G_PLAYER]
-	mov	x2, x19
-	SEND	S_replaceCurrentItemWithPlayerItem_
-	mov	x0, x19
-	SEND	S_release
-	b	Lret1
-
-; tv_ready(job) — main: the TV's HLS is served; its LAN URL (after the generation) becomes the dormant AVPlayer's item, if the media is still this one.
-	ENTRY	tv_ready
-	FRAME	1
-	mov	x19, x0
-	ldr	w9, [x19]
-	ldr	w10, [x28, #G_PLAYGEN]
-	ldr	w11, [x28, #G_MODE]
-	cmp	w9, w10
-	ccmp	w11, #0, #0, eq
-	b.ne	1f
-	add	x0, x19, #8
-	bl	make_item
-	mov	x9, x19
-	mov	x19, x0
-	mov	x0, x9
-	bl	_free
-	mov	x0, x19
-	b	air_item
-1:	mov	x0, x19
-	bl	_free
-	b	Lret1
-
-; tv_build(job) — a worker: a YouTube video's HLS for a TV (its H.264 picture, AAC sound, segments straight from the CDN by their sidx), served on the LAN; then tv_ready with its URL.
-	.equ TB_OUT,	48                ; asprintf's result
-	.equ TB_V,	56                ; the picture's playlist URL [256], the sound's [256], the master's [256]
-	.equ TB_A,	312
-	.equ TB_M,	568
-	.equ TB_SIZE,	832
-	ENTRY	tv_build
-	FRAME	3, TB_SIZE
-	mov	x19, x0
-	bl	_objc_autoreleasePoolPush
-	mov	x21, x0
-	add	x20, x19, #8              ; the copy
-	mov	x0, x20
-	ADDO	x1, x20, AIR_VF
-	add	x2, sp, #TB_V
-	bl	tv_media
-	cbz	w0, Ltb_end
-	add	x0, x20, #AIR_A
-	ADDO	x1, x20, AIR_AF
-	add	x2, sp, #TB_A
-	bl	tv_media
-	cbz	w0, Ltb_end
-	add	x0, sp, #TB_A             ; the master: the picture's variant with its sound, by relative URIs
-	GADDR	x1, Ls_stream
-	bl	_strstr
-	add	x9, x0, #8
-	str	x9, [sp]
-	ADDO	x9, x20, AIR_VF
-	ldr	x10, [x9, #FMT_RATE]
-	ADDO	x11, x20, AIR_AF
-	ldr	x12, [x11, #FMT_RATE]
-	add	x10, x10, x12
-	add	x9, x9, #FMT_CODECS
-	add	x11, x11, #FMT_CODECS
-	stp	x10, x9, [sp, #8]
-	str	x11, [sp, #24]
-	add	x0, sp, #TB_V
-	GADDR	x1, Ls_stream
-	bl	_strstr
-	add	x9, x0, #8
-	str	x9, [sp, #32]
-	add	x0, sp, #TB_OUT
-	CSTR	x1, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"Sound\",DEFAULT=YES,AUTOSELECT=YES,URI=\"%s\"\n#EXT-X-STREAM-INF:BANDWIDTH=%llu,CODECS=\"%s,%s\",AUDIO=\"a\"\n%s\n"
-	bl	_asprintf
-	tbnz	w0, #31, Ltb_end
-	ldr	x0, [sp, #TB_OUT]
-	add	x1, sp, #TB_M
-	bl	slot_uri
-	ldr	x0, [sp, #TB_OUT]
-	bl	_free
-	bl	discover_lan              ; for the TV: our LAN address, not loopback
-	cbz	x0, Ltb_end
-	and	w9, w0, #0xff
-	ubfx	w10, w0, #8, #8
-	ubfx	w11, w0, #16, #8
-	lsr	w12, w0, #24
-	stp	x9, x10, [sp]
-	stp	x11, x12, [sp, #16]
-	ldr	w9, [x28, #G_PORT]
-	str	x9, [sp, #32]
-	add	x0, sp, #TB_M
-	GADDR	x1, Ls_stream
-	bl	_strstr
-	str	x0, [sp, #40]
-	add	x0, x19, #8               ; over the copy: the job is the URL now
-	mov	x1, #256
-	CSTR	x2, "http://%u.%u.%u.%u:%u%s"
-	bl	_snprintf
-	adr	x0, tv_ready
-	mov	x1, x19
-	bl	post_main
-	mov	x19, #0
-Ltb_end:
-	mov	x0, x21
-	bl	_objc_autoreleasePoolPop
-	mov	x0, x19
-	bl	_free
-	b	Lret3
-
-; tv_media(url, fmt, out) -> w0 = 1 when a VOD playlist of the stream's segments (by its sidx) is served at out's URL.
-	.equ TM_BUF,	32                ; fetch's {data, length}
-	.equ TM_TXT,	48                ; the text {data, length, room}
-	.equ TM_OUT,	72                ; asprintf's result
-	.equ TM_OFF,	80                ; the next segment's offset
-	.equ TM_SIZE,	96
-tv_media:
-	FRAME	4, TM_SIZE
-	mov	x19, x0
-	mov	x20, x1
-	mov	x21, x2
-	mov	w22, #0
-	stp	xzr, xzr, [sp, #TM_TXT]
-	str	xzr, [sp, #(TM_TXT + 16)]
-	stp	xzr, xzr, [sp, #TM_BUF]
-	ldp	x9, x10, [x20, #FMT_IDX0]
-	cbz	x10, Ltm_end
-	add	x11, x10, #1
-	str	x11, [sp, #TM_OFF]
-	stp	x9, x10, [sp]             ; the sidx: a ranged request
-	add	x0, sp, #TM_OUT
-	CSTR	x1, "bytes=%llu-%llu"
-	bl	_asprintf
-	tbnz	w0, #31, Ltm_end
-	mov	x0, x19
-	bl	mkreq
-	mov	x23, x0
-	ldr	x0, [sp, #TM_OUT]
-	bl	mkstr
-	mov	x24, x0
-	ldr	x0, [sp, #TM_OUT]
-	bl	_free
-	cbz	x23, Ltm_end
-	CSTR	x0, "Range"
-	bl	mkstr
-	mov	x3, x0
-	mov	x2, x24
-	mov	x0, x23
-	SEND	S_setValue_forHTTPHeaderField_
-	mov	x0, x23
-	add	x1, sp, #TM_BUF
-	bl	fetch
-	ldp	x23, x24, [sp, #TM_BUF]
-	cmp	x24, #44
-	b.lo	Ltm_end
-	ldr	w9, [x23, #4]
-	TYPE	w10, 's','i','d','x'
-	cmp	w9, w10
-	b.ne	Ltm_end
-	ldr	w25, [x23, #16]
-	rev	w25, w25                  ; timescale
-	ldr	w11, [x23, #24]
-	rev	w11, w11                  ; the first segment's offset past the sidx
-	add	x12, x23, #30
-	ldrb	w9, [x23, #8]
-	cbz	w9, 1f
-	ldr	x11, [x23, #28]
-	rev	x11, x11
-	add	x12, x23, #38
-1:	ldr	x9, [sp, #TM_OFF]
-	add	x9, x9, x11
-	str	x9, [sp, #TM_OFF]
-	ldrh	w26, [x12]
-	rev16	w26, w26                  ; references
-	add	x24, x12, #2
-	mov	w9, #12
-	umaddl	x9, w26, w9, x24
-	ldr	x10, [sp, #(TM_BUF + 8)]
-	add	x10, x23, x10
-	cmp	x9, x10
-	b.hi	Ltm_end                   ; cut short
-	cbz	w25, Ltm_end
-	mov	x9, x24                   ; the longest segment, for the target duration
-	mov	w10, w26
-	mov	w11, #0
-2:	cbz	w10, 3f
-	ldr	w12, [x9, #4]
-	rev	w12, w12
-	cmp	w12, w11
-	csel	w11, w12, w11, hi
-	add	x9, x9, #12
-	sub	w10, w10, #1
-	b	2b
-3:	add	w11, w11, w25
-	sub	w11, w11, #1
-	udiv	w11, w11, w25
-	ldr	x9, [x20, #FMT_INIT]
-	add	x9, x9, #1
-	stp	x11, x19, [sp]
-	str	x9, [sp, #16]
-	add	x0, sp, #TM_OUT
-	CSTR	x1, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:%u\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MAP:URI=\"%s\",BYTERANGE=\"%llu@0\"\n"
-	bl	_asprintf
-	add	x0, sp, #TM_TXT
-	ldr	x1, [sp, #TM_OUT]
-	bl	tm_add
-Ltm_seg:
-	cbz	w26, Ltm_done
-	ldr	w9, [x24]
-	rev	w9, w9
-	and	w9, w9, #0x7fffffff       ; the segment's size
-	ldr	w10, [x24, #4]
-	rev	w10, w10
-	ucvtf	d0, w10
-	ucvtf	d1, w25
-	fdiv	d0, d0, d1                ; and length, seconds
-	ldr	x11, [sp, #TM_OFF]
-	str	d0, [sp]
-	stp	x9, x11, [sp, #8]
-	str	x19, [sp, #24]
-	add	x11, x11, x9
-	str	x11, [sp, #TM_OFF]
-	add	x0, sp, #TM_OUT
-	CSTR	x1, "#EXTINF:%.3f,\n#EXT-X-BYTERANGE:%u@%llu\n%s\n"
-	bl	_asprintf
-	add	x0, sp, #TM_TXT
-	ldr	x1, [sp, #TM_OUT]
-	bl	tm_add
-	add	x24, x24, #12
-	sub	w26, w26, #1
-	b	Ltm_seg
-Ltm_done:
-	add	x0, sp, #TM_TXT
-	CSTR	x1, "#EXT-X-ENDLIST\n"
-	mov	x2, #16                   ; with its NUL
-	bl	buf_add
-	ldr	x0, [sp, #TM_TXT]
-	cbz	x0, Ltm_end
-	mov	x1, x21
-	bl	slot_uri
-	mov	w22, #1
-Ltm_end:
-	ldr	x0, [sp, #TM_BUF]
-	bl	_free
-	ldr	x0, [sp, #TM_TXT]
-	bl	_free
-	mov	w0, w22
-	b	Lret4
-
-; tm_add(text, line) — a malloc'd line (0: none) onto a text buffer, then freed.
-tm_add:
-	FRAME	2
-	mov	x19, x0
-	mov	x20, x1
-	cbz	x1, Lret2
-	mov	x0, x1
-	bl	_strlen
-	mov	x2, x0
-	mov	x0, x19
-	mov	x1, x20
-	bl	buf_add
-	mov	x0, x20
-	bl	_free
-	b	Lret2
-; discover_lan() -> x0 = our private IPv4 network, mask << 32 | address (en0's, else the first one; 0 without one), also into G_LAN.
-discover_lan:
-	FRAME	3, 16
-	mov	x0, sp
-	bl	_getifaddrs
-	mov	x21, #0                   ; the chosen interface
-	mov	x22, #0
-	cbnz	w0, Ldl_ret
-	ldr	x19, [sp]
-Ldl_loop:
-	cbz	x19, Ldl_take
-	ldr	x9, [x19, #IFA_ADDR]
-	cbz	x9, Ldl_next
-	ldrb	w10, [x9, #1]
-	cmp	w10, #AF_INET
-	b.ne	Ldl_next
-	ldr	x10, [x19, #IFA_NETMASK]
-	cbz	x10, Ldl_next
-	ldr	w10, [x19, #IFA_FLAGS]
-	tbz	w10, #0, Ldl_next         ; IFF_UP
-	tbnz	w10, #3, Ldl_next         ; IFF_LOOPBACK
-	ldr	w10, [x9, #4]
-	rev	w20, w10                  ; address in host order
-	lsr	w10, w20, #24
-	cmp	w10, #10                  ; 10.0.0.0/8
-	b.eq	Ldl_private
-	lsr	w10, w20, #20
-	cmp	w10, #0xac1               ; 172.16.0.0/12
-	b.eq	Ldl_private
-	lsr	w10, w20, #16
-	mov	w11, #0xc0a8              ; 192.168.0.0/16
-	cmp	w10, w11
-	b.ne	Ldl_next
-Ldl_private:
-	cbnz	x21, Ldl_en0
-	mov	x21, x19                  ; the first one, unless en0 comes later
-Ldl_en0:
-	ldr	x0, [x19, #IFA_NAME]
-	CSTR	x1, "en0"
-	bl	_strcmp
-	cbnz	w0, Ldl_next
-	mov	x21, x19
-	b	Ldl_take
-Ldl_next:
-	ldr	x19, [x19]
-	b	Ldl_loop
-Ldl_take:
-	cbz	x21, Ldl_free
-	ldr	x9, [x21, #IFA_ADDR]
-	ldr	w20, [x9, #4]
-	ldr	x10, [x21, #IFA_NETMASK]
-	ldr	w10, [x10, #4]
-	orr	x22, x20, x10, lsl #32
-Ldl_free:
-	ldr	x0, [sp]
-	bl	_freeifaddrs
-Ldl_ret:
-	str	x22, [x28, #G_LAN]        ; one store: readers see a matching pair
-	mov	x0, x22
-	b	Lret3
-
 ; ---- Network: one NSURLSession; its delegate (the controller) runs on the media queue ----
 
 ; mkreq(url) -> an NSMutableURLRequest for a URL string (API_TIMEOUT_MS without data ends it), or nil.
 mkreq:
-	FRAME	0
-	bl	mkurl
-	cbz	x0, Lret0
-	mov	x2, x0
-	CLASS	x0, NSMutableURLRequest
-	SEND	S_requestWithURL_
-	str	x0, [sp, #-16]!
-	mov	x9, #(API_TIMEOUT_MS / 1000)
-	scvtf	d0, x9
-	SEND	S_setTimeoutInterval_
-	ldr	x0, [sp], #16
-	b	Lret0
+	VM	Lp_mkreq
+	.pushsection __DATA,__data
+Lp_mkreq:
+	NCALL	mkurl, "=a"
+	JZ	Lp_mkreq_end
+	SL	1
+	CLS	NSMutableURLRequest
+	MSG	S_requestWithURL_, "=b"
+	SL	1
+	MSG	S_setTimeoutInterval_, "D"
+	.short	API_TIMEOUT_MS / 1000 * 4
+	GL	1
+	HERE	Lp_mkreq_end
+	OP_END
+	.popsection
 
 ; hdrs(request, pairs) -> the request, with each name and value of a packed list as a header (an empty name ends it); x1 = what follows.
 hdrs:
-	FRAME	2
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	2, 0, 1
 Lhs_next:
 	ldrb	w9, [x20]
 	cbz	w9, Lhs_end
@@ -4111,8 +4532,7 @@ Lhs_end:
 
 ; net_start(record) — start its request; the table finds the record from the task's callbacks (media queue).
 	ENTRY	net_start
-	FRAME	1
-	mov	x19, x0
+	FRAME	1, 0, 1
 	ldr	x0, [x27, #E_SESSION]
 	ldr	x2, [x19, #RQ_REQ]
 	SEND	S_dataTaskWithRequest_
@@ -4228,7 +4648,7 @@ sink_buf:
 done_sync:
 	str	w1, [x0, #RQ_OK]
 	ldr	x0, [x0, #RQ_SEM]
-	b	_dispatch_semaphore_signal
+	JUMPF	dispatch_semaphore_signal
 
 ; fetch(request, buf) — run a request from a worker thread and wait; buf {data, len} gets the body; w0 = 1 for a 2xx answer, buf empty otherwise.
 fetch:
@@ -4241,14 +4661,14 @@ fetch:
 	stp	xzr, xzr, [sp, #RQ_BUF]
 	str	wzr, [sp, #RQ_OK]
 	mov	x0, #0
-	bl	_dispatch_semaphore_create
+	CALLF	dispatch_semaphore_create
 	str	x0, [sp, #RQ_SEM]
 	adr	x0, net_start
 	mov	x1, sp
 	bl	eng_cmd
 	ldr	x0, [sp, #RQ_SEM]
 	mov	x1, #DISPATCH_TIME_FOREVER
-	bl	_dispatch_semaphore_wait
+	CALLF	dispatch_semaphore_wait
 	ldr	x0, [sp, #RQ_SEM]
 	SEND	S_release
 	ldr	w20, [sp, #RQ_OK]
@@ -4266,8 +4686,7 @@ fetch:
 	.equ SP_URL,	16                ; char[4200]: a live segment's URL
 	.equ SP_SIZE,	4224
 st_pump:
-	FRAME	2, SP_SIZE
-	mov	x19, x0
+	FRAME	2, SP_SIZE, 1
 	cbz	x19, Lret2
 	ldr	x9, [x19, #ST_URL]
 	ldr	x10, [x19, #ST_PLURL]
@@ -4347,12 +4766,12 @@ Lpu_req:
 	stp	x9, x10, [sp]
 	add	x0, sp, #SP_URL
 	mov	x1, #64
-	CSTR	x2, "bytes=%lld-%lld"
+	GADDR	x2, Ls_bytes
 	bl	_snprintf
 	add	x0, sp, #SP_URL
 	bl	mkstr
 	mov	x21, x0
-	CSTR	x0, "Range"
+	GADDR	x0, Ls_range
 	bl	mkstr
 	mov	x3, x0
 	mov	x2, x21
@@ -4360,7 +4779,7 @@ Lpu_req:
 	SEND	S_setValue_forHTTPHeaderField_
 Lpu_go:
 	ldr	x0, [x19, #ST_URL]
-	CSTR	x1, "googlevideo"
+	GADDR	x1, Ls_gvideo
 	bl	_strstr
 	cbz	x0, 1f
 	mov	x0, x20                   ; YouTube's CDN speaks QUIC
@@ -4567,9 +4986,7 @@ Lsd_live:
 	SEND	S_valueForHTTPHeaderField_
 	SEND	S_UTF8String
 	cbz	x0, Lsd_end
-	mov	x1, #0
-	mov	w2, #10
-	bl	_strtol
+	bl	strtol10
 	add	x0, x0, #1
 	str	x0, [x19, #ST_SQ]
 	b	Lsd_pump
@@ -4618,8 +5035,7 @@ Lsd_end:
 
 ; st_reset(stream) — stop its request and parsing; what it fed stays queued.
 st_reset:
-	FRAME	1
-	mov	x19, x0
+	FRAME	1, 0, 1
 	add	x0, x19, #ST_RQ
 	bl	rq_drop
 	ldr	x0, [x19, #ST_BBUF]
@@ -4639,9 +5055,7 @@ st_reset:
 
 ; st_seek(stream, ms) — its tracks drop what is queued and start again at the sync sample before that moment; a stream without its index yet starts over and seeks once it has it.
 st_seek:
-	FRAME	3
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	3, 0, 1
 	bl	st_reset
 	str	x20, [x19, #ST_PEND]
 	add	x21, x19, #ST_TR          ; each track: its target, nothing queued
@@ -4726,8 +5140,7 @@ Lsk_go:
 
 ; trk_target(track, ms) — the track restarts at that moment: queue emptied, earlier samples decoded only.
 trk_target:
-	FRAME	1
-	mov	x19, x0
+	FRAME	1, 0, 1
 	mov	x9, #-1
 	str	x9, [x19, #TR_APTS]       ; packed sound times itself again
 	ldr	w9, [x19, #TR_TS]
@@ -4809,9 +5222,7 @@ sidx_find:
 
 ; st_parse(stream, bytes, length) — boxes as they come: small ones collected and read, media data into arenas, the rest skipped.
 st_parse:
-	FRAME	3
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	3, 0, 1
 	mov	x21, x2
 Lsp_loop:
 	cbz	x21, Lret3
@@ -4994,8 +5405,7 @@ Lsp_eat:
 
 ; arena_new(stream) -> x0 = 1 with a new arena for the media data, carrying over the bytes of the earliest sample not given yet; 0 without memory.
 arena_new:
-	FRAME	3, 16
-	mov	x19, x0
+	FRAME	3, 16, 1
 	bl	st_keep                   ; x0 = the stream position still needed
 	ldp	x9, x10, [x19, #ST_ARPOS]
 	add	x10, x9, x10              ; the old arena's end
@@ -5192,8 +5602,7 @@ aonly_drop:
 
 ; box_done(stream) -> w0 = 1 when reading the collected box moved the stream elsewhere.
 box_done:
-	FRAME	2
-	mov	x19, x0
+	FRAME	2, 0, 1
 	str	wzr, [x19, #ST_PST]
 	ldr	w9, [x19, #ST_BOXT]
 	ldp	x20, x21, [x19, #ST_BBUF]
@@ -5329,18 +5738,14 @@ Lmv_done:
 	mov	x0, x20
 	bl	no_pic
 	ldr	w9, [x20, #ST_FRAG]
-	cbnz	w9, Lmv_stay
+	cbnz	w9, Lnil4
 	ldr	x9, [x20, #ST_MDEND]
-	cbz	x9, Lmv_stay              ; the media data follows
+	cbz	x9, Lnil4              ; the media data follows
 	mov	x0, x20                   ; it came first: back to it
 	ldr	x1, [x27, #E_TGTMS]
 	bl	st_seek
 	mov	w0, #1
 	b	Lret4
-Lmv_stay:
-	mov	w0, #0
-	b	Lret4
-
 ; trk_attach(stream) -> w0 = 1 when the track is fed by the stream, if it has room: its queue, its target; the first of its kind plays (x19 = track).
 trk_attach:
 	FRAME	1, 16
@@ -5650,8 +6055,7 @@ Ltr_none:
 
 ; st_open(stream, url, live) — start a stream from its first byte (the URL is the stream's); its size from the URL's clen, if any.
 st_open:
-	FRAME	1
-	mov	x19, x0
+	FRAME	1, 0, 1
 	str	x1, [x19, #ST_URL]
 	str	w2, [x19, #ST_LIVE]
 	mov	x0, x1
@@ -5659,9 +6063,7 @@ st_open:
 	bl	_strstr
 	cbz	x0, 1f
 	add	x0, x0, #5
-	mov	x1, #0
-	mov	w2, #10
-	bl	_strtol
+	bl	strtol10
 	str	x0, [x19, #ST_LEN]
 1:	mov	x0, x19
 	bl	st_pump
@@ -5669,8 +6071,7 @@ st_open:
 
 ; st_close(stream) — stop it and free what it keeps.
 st_close:
-	FRAME	2
-	mov	x19, x0
+	FRAME	2, 0, 1
 	bl	st_reset
 	adr	x20, Lst_owned
 1:	ldrh	w9, [x20], #2
@@ -5710,9 +6111,7 @@ line_end:
 
 ; attr(line, end, name) -> x0 = name's value in [line, end), without quotes, x1 = its end; x0 = 0 if absent (name ends with '=').
 attr:
-	FRAME	2
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	2, 0, 1
 	mov	x21, x2
 	mov	x0, x2
 	bl	_strlen
@@ -5754,18 +6153,14 @@ La_bare:
 
 ; attr_num(line, name) -> x0 = name's decimal value in the line, 0 if absent.
 attr_num:
-	FRAME	1
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	1, 0, 1
 	bl	line_end
 	mov	x1, x0
 	mov	x0, x19
 	mov	x2, x20
 	bl	attr
 	cbz	x0, Lret1
-	mov	x1, #0
-	mov	w2, #10
-	bl	_strtol
+	bl	strtol10
 	b	Lret1
 
 ; seg_scan(stream, mode, value, out) -> w0 = 1 with out the media playlist's segment: mode 0 by media sequence number, 1 by time (ms); out's playlist fields are filled either way.
@@ -5844,15 +6239,13 @@ Lsg_tag:
 	cmp	w9, #'A'
 	b.eq	Lsg_map
 	add	x0, x22, #22              ; #EXT-X-MEDIA-SEQUENCE:
-	mov	x1, #0
-	mov	w2, #10
-	bl	_strtol
+	bl	strtol10
 	str	x0, [x19, #SG_SEQ0]
 	b	Lsg_next
 Lsg_inf:
 	add	x0, x22, #8
 	mov	x1, #0
-	bl	_strtod
+	CALLF	strtod
 	mov	x9, #1000
 	scvtf	d1, x9
 	fmul	d0, d0, d1
@@ -5870,9 +6263,7 @@ Lsg_br:
 	cmp	w10, #'@'
 	b.ne	1f
 	add	x0, x9, #1
-	mov	x1, #0
-	mov	w2, #10
-	bl	_strtol
+	bl	strtol10
 	mov	x11, x0
 1:	str	x11, [x19, #SG_BRO]
 	b	Lsg_next
@@ -5890,9 +6281,7 @@ Lsg_map:
 	b	Lsg_next
 Lsg_tdur:
 	add	x0, x22, #22
-	mov	x1, #0
-	mov	w2, #10
-	bl	_strtol
+	bl	strtol10
 	mov	x9, #1000
 	mul	x0, x0, x9
 	str	w0, [x19, #SG_TDUR]
@@ -5915,206 +6304,226 @@ Lsg_next:
 Lsg_none:
 	str	w26, [x19, #SG_N]
 	str	x23, [x19, #SG_T]         ; the playlist's length
-	mov	w0, #0
-	b	Lret4
+	b	Lnil4
 
-; url_join(base, uri, end) -> x0 = the absolute URL (malloc) of a URI in [uri, end), relative to base; 0 if not one.
-	.equ UJ_BUF,	4112
+; url_join(base, uri, end) -> x0 = the absolute URL (malloc) of a URI in [uri, end), relative to base; 0 if not one (media queue).
 url_join:
-	FRAME	1, UJ_BUF
-	mov	x19, x0
-	sub	x2, x2, x1
-	mov	x9, #4095
-	cmp	x2, x9
-	csel	x2, x2, x9, lo
-	add	x2, x2, #1
-	mov	x0, sp
-	bl	_strlcpy
-	mov	x0, x19
-	bl	mkurl
-	mov	x19, x0
-	mov	x0, sp
-	bl	mkstr
-	mov	x2, x0
-	mov	x3, x19
-	CLASS	x0, NSURL
-	SEND	S_URLWithString_relativeToURL_
-	SEND	S_absoluteString
-	SEND	S_UTF8String
-	cbz	x0, Lret1
-	bl	_strdup
-	b	Lret1
+	VM	Lp_ujoin
+	.pushsection __DATA,__data
+Lp_ujoin:
+	GL	2
+	SUBL	1
+	FI
+	FOPK	4, 4095 * 16              ; at most 4095 bytes of it
+	FT
+	ADDI	1
+	SL	2
+	CALL	F_strlcpy, "Bbc"
+	.short	B_UJ
+	NCALL	mkurl, "=a"
+	SL	3
+	NCALL	mkstr, "=B"
+	.short	B_UJ
+	SL	4
+	CLS	NSURL
+	MSG	S_URLWithString_relativeToURL_, "=ed"
+	MSG	S_absoluteString, "="
+	MSG	S_UTF8String, "="
+	JZ	Lp_ujoin_end
+	CALL	F_strdup, "=V"
+	HERE	Lp_ujoin_end
+	OP_END
+	.popsection
 
 ; hls_pick() -> w0 = 1 with the master playlist's variant for the measured speed as the first stream's playlist, and the first time its sound rendition as the second's.
 hls_pick:
-	FRAME	4, 16
-	ldr	x9, [x27, #E_BPS]
-	mov	x23, #(BPS_START & 0xffff)
-	movk	x23, #(BPS_START >> 16), lsl #16
-	cbz	x9, 1f
-	mov	x10, #5
-	udiv	x23, x9, x10
-	lsl	x23, x23, #2              ; four fifths of it
-1:	ldr	x19, [x27, #E_MASTER]
-	mov	x20, #0                   ; the best line that fits, and its bandwidth
-	mov	x21, #0
-	mov	x22, #0                   ; the lowest, and its bandwidth
-	mov	x24, #-1
-	mov	x0, x19
-	CSTR	x1, "mp4a.40.2"
-	bl	_strstr
-	str	x0, [sp]                  ; the master lists AAC-LC
-Lpk_line:
-	ldrb	w9, [x19]
-	cbz	w9, Lpk_done
-	mov	x0, x19
-	CSTR	x1, "#EXT-X-STREAM-INF:"
-	mov	x2, #18
-	bl	_strncmp
-	cbnz	w0, Lpk_next
-	ldr	x9, [sp]
-	cbz	x9, 6f
-	mov	x0, x19                   ; AAC-LC variants only, when there are any
-	bl	line_end
-	sub	x2, x0, x19
-	mov	x0, x19
-	CSTR	x1, "mp4a.40.2"
-	bl	_strnstr
-	cbz	x0, Lpk_next
-6:	mov	x0, x19
-	CSTR	x1, "BANDWIDTH="
-	bl	attr_num
-	cmp	x0, x24
-	b.hs	1f
-	mov	x24, x0
-	mov	x22, x19
-1:	cmp	x0, x23
-	ccmp	x0, x21, #0, ls
-	b.ls	Lpk_next
-	mov	x21, x0
-	mov	x20, x19
-Lpk_next:
-	mov	x0, x19
-	bl	line_end
-	mov	x19, x1
-	b	Lpk_line
-Lpk_done:
-	cmp	x20, #0
-	csel	x20, x22, x20, eq         ; none fits: the lowest
-	mov	w0, #0
-	cbz	x20, Lret4
-	mov	x0, x20                   ; its URI: the next line that is not a tag
-	bl	line_end
-	mov	x19, x1
-2:	ldrb	w9, [x19]
-	cbz	w9, Lpk_no
-	mov	w10, #' '
-	cmp	w9, #'#'
-	ccmp	w9, w10, #0, ne
-	b.hi	3f
-	mov	x0, x19
-	bl	line_end
-	mov	x19, x1
-	b	2b
-3:	mov	x0, x19
-	bl	line_end
-	mov	x2, x0
-	ldr	x0, [x27, #E_MURL]
-	mov	x1, x19
-	bl	url_join
-	cbz	x0, Lpk_no
-	BADDR	x21, E_ST
-	mov	x1, x0
-	mov	x0, x21
-	bl	pl_set
-	ldr	w9, [x27, #(E_ST + ST_SIZE + ST_KIND)]
-	cbnz	w9, Lpk_yes               ; the sound rendition was chosen already
-	mov	x0, x20                   ; its sound: AUDIO="group" names an EXT-X-MEDIA with a URI
-	bl	line_end
-	mov	x1, x0
-	mov	x0, x20
-	CSTR	x2, "AUDIO="
-	bl	attr
-	cbz	x0, Lpk_yes
-	mov	x23, x0
-	sub	x24, x1, x0               ; the group's name and length
-	ldr	x19, [x27, #E_MASTER]
-	mov	x22, #0                   ; the rendition chosen
-Lpk_media:
-	ldrb	w9, [x19]
-	cbz	w9, Lpk_found
-	mov	x0, x19
-	CSTR	x1, "#EXT-X-MEDIA:"
-	mov	x2, #13
-	bl	_strncmp
-	cbnz	w0, Lpk_mnext
-	mov	x0, x19
-	bl	line_end
-	mov	x20, x0
-	mov	x0, x19
-	CSTR	x1, "TYPE=AUDIO"
-	sub	x2, x20, x19
-	bl	_strnstr
-	cbz	x0, Lpk_mnext
-	mov	x1, x20
-	mov	x0, x19
-	CSTR	x2, "GROUP-ID="
-	bl	attr
-	cbz	x0, Lpk_mnext
-	sub	x9, x1, x0
-	cmp	x9, x24
-	b.ne	Lpk_mnext
-	mov	x1, x23
-	mov	x2, x24
-	bl	_strncmp
-	cbnz	w0, Lpk_mnext
-	mov	x0, x19
-	mov	x1, x20
-	CSTR	x2, "URI="
-	bl	attr
-	cbz	x0, Lpk_mnext             ; in the variant's own segments
-	cbnz	x22, 4f
-	mov	x22, x19                  ; the first, unless a default follows
-4:	mov	x0, x19
-	CSTR	x1, "DEFAULT=YES"
-	sub	x2, x20, x19
-	bl	_strnstr
-	cbz	x0, Lpk_mnext
-	mov	x22, x19
-	b	Lpk_found
-Lpk_mnext:
-	mov	x0, x19
-	bl	line_end
-	mov	x19, x1
-	b	Lpk_media
-Lpk_found:
-	cbz	x22, Lpk_yes
-	mov	x0, x22
-	bl	line_end
-	mov	x1, x0
-	mov	x0, x22
-	CSTR	x2, "URI="
-	bl	attr
-	mov	x2, x1
-	mov	x1, x0
-	ldr	x0, [x27, #E_MURL]
-	bl	url_join
-	cbz	x0, Lpk_yes
-	mov	x1, x0
-	BADDR	x0, (E_ST + ST_SIZE)
-	bl	pl_set
-Lpk_yes:
-	mov	w0, #1
-	b	Lret4
-Lpk_no:
-	mov	w0, #0
-	b	Lret4
+	VM	Lp_hpick
+	.pushsection __DATA,__data
+Lp_hpick:
+	LDE	E_BPS
+	JZ	Lp_hpk_start
+	DIVH	5
+	SHL	2                         ; four fifths of the measured speed
+	JMP	Lp_hpk_target
+	HERE	Lp_hpk_start
+	IMM	0
+	ADDH	BPS_START / 64
+	MULH	64
+	HERE	Lp_hpk_target
+	SL	5                         ; f: the target
+	IMM	0
+	SL	1                         ; b: the best line that fits, c: its bandwidth
+	SL	2
+	SL	3                         ; d: the lowest, e: its bandwidth
+	IMM	1
+	SHL	62
+	SL	4
+	LDE	E_MASTER
+	SL	0                         ; a: the line
+	CALL	F_strstr, "=aP"
+	.long	Ls_aac - Lvm_base
+	SL	6                         ; g: the master lists AAC-LC
+	HERE	Lp_hpk_line
+	GL	0
+	LDB	0
+	JZ	Lp_hpk_done
+	CALL	F_strncmp, ">aPI"
+	.long	Ls_xstream - Lvm_base
+	.byte	18
+	JNZ	Lp_hpk_next
+	GL	6
+	JZ	Lp_hpk_any
+	NCALL	line_end, "=a"            ; AAC-LC variants only, when there are any
+	SUBL	0
+	SL	7
+	CALL	F_strnstr, "=aPh"
+	.long	Ls_aac - Lvm_base
+	JZ	Lp_hpk_next
+	HERE	Lp_hpk_any
+	NCALL	attr_num, "=aC"
+	.asciz	"BANDWIDTH="
+	SL	7
+	SUBL	4
+	LT	0
+	JZ	Lp_hpk_fit
+	GL	7
+	SL	4
+	GL	0
+	SL	3
+	HERE	Lp_hpk_fit
+	GL	5
+	SUBL	7
+	LT	0
+	JNZ	Lp_hpk_next               ; over the target
+	GL	2
+	SUBL	7
+	LT	0
+	JZ	Lp_hpk_next
+	GL	7
+	SL	2
+	GL	0
+	SL	1
+	HERE	Lp_hpk_next
+	NCALL	line_end, "?a"
+	GL	7
+	SL	0
+	JMP	Lp_hpk_line
+	HERE	Lp_hpk_done
+	GL	1
+	JNZ	Lp_hpk_chosen
+	GL	3                         ; none fits: the lowest
+	SL	1
+	JNZ	Lp_hpk_chosen
+	OP_END
+	HERE	Lp_hpk_chosen
+	NCALL	line_end, "?b"            ; its URI: the next line that is not a tag
+	GL	7
+	SL	0
+	HERE	Lp_hpk_uri
+	GL	0
+	LDB	0
+	JNZ	Lp_hpk_char
+	OP_END
+	HERE	Lp_hpk_char
+	SL	2
+	EQ	'#'
+	JNZ	Lp_hpk_skip
+	GL	2
+	LT	33
+	JZ	Lp_hpk_url
+	HERE	Lp_hpk_skip
+	NCALL	line_end, "?a"
+	GL	7
+	SL	0
+	JMP	Lp_hpk_uri
+	HERE	Lp_hpk_url
+	NCALL	line_end, "=a"
+	SL	7
+	LDE	E_MURL
+	NCALL	url_join, "=Vah"
+	JNZ	Lp_hpk_set
+	OP_END
+	HERE	Lp_hpk_set
+	SL	2
+	NCALL	pl_set, "Bc"
+	.short	E_ST
+	LDEW	E_ST + ST_SIZE + ST_KIND
+	JZ	Lp_hpk_sound
+	HERE	Lp_hpk_yes1               ; the sound rendition was chosen already
+	IMM	1
+	OP_END
+	HERE	Lp_hpk_sound
+	GL	1                         ; its sound: AUDIO="group" names an EXT-X-MEDIA with a URI
+	NCALL	line_end, "=V"
+	SL	7
+	NCALL	attr, "?bhC"
+	.asciz	"AUDIO="
+	JZ	Lp_hpk_yes1
+	SL	2                         ; c: the group's name, d: its length
+	GL	7
+	SUBL	2
+	SL	3
+	IMM	0
+	SL	4                         ; e: the rendition chosen
+	LDE	E_MASTER
+	SL	0
+	HERE	Lp_hpk_media
+	NCALL	media_next, "?aP"
+	.long	Ls_taudio - Lvm_base
+	JZ	Lp_hpk_found
+	SL	5                         ; f: the line, b: its end
+	GL	7
+	SL	1
+	LDE	B_MNEXT
+	SL	0
+	NCALL	attr, "?fbP"
+	.long	Ls_group - Lvm_base
+	JZ	Lp_hpk_media
+	SL	6
+	GL	7
+	SUBL	6
+	EQL	3
+	JZ	Lp_hpk_media
+	CALL	F_strncmp, ">gcd"
+	JNZ	Lp_hpk_media
+	NCALL	attr, "=fbP"
+	.long	Ls_uri - Lvm_base
+	JZ	Lp_hpk_media              ; in the variant's own segments
+	GL	4
+	JNZ	Lp_hpk_def
+	GL	5
+	SL	4                         ; the first, unless a default follows
+	HERE	Lp_hpk_def
+	GL	1
+	SUBL	5
+	SL	7
+	CALL	F_strnstr, "=fCh"
+	.asciz	"DEFAULT=YES"
+	JZ	Lp_hpk_media
+	GL	5
+	SL	4
+	HERE	Lp_hpk_found
+	GL	4
+	JZ	Lp_hpk_yes
+	NCALL	line_end, "=V"
+	SL	7
+	NCALL	attr, "?ehP"
+	.long	Ls_uri - Lvm_base
+	SL	6
+	LDE	E_MURL
+	NCALL	url_join, "=Vgh"
+	JZ	Lp_hpk_yes
+	SL	2
+	NCALL	pl_set, "Bc"
+	.short	E_ST + ST_SIZE
+	HERE	Lp_hpk_yes
+	IMM	1
+	OP_END
+	.popsection
 
 ; pl_set(stream, url) — the stream plays that media playlist (the URL becomes its); a new one is loaded at the next segment.
 pl_set:
-	FRAME	1
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	1, 0, 1
 	ldr	x0, [x19, #ST_PLURL]
 	cbz	x0, 1f
 	mov	x1, x20
@@ -6134,8 +6543,7 @@ pl_set:
 ; st_get(stream, url, type, first, length) — request a URL for the stream (type: ST_REQT); bytes from first, length of them (0: all, or CHUNK of a stream's bytes).
 	.equ GT_BUF,	16
 st_get:
-	FRAME	3, 80
-	mov	x19, x0
+	FRAME	3, 80, 1
 	mov	w22, w2
 	mov	x23, x3
 	mov	x24, x4
@@ -6157,12 +6565,12 @@ st_get:
 	stp	x23, x10, [sp]
 	add	x0, sp, #GT_BUF
 	mov	x1, #64
-	CSTR	x2, "bytes=%lld-%lld"
+	GADDR	x2, Ls_bytes
 	bl	_snprintf
 	add	x0, sp, #GT_BUF
 	bl	mkstr
 	mov	x21, x0
-	CSTR	x0, "Range"
+	GADDR	x0, Ls_range
 	bl	mkstr
 	mov	x3, x0
 	mov	x2, x21
@@ -6173,7 +6581,7 @@ Lgt_go:
 	SEND	S_URL
 	SEND	S_absoluteString
 	SEND	S_UTF8String
-	CSTR	x1, "googlevideo"
+	GADDR	x1, Ls_gvideo
 	bl	_strstr
 	cbz	x0, 2f
 	mov	x0, x20                   ; YouTube's CDN speaks QUIC
@@ -6202,9 +6610,7 @@ Lgt_fail:
 
 ; st_get_own(stream, url, type, first, length) — st_get with a URL (malloc) the stream keeps until its next request.
 st_get_own:
-	FRAME	3
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	3, 0, 1
 	mov	w21, w2
 	mov	x22, x3
 	mov	x23, x4
@@ -6265,8 +6671,7 @@ hexbyte:
 	.equ HP_SEG,	16
 	.equ HP_SIZE,	HP_SEG + SG_SIZE
 hls_pump:
-	FRAME	3, HP_SIZE
-	mov	x19, x0
+	FRAME	3, HP_SIZE, 1
 	ldr	x9, [x19, #ST_PL]
 	ldr	w10, [x19, #ST_STALE]
 	cmp	x9, #0
@@ -6300,7 +6705,6 @@ Lhp_end:
 	bl	st_end
 	b	Lret3
 Lhp_list:
-	str	wzr, [x19, #ST_STALE]
 	ldr	x0, [x19, #ST_PLURL]
 	bl	_strdup
 	mov	x1, x0
@@ -6325,7 +6729,7 @@ Lhp_seg:
 	mov	x21, x0
 	mov	x1, x0
 	mov	x0, x20
-	CSTR	x2, "URI="
+	GADDR	x2, Ls_uri
 	bl	attr
 	cbz	x0, Lhp_map
 	mov	x2, x1
@@ -6374,7 +6778,7 @@ Lhp_map:
 	mov	x21, x0
 	mov	x1, x0
 	mov	x0, x20
-	CSTR	x2, "URI="
+	GADDR	x2, Ls_uri
 	bl	attr
 	cbz	x0, Lhp_get
 	mov	x2, x1
@@ -6405,9 +6809,7 @@ Lhp_map:
 	b.ne	7f
 	str	x4, [sp, #(HP_SEG + SG_BRO)]
 	add	x0, x9, #1
-	mov	x1, #0
-	mov	w2, #10
-	bl	_strtol
+	bl	strtol10
 	mov	x3, x0
 	ldr	x4, [sp, #(HP_SEG + SG_BRO)]
 7:	str	wzr, [x19, #ST_PST]
@@ -6437,8 +6839,7 @@ Lhp_get:
 ; hls_text(stream) — a playlist or key came whole: a master picks its variant and sound, a media playlist replaces the last (the first sets where to start), a key is kept.
 	.equ HT_SEG,	0
 hls_text:
-	FRAME	2, SG_SIZE
-	mov	x19, x0
+	FRAME	2, SG_SIZE, 1
 	ldr	x20, [x19, #ST_TXT]
 	stp	xzr, xzr, [x19, #ST_TXT]  ; the text is its reader's now
 	cbz	x20, Lret2
@@ -6457,7 +6858,7 @@ hls_text:
 	b	Lht_pump
 Lht_list:
 	mov	x0, x20
-	CSTR	x1, "#EXT-X-STREAM-INF:"
+	GADDR	x1, Ls_xstream
 	bl	_strstr
 	cbz	x0, Lht_media
 	ldr	x9, [x27, #E_MASTER]      ; a master playlist, once
@@ -6477,6 +6878,7 @@ Lht_media:
 	ldr	x0, [x19, #ST_PL]
 	bl	_free
 	str	x20, [x19, #ST_PL]
+	str	wzr, [x19, #ST_STALE]
 	ldr	x9, [x19, #ST_SEQ]
 	cbnz	x9, Lht_pump              ; already playing: it goes on from its sequence number
 	mov	x0, x19                   ; the first: the whole playlist read, its length and end
@@ -6522,8 +6924,7 @@ Lht_end:
 
 ; hls_done(stream, ok) — an HLS request ended: text read, a segment flushed (decrypted first) and timed for the bit rate, then the next.
 hls_done:
-	FRAME	3
-	mov	x19, x0
+	FRAME	3, 0, 1
 	mov	w20, w1
 	ldr	w9, [x19, #ST_REQT]
 	cbz	w20, Lhd_fail
@@ -6610,8 +7011,7 @@ Lhd_fail:
 
 ; seg_decrypt(stream) — decrypt the collected segment in place (AES-128-CBC, PKCS7) and read it.
 seg_decrypt:
-	FRAME	1, 48
-	mov	x19, x0
+	FRAME	1, 48, 1
 	ldp	x20, x9, [x19, #ST_TXT]   ; the segment and its length
 	stp	xzr, xzr, [x19, #ST_TXT]
 	cbz	x20, Lret1
@@ -6626,7 +7026,7 @@ seg_decrypt:
 	add	x5, x19, #ST_IV
 	mov	x6, x20
 	mov	x7, x9
-	bl	_CCCrypt
+	CALLF	CCCrypt
 	cbnz	w0, 1f
 	ldr	x2, [sp, #32]
 	mov	x0, x19
@@ -6638,9 +7038,7 @@ seg_decrypt:
 
 ; txt_add(stream, bytes, length) — append to the text being collected (a playlist, a key, an encrypted segment), at most BUF_MAX.
 txt_add:
-	FRAME	3
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	3, 0, 1
 	mov	x21, x2
 	ldp	x0, x22, [x19, #ST_TXT]
 	add	x1, x22, x21
@@ -6682,9 +7080,7 @@ vtt_cues:
 	bl	_strstr
 	cbz	x0, 1f
 	add	x0, x0, #7
-	mov	x1, #0
-	mov	w2, #10
-	bl	_strtol
+	bl	strtol10
 	mov	x9, #90
 	sdiv	x23, x0, x9
 1:	mov	x0, x21
@@ -6825,9 +7221,7 @@ Lvt_part:
 
 ; seg_bytes(stream, bytes, length) — a segment's bytes to its reader: TS, boxes (fMP4), packed audio or WebVTT, as its first byte tells.
 seg_bytes:
-	FRAME	2
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	2, 0, 1
 	mov	x21, x2
 	cbz	x21, Lret2
 	ldr	w9, [x19, #ST_SEGF]
@@ -6871,8 +7265,7 @@ seg_bytes:
 
 ; seg_flush(stream) — a TS segment's last PES of each kind is read now.
 seg_flush:
-	FRAME	1
-	mov	x19, x0
+	FRAME	1, 0, 1
 	ldr	w9, [x19, #ST_SEGF]
 	cmp	w9, #4
 	b.ne	1f
@@ -6892,9 +7285,7 @@ seg_flush:
 
 ; ts_feed(stream, bytes, length) — TS packets, whole or split across calls.
 ts_feed:
-	FRAME	3
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	3, 0, 1
 	mov	x21, x2
 Ltf_loop:
 	cbz	x21, Lret3
@@ -6943,9 +7334,7 @@ Ltf_part:
 
 ; ts_packet(stream, packet) — one 188-byte packet: the program tables, or a picture or sound PES.
 ts_packet:
-	FRAME	2
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	2, 0, 1
 	ldrb	w9, [x20, #1]
 	ldrb	w10, [x20, #2]
 	and	w22, w9, #0x40            ; a unit starts here
@@ -7015,8 +7404,7 @@ ts_pat:
 
 ; ts_pmt(stream, payload, length) — the program map: the first picture (H.264, HEVC) and sound (AAC, MPEG audio, AC-3) PIDs, and their tracks.
 ts_pmt:
-	FRAME	3
-	mov	x19, x0
+	FRAME	3, 0, 1
 	add	x20, x1, x2
 	ldrb	w9, [x1]
 	add	x1, x1, x9
@@ -7103,9 +7491,7 @@ Lpm_end:
 
 ; pes_add(stream, data, length, sound, start) — gather a PES: the previous one is read when the next starts.
 pes_add:
-	FRAME	3
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	3, 0, 1
 	mov	x21, x2
 	mov	w22, w3
 	add	x23, x19, #ST_VPES
@@ -7162,8 +7548,7 @@ Lba_lost:
 
 ; pes_done(stream, sound) — read a gathered PES: its times, anchored on the HLS timeline, then its picture or sound.
 pes_done:
-	FRAME	4
-	mov	x19, x0
+	FRAME	4, 0, 1
 	mov	w22, w1
 	add	x23, x19, #ST_VPES
 	cbz	w22, 1f
@@ -7276,9 +7661,7 @@ next_sc:
 	.equ TV_LEN,	32
 	.equ TV_DUR,	40
 ts_video:
-	FRAME	4, 48
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	4, 48, 1
 	add	x21, x1, x2
 	mov	x22, x3
 	mov	x23, x4
@@ -7655,7 +8038,7 @@ cc_pair:
 	str	w2, [x20]
 	mov	x0, x9
 	mov	x1, x12
-	bl	_memmove
+	CALLF	memmove
 	b	Lcp_yes
 8:	cmp	w1, #0x21                 ; BS
 	b.ne	Lcp_no
@@ -7770,9 +8153,7 @@ cc_cue:
 
 ; vau_next(track, bytes, length, pts, dts) — a picture PES: what comes before its first start code ends the waiting access unit, which goes on; the rest waits (pts -1: all of it ends the waiting one).
 vau_next:
-	FRAME	4
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	4, 0, 1
 	add	x21, x1, x2
 	mov	x22, x3
 	mov	x23, x4
@@ -7851,8 +8232,7 @@ ps_store:
 
 ; ps_format(track) — the picture's format from its stream's parameter sets.
 ps_format:
-	FRAME	1, 64
-	mov	x19, x0
+	FRAME	1, 64, 1
 	ldr	x20, [x19, #TR_ST]
 	add	x9, x20, #ST_PS
 	ldr	w10, [x9]
@@ -7901,7 +8281,7 @@ vid_dims:
 	ldr	x0, [x19, #TR_FD]
 	mov	w1, #1
 	mov	w2, #1
-	bl	_CMVideoFormatDescriptionGetPresentationDimensions
+	CALLF	CMVideoFormatDescriptionGetPresentationDimensions
 	fcvtzu	w9, d0
 	fcvtzu	w10, d1
 	str	w9, [x19, #TR_DW]
@@ -7963,8 +8343,7 @@ afs_more:
 	ldr	x0, [x19, #TR_AFS]
 	ldr	x2, [x27, #E_MAP]
 	add	x2, x2, x9
-	ldr	w3, [x19, #TR_AFLAG]
-	str	wzr, [x19, #TR_AFLAG]
+	mov	w3, #0                    ; no discontinuity flag: AudioFileStreamSeek placed it, and the flag stops WAV and AIFF
 	bl	_AudioFileStreamParseBytes
 	cmp	w0, #0
 	cset	w0, eq
@@ -7972,14 +8351,18 @@ afs_more:
 1:	mov	w0, #0
 	b	Lret0
 
-; afs_get(property, out) -> w0 = 0 when the track's AudioFileStream gave it (out: up to 8 bytes, zeroed first) (x19 = track).
+; afs_get(property, out) -> w0 = 0 when the track's AudioFileStream gave it (out: 8 bytes, zeroed first; afs_get16: 16, the first 8 zeroed) (x19 = track).
+afs_get16:
+	mov	w10, #16
+	b	Lag_size
 afs_get:
+	mov	w10, #8
+Lag_size:
 	FRAME	0, 16
 	str	xzr, [x1]
 	mov	x3, x1
 	mov	w1, w0
-	mov	w9, #8
-	str	w9, [sp]
+	str	w10, [sp]
 	mov	x2, sp
 	ldr	x0, [x19, #TR_AFS]
 	bl	_AudioFileStreamGetProperty
@@ -8034,7 +8417,7 @@ afs_dur:
 2:	str	x9, [x27, #E_DURMS]
 	b	Lret1
 
-; afs_seek(ms) — a sound file from the packet at that moment: AudioFileStreamSeek's byte past its data's start, read as a discontinuity (x19 = track).
+; afs_seek(ms) — a sound file from the packet at that moment: AudioFileStreamSeek's byte past its data's start (x19 = track).
 afs_seek:
 	FRAME	1, 32
 	mov	x20, x0
@@ -8052,7 +8435,7 @@ afs_seek:
 	mov	x2, sp
 	add	x3, sp, #8
 	str	wzr, [sp, #8]
-	bl	_AudioFileStreamSeek
+	CALLF	AudioFileStreamSeek
 	cbnz	w0, 2f
 	mov	w0, #(AFS_DOFF & 0xffff)
 	movk	w0, #(AFS_DOFF >> 16), lsl #16
@@ -8062,27 +8445,24 @@ afs_seek:
 	ldr	x10, [sp, #16]
 	add	x9, x9, x10
 	str	x9, [x19, #TR_OFF]
-	ldr	x9, [sp, #24]             ; that packet's time
+	ldr	x9, [sp, #24]             ; that packet's time, less the priming (before 0: cut as before a target)
 	ldr	w10, [x19, #TR_ASR]
 	ldr	w11, [x19, #TR_AFPP]
 	ldr	w12, [x19, #TR_TS]
+	ldr	w13, [x19, #TR_PRIM]
 	mul	x9, x9, x11
+	sub	x9, x9, x13
 	mul	x9, x9, x12
-	udiv	x9, x9, x10
+	sdiv	x9, x9, x10
 	str	x9, [x19, #TR_APTS]
-	mov	w9, #1
-	str	w9, [x19, #TR_AFLAG]
 	b	Lret1
 2:	str	xzr, [x19, #TR_OFF]       ; it cannot seek: from the start
 	str	xzr, [x19, #TR_APTS]
-	mov	w9, #1
-	str	w9, [x19, #TR_AFLAG]
 	b	Lret1
 
 ; afs_stream(stream) — a web stream of sound: one track it feeds through an AudioFileStream (its type sniffed); no picture waited for.
 afs_stream:
-	FRAME	1
-	mov	x19, x0
+	FRAME	1, 0, 1
 	mov	w9, #2
 	str	w9, [x19, #ST_KIND]
 	mov	w1, #'a'
@@ -8131,36 +8511,30 @@ no_pic:
 
 ; afs_open(track, hint) — the track's packets will come from an AudioFileStream; its format when the stream is ready.
 afs_open:
-	FRAME	0
 	mov	w3, w1
 	add	x4, x0, #TR_AFS
 	adr	x1, afs_prop
 	adr	x2, afs_pkts
-	bl	_AudioFileStreamOpen
-	b	Lret0
+	JUMPF	AudioFileStreamOpen
 
 ; afs_feed(track, bytes, length, pts) — bytes for its AudioFileStream; pts (track units, after the timeline's shift) times the packets that follow, -1 to go on.
 afs_feed:
-	FRAME	0
 	tbnz	x3, #63, 1f
 	str	x3, [x0, #TR_APTS]
-1:	ldr	w3, [x0, #TR_AFLAG]      ; a discontinuity after a seek
-	str	wzr, [x0, #TR_AFLAG]
+1:	mov	w3, #0
 	ldr	x0, [x0, #TR_AFS]
-	cbz	x0, Lret0
+	cbz	x0, 2f
 	mov	x9, x1
 	mov	w1, w2
 	mov	x2, x9
-	bl	_AudioFileStreamParseBytes
-	b	Lret0
+	b	_AudioFileStreamParseBytes
+2:	ret
 
 ; afs_prop(track, stream, property, flags) — ready to produce packets: the track's format from the stream's data format and magic cookie.
 	.equ AP_SIZE,	48
 	.equ AP_FD,	56
 	ENTRY	afs_prop
-	FRAME	2, 64
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	2, 64, 1
 	mov	w9, #(AFS_READY & 0xffff)
 	movk	w9, #(AFS_READY >> 16), lsl #16
 	cmp	w2, w9
@@ -8181,7 +8555,7 @@ afs_feed:
 	movk	w1, #(AFS_COOKIE >> 16), lsl #16
 	add	x2, sp, #AP_SIZE
 	add	x3, sp, #AP_FD
-	bl	_AudioFileStreamGetPropertyInfo
+	CALLF	AudioFileStreamGetPropertyInfo
 	cbnz	w0, 1f
 	ldr	w22, [sp, #AP_SIZE]
 	mov	x0, x22
@@ -8204,7 +8578,7 @@ afs_feed:
 	mov	x5, x21
 	mov	x6, #0
 	add	x7, sp, #AP_FD
-	bl	_CMAudioFormatDescriptionCreate
+	CALLF	CMAudioFormatDescriptionCreate
 	mov	w20, w0
 	mov	x0, x21
 	bl	_free
@@ -8221,6 +8595,13 @@ afs_feed:
 	csinc	w10, w10, wzr, ne
 	str	w9, [x19, #TR_ASR]
 	str	w10, [x19, #TR_AFPP]
+	mov	w0, #(AFS_PNFO & 0xffff)  ; the encoder's priming, if it says
+	movk	w0, #(AFS_PNFO >> 16), lsl #16
+	mov	x1, sp
+	stp	xzr, xzr, [sp]
+	bl	afs_get16
+	ldr	w9, [sp, #8]
+	str	w9, [x19, #TR_PRIM]
 	b	Lret2
 
 ; afs_pkts(track, bytes, packets, data, descriptions) — packets found: one sound sample buffer of them, timed from TR_APTS, cut before a seek's target, queued.
@@ -8228,8 +8609,7 @@ afs_feed:
 	.equ AK_BB,	24
 	.equ AK_PTS,	32
 	ENTRY	afs_pkts
-	FRAME	3, 64
-	mov	x19, x0
+	FRAME	3, 64, 1
 	ldr	x9, [x19, #TR_FD]
 	cbz	x9, Lret3
 	mov	w20, w1
@@ -8270,7 +8650,7 @@ afs_feed:
 	add	x4, sp, #AK_PTS
 	mov	x5, x23
 	add	x6, sp, #AK_SB
-	bl	_CMAudioSampleBufferCreateReadyWithPacketDescriptions
+	CALLF	CMAudioSampleBufferCreateReadyWithPacketDescriptions
 	mov	w24, w0
 	ldr	x0, [sp, #AK_BB]
 	bl	_CFRelease
@@ -8308,23 +8688,21 @@ trim:
 	str	xzr, [sp, #16]
 	mov	x0, sp
 	mov	x1, #0
-	bl	_CMTimeCopyAsDictionary
+	CALLF	CMTimeCopyAsDictionary
 	mov	x21, x0
 	mov	x0, x20
 	ldr	x1, [x27, #F_kCMSampleBufferAttachmentKey_TrimDurationAtStart]
 	ldr	x1, [x1]
 	mov	x2, x21
 	mov	w3, #1                    ; kCMAttachmentMode_ShouldPropagate
-	bl	_CMSetAttachment
+	CALLF	CMSetAttachment
 	mov	x0, x21
 	bl	_CFRelease
 	b	Lret2
 
 ; pa_feed(stream, bytes, length) — packed audio (AAC, MPEG audio, AC-3 frames): each segment's ID3 tag times its first frame.
 pa_feed:
-	FRAME	3
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	3, 0, 1
 	mov	x21, x2
 	mov	x23, #-1                  ; no time: the packets go on
 	ldr	x9, [x19, #ST_GOT]
@@ -8391,9 +8769,7 @@ Lpa_feed:
 
 ; id3_pts(data, length) -> x0 = an ID3 tag's length, x1 = its Apple transport stream time stamp (90 kHz), or -1.
 id3_pts:
-	FRAME	2
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	2, 0, 1
 	mov	x21, #-1
 	mov	x22, #0
 	cmp	x20, #10
@@ -8457,7 +8833,7 @@ Lblk_s:	.quad	0
 	.quad	Lblk_desc
 Lblk_desc:	.quad	0, 32, Lblk_sig
 	.popsection
-	.pushsection __TEXT,__cstring,cstring_literals
+	.pushsection __DATA,__data
 Lblk_sig:	.asciz	"v8@?0"
 	.popsection
 
@@ -8467,6 +8843,17 @@ Lblk_sig:	.asciz	"v8@?0"
 	mov	x1, x2
 	b	_munmap
 
+; av1_check — AV1 streams only where the chip decodes them: asked off the launch path, as the answer makes a decoder (~20 ms).
+	VMENTRY	av1_check, Lp_av1
+	.pushsection __DATA,__data
+Lp_av1:
+	CALL	F_VTIsHardwareDecodeSupported, ">X"
+	.long	0x61763031                ; 'av01'
+	ANDH	0xff
+	SW	G_AV1
+	OP_END
+	.popsection
+
 ; eng_cmd(work, context) — run work(context) on the media queue.
 eng_cmd:
 	mov	x2, x0
@@ -8474,129 +8861,111 @@ eng_cmd:
 	b	_dispatch_async_f
 
 ; eng_init — the synchronizer and its two renderers, made on the media queue: the first costs ~45 ms of framework setup, off the launch path.
-	ENTRY	eng_init
-	FRAME	1, 64
-	CLASS	x0, AVSampleBufferRenderSynchronizer
-	SEND	S_new
-	str	x0, [x27, #E_SYNC]
-	mov	x9, #1                    ; subtitles follow the clock every 1/30 s, and on every jump
-	mov	x10, #30
-	movk	x10, #1, lsl #32
-	stp	x9, x10, [sp]
-	str	xzr, [sp, #16]
-	mov	x2, sp
-	ldr	x3, [x28, #G_MEDIAQ]
-	ADDR	x4, Lblk_s
-	SEND	S_addPeriodicTimeObserverForInterval_queue_usingBlock_
-	SEND	S_retain
-	CLASS	x0, AVSampleBufferAudioRenderer
-	SEND	S_new
-	str	x0, [x27, #E_AR]
-	mov	x19, x0
-	CSTR	x0, "Spectral"            ; speed changes keep the pitch
-	bl	mkstr
-	mov	x2, x0
-	mov	x0, x19
-	SEND	S_setAudioTimePitchAlgorithm_
-	mov	x2, x19
-	ldr	x0, [x27, #E_SYNC]
-	SEND	S_addRenderer_
-	CLASS	x0, AVSampleBufferDisplayLayer
-	SEND	S_new
-	str	x0, [x28, #G_SBLAYER]
-	mov	x19, x0
-	CSTR	x0, "AVLayerVideoGravityResize" ; pic_layout gives it the picture's shape
-	bl	mkstr
-	mov	x2, x0
-	mov	x0, x19
-	SEND	S_setVideoGravity_
-	mov	x0, x19
-	SEND	S_sampleBufferRenderer
-	str	x0, [x27, #E_VR]
-	mov	x2, x0
-	ldr	x0, [x27, #E_SYNC]
-	SEND	S_addRenderer_
-	bl	Leng_vol
-	adr	x9, Lvt_sps               ; VideoToolbox's H.264 and HEVC decoders loaded off the launch path: a first picture ~60 ms sooner
-	adr	x10, Lvt_pps
-	stp	x9, x10, [sp]
-	mov	x9, #(Lvt_pps - Lvt_sps)
-	mov	x10, #(Lvt_vps - Lvt_pps)
-	stp	x9, x10, [sp, #16]
-	mov	x0, #0
-	mov	x1, #2
-	mov	x2, sp
-	add	x3, sp, #16
-	mov	w4, #4
-	add	x5, sp, #48
-	bl	_CMVideoFormatDescriptionCreateFromH264ParameterSets
-	bl	vt_warm
-	adr	x9, Lvt_vps
-	adr	x10, Lvt_hsps
-	stp	x9, x10, [sp]
-	adr	x9, Lvt_hpps
-	str	x9, [sp, #16]
-	mov	x9, #(Lvt_hsps - Lvt_vps)
-	mov	x10, #(Lvt_hpps - Lvt_hsps)
-	stp	x9, x10, [sp, #24]
-	mov	x9, #(Lvt_end - Lvt_hpps)
-	str	x9, [sp, #40]
-	mov	x0, #0
-	mov	x1, #3
-	mov	x2, sp
-	add	x3, sp, #24
-	mov	w4, #4
-	mov	x5, #0
-	add	x6, sp, #48
-	bl	_CMVideoFormatDescriptionCreateFromHEVCParameterSets
-	bl	vt_warm
-	CLASS	x0, NSOperationQueue      ; the session calls its delegate on the media queue
-	SEND	S_new
-	mov	x19, x0
-	ldr	x2, [x28, #G_MEDIAQ]
-	SEND	S_setUnderlyingQueue_
-	CLASS	x0, NSURLSessionConfiguration
-	SEND	S_defaultSessionConfiguration
-	mov	x2, x0
-	ldr	x3, [x28, #G_CTRL]
-	mov	x4, x19
-	CLASS	x0, NSURLSession
-	SEND	S_sessionWithConfiguration_delegate_delegateQueue_
-	SEND	S_retain
-	str	x0, [x27, #E_SESSION]
-	adr	x0, ui_attach
-	mov	x1, #0
-	bl	post_main
-	b	Lret1
-
+	VMENTRY	eng_init, Lp_init
+	.pushsection __DATA,__data
+Lp_init:
+	CLS	AVSampleBufferRenderSynchronizer
+	MSG	S_new, "="
+	STE	E_SYNC
+	CLS	AVSampleBufferAudioRenderer
+	MSG	S_new, "="
+	STE	E_AR
+	MSG	S_setAudioTimePitchAlgorithm_, "S" ; speed changes keep the pitch
+	.asciz	"Spectral"
+	LDE	E_SYNC
+	MSG	S_addRenderer_, "E"
+	.short	E_AR
+	CLS	AVSampleBufferDisplayLayer
+	MSG	S_new, "="
+	STO	G_SBLAYER
+	MSG	S_setVideoGravity_, "S"   ; pic_layout gives it the picture's shape
+	.asciz	"AVLayerVideoGravityResize"
+	MSG	S_sampleBufferRenderer, "="
+	STE	E_VR
+	LDE	E_SYNC
+	MSG	S_addRenderer_, "E"
+	.short	E_VR
+	NCALL	Leng_vol
+	CLS	NSOperationQueue          ; the session calls its delegate on the media queue
+	MSG	S_new, "="
+	SL	0
+	MSG	S_setUnderlyingQueue_, "O"
+	.byte	G_MEDIAQ >> 3
+	CLS	NSURLSessionConfiguration
+	MSG	S_defaultSessionConfiguration, "="
+	SL	1
+	CLS	NSURLSession
+	MSG	S_sessionWithConfiguration_delegate_delegateQueue_, "=bOa"
+	.byte	G_CTRL >> 3
+	MSG	S_retain, "="
+	STE	E_SESSION
+	LEA	Lvt_sps                   ; VideoToolbox's H.264 and HEVC decoders loaded off the launch path: a first picture ~60 ms sooner
+	STE	B_VTW
+	LEA	Lvt_pps
+	STE	B_VTW + 8
+	IMM	Lvt_pps - Lvt_sps
+	STE	B_VTW + 24
+	IMM	Lvt_vps - Lvt_pps
+	STE	B_VTW + 32
+	CALL	F_CMVideoFormatDescriptionCreateFromH264ParameterSets, ">IIBBIB"
+	.byte	0, 2
+	.short	B_VTW, B_VTW + 24
+	.byte	4
+	.short	B_VTW + 48
+	NCALL	vt_warm, "V"
+	LEA	Lvt_vps
+	STE	B_VTW
+	LEA	Lvt_hsps
+	STE	B_VTW + 8
+	LEA	Lvt_hpps
+	STE	B_VTW + 16
+	IMM	Lvt_hsps - Lvt_vps
+	STE	B_VTW + 24
+	IMM	Lvt_hpps - Lvt_hsps
+	STE	B_VTW + 32
+	IMM	Lvt_end - Lvt_hpps
+	STE	B_VTW + 40
+	CALL	F_CMVideoFormatDescriptionCreateFromHEVCParameterSets, ">IIBBIIB"
+	.byte	0, 3
+	.short	B_VTW, B_VTW + 24
+	.byte	4, 0
+	.short	B_VTW + 48
+	NCALL	vt_warm, "V"
+	NCALL	post_main, "PI"
+	.long	ui_attach - Lvm_base
+	.byte	0
+	OP_END
 Lvt_sps:	.byte	0x67, 0x42, 0xc0, 0x0a, 0xd9, 0x07, 0x3c, 0xc0, 0x44, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0x08, 0x3c, 0x48, 0x99, 0x20
 Lvt_pps:	.byte	0x68, 0xcb, 0x83, 0xcb, 0x20
 Lvt_vps:	.byte	0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0xb0, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x99, 0x15, 0xc0, 0x90
 Lvt_hsps:	.byte	0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0xb0, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x99, 0xa0, 0x01, 0xe0, 0x20, 0x02, 0x1c, 0x58, 0x81, 0x5e, 0xe4, 0x59, 0x51
 Lvt_hpps:	.byte	0x44, 0x01, 0xc0, 0x2c, 0xbc, 0x14, 0xc9
 Lvt_end:
-	.p2align 2
+	.popsection
 
-; vt_warm(status) — after a format was made at sp + 48 (status 0): a decompression session for it made and dropped, so VideoToolbox's decoder is loaded early; the format released (in eng_init's frame).
+; vt_warm(status) — after a format was made in B_VTW + 48 (status 0): a decompression session for it made and dropped, so VideoToolbox's decoder is loaded early; the format released.
 vt_warm:
-	cbnz	w0, 2f
-	stp	x29, x30, [sp, #-16]!
-	mov	x0, #0
-	ldr	x1, [sp, #(16 + 48)]
-	mov	x2, #0
-	mov	x3, #0
-	mov	x4, #0
-	add	x5, sp, #(16 + 56)
-	bl	_VTDecompressionSessionCreate
-	cbnz	w0, 1f
-	ldr	x0, [sp, #(16 + 56)]
-	bl	_VTDecompressionSessionInvalidate
-	ldr	x0, [sp, #(16 + 56)]
-	bl	_CFRelease
-1:	ldr	x0, [sp, #(16 + 48)]
-	bl	_CFRelease
-	ldp	x29, x30, [sp], #16
-2:	ret
+	VM	Lp_vtwarm
+	.pushsection __DATA,__data
+Lp_vtwarm:
+	GL	0
+	JNZ	Lp_vtwarm_end
+	CALL	F_VTDecompressionSessionCreate, ">IEIIIB"
+	.byte	0
+	.short	B_VTW + 48
+	.byte	0, 0, 0
+	.short	B_VTW + 56
+	JNZ	Lp_vtwarm_fd
+	LDE	B_VTW + 56
+	CALL	F_VTDecompressionSessionInvalidate, "V"
+	LDE	B_VTW + 56
+	CALL	F_CFRelease, "V"
+	HERE	Lp_vtwarm_fd
+	LDE	B_VTW + 48
+	CALL	F_CFRelease, "V"
+	HERE	Lp_vtwarm_end
+	OP_END
+	.popsection
 
 ; ui_attach — the engine's layer goes into its view.
 	ENTRY	ui_attach
@@ -8611,32 +8980,40 @@ vt_warm:
 	b	local_poll
 
 ; eng_close — stop and forget the open file; its mapping goes once the renderers let go of its samples.
-	ENTRY	eng_close
+	VMENTRY	eng_close, Lp_close
+	.pushsection __DATA,__data
+Lp_close:
+	LDE	E_SYNC
+	MSG	S_setRate_, "D"
+	.short	0
+	LDE	E_VR
+	MSG	S_stopRequestingMediaData
+	LDE	E_VR
+	MSG	S_flushWithRemovalOfDisplayedImage_completionHandler_, "II" ; the last picture goes too
+	.byte	1, 0
+	LDE	E_AR
+	MSG	S_stopRequestingMediaData
+	LDE	E_AR
+	MSG	S_flush
+	NCALL	sub_reset
+	NCALL	st_close, "B"
+	.short	E_ST
+	NCALL	st_close, "B"
+	.short	E_ST + ST_SIZE
+	NCALL	st_close, "B"
+	.short	E_ST + 2 * ST_SIZE
+	LDE	E_MASTER
+	CALL	F_free, "V"
+	LDE	E_MURL
+	CALL	F_free, "V"
+	NCALL	eng_frees
+	NCALL	sub_obs
+	OP_END
+	.popsection
+
+; eng_frees — the tracks' formats, sound parsers and queues go, the mapping's block is let go, the engine's state cleared.
+eng_frees:
 	FRAME	1
-	ldr	x0, [x27, #E_SYNC]
-	movi	d0, #0
-	SEND	S_setRate_
-	ldr	x0, [x27, #E_VR]
-	SEND	S_stopRequestingMediaData
-	ldr	x0, [x27, #E_VR]
-	mov	w2, #1                    ; the last picture goes too
-	mov	x3, #0
-	SEND	S_flushWithRemovalOfDisplayedImage_completionHandler_
-	ldr	x0, [x27, #E_AR]
-	SEND	S_stopRequestingMediaData
-	ldr	x0, [x27, #E_AR]
-	SEND	S_flush
-	bl	sub_reset
-	BADDR	x0, E_ST
-	bl	st_close
-	BADDR	x0, (E_ST + ST_SIZE)
-	bl	st_close
-	BADDR	x0, (E_ST + 2 * ST_SIZE)
-	bl	st_close
-	ldr	x0, [x27, #E_MASTER]
-	bl	_free
-	ldr	x0, [x27, #E_MURL]
-	bl	_free
 	BADDR	x19, E_TR
 	add	x20, x19, #((TRACKS * TR_SIZE) >> 12), lsl #12
 Lec_fd:
@@ -8645,7 +9022,7 @@ Lec_fd:
 	bl	_CFRelease
 1:	ldr	x0, [x19, #TR_AFS]
 	cbz	x0, 2f
-	bl	_AudioFileStreamClose
+	CALLF	AudioFileStreamClose
 2:	bl	q_clear
 	ldr	x0, [x19, #TR_FQ]
 	bl	_free
@@ -8664,16 +9041,15 @@ Lec_fd:
 
 ; eng_open(request) — play a file on This Mac from its start; request = {play generation, path}, freed here. What it cannot read, AVPlayer gets (eng_fallback).
 	ENTRY	eng_open
-	FRAME	2, 176                    ; the 9th argument at sp, struct stat at sp + 16
-	mov	x19, x0
-	bl	Leng_close
+	FRAME	2, 176, 1	; the 9th argument at sp, struct stat at sp + 16
+	bl	eng_close
 	add	x0, x19, #8
 	mov	w1, #0                    ; O_RDONLY
-	bl	_open
+	CALLF	open
 	mov	w20, w0
 	tbnz	w0, #31, Leo_fail
 	add	x1, sp, #16
-	bl	_fstat
+	CALLF	fstat
 	ldr	x21, [sp, #(16 + STAT_SIZE)]
 	cbnz	w0, Leo_close
 	mov	x0, #0
@@ -8682,7 +9058,7 @@ Lec_fd:
 	mov	w3, #MAP_PRIVATE
 	mov	w4, w20
 	mov	x5, #0
-	bl	_mmap
+	CALLF	mmap
 	mov	x22, x0
 	mov	w0, w20
 	bl	_close
@@ -8693,7 +9069,7 @@ Lec_fd:
 	mov	x0, x22
 	mov	x1, x21
 	mov	w2, #MADV_SEQUENTIAL
-	bl	_madvise
+	CALLF	madvise
 	BADDR	x9, E_PARENT
 	str	x9, [sp]
 	stp	xzr, xzr, [sp, #16]       ; CMBlockBufferCustomBlockSource, packed to 4 (CoreMedia copies it): the mapping goes with the last sample
@@ -8718,17 +9094,34 @@ Leo_read:
 	bl	mp4_open
 	cbnz	w0, 1f
 	bl	afs_file                  ; not MP4: a sound file AudioFileStream reads
-	cbz	w0, Leo_fail
-1:	ldr	w9, [x19]
-	str	w9, [x27, #E_GEN]
+	cbnz	w0, 1f
+	ldr	w9, [x27, #E_M4A]
+	cmp	w9, #1
+	b.ne	Leo_fail
+	BADDR	x20, E_TR                 ; an M4A it could not read (its index last): its track goes, the boxes are read instead
+	ldr	x0, [x20, #TR_AFS]
+	CALLF	AudioFileStreamClose
+	ldr	x0, [x20, #TR_FQ]
+	bl	_free
+	mov	x0, x20
+	mov	x1, #TR_SIZE
+	bl	_bzero
+	mov	w9, #2
+	str	w9, [x27, #E_M4A]
+	str	wzr, [x27, #E_NTR]
+	b	Leo_read
+1:	ldr	w0, [x19]
+	str	w0, [x27, #E_GEN]
 	ldr	x9, [x27, #E_VT]
 	cmp	x9, #0
 	cset	w9, ne
 	str	w9, [x27, #E_WANTV]
-	mov	x0, x19
+	cbz	w9, 2f                    ; sound alone: no picture's lead to watch, no ticks
+	bl	tick_later                ; its ticks
+2:	mov	x0, x19
 	bl	_free
 	mov	x0, #0
-	bl	Leng_seek                 ; from the start
+	bl	eng_seek                 ; from the start
 	adr	x0, ui_poll
 	mov	x1, #0
 	bl	post_main
@@ -8737,7 +9130,7 @@ Leo_close:
 	mov	w0, w20
 	bl	_close
 Leo_fail:
-	bl	Leng_close
+	bl	eng_close
 	ldr	w20, [x19]
 	mov	x0, x19
 	bl	_free
@@ -8747,36 +9140,43 @@ Leo_fail:
 	b	Lret2
 
 ; eng_fallback(generation) — the engine cannot play This Mac's file: AVPlayer tries it, unless a newer play came (main).
-	ENTRY	eng_fallback
-	FRAME	1
-	ldr	w9, [x28, #G_PLAYGEN]
-	cmp	w0, w9
-	b.ne	Lret1
-	mov	w9, #1
-	str	w9, [x28, #G_MODE]
-	adr	x0, eng_close
-	mov	x1, #0
-	bl	eng_cmd
-	BADDR	x0, B_LTPATH
-	ldrb	w9, [x0]
-	cmp	w9, #'/'
-	b.eq	1f
-	bl	mkurl                     ; web media
-	b	2f
-1:	bl	mkstr
-	mov	x2, x0
-	CLASS	x0, NSURL
-	SEND	S_fileURLWithPath_
-2:	mov	x2, x0
-	CLASS	x0, AVPlayerItem
-	SEND	S_playerItemWithURL_
-	mov	x2, x0
-	ldr	x0, [x28, #G_PLAYER]
-	SEND	S_replaceCurrentItemWithPlayerItem_
-	ldr	x0, [x28, #G_PLAYER]
-	SEND	S_play
-	bl	local_poll
-	b	Lret1
+	VMENTRY	eng_fallback, Lp_fallback
+	.pushsection __DATA,__data
+Lp_fallback:
+	LW	G_PLAYGEN
+	EQL	0
+	JZ	Lp_fallback_end
+	IMM	1
+	SW	G_MODE
+	NCALL	eng_cmd, "PI"
+	.long	eng_close - Lvm_base
+	.byte	0
+	LDE	B_LTPATH
+	ANDH	255
+	EQ	'/'
+	JNZ	Lp_fallback_file
+	NCALL	mkurl, "=B"               ; web media
+	.short	B_LTPATH
+	JMP	Lp_fallback_item
+	HERE	Lp_fallback_file
+	NCALL	mkstr, "=B"
+	.short	B_LTPATH
+	SL	1
+	CLS	NSURL
+	MSG	S_fileURLWithPath_, "=b"
+	HERE	Lp_fallback_item
+	SL	1
+	CLS	AVPlayerItem
+	MSG	S_playerItemWithURL_, "=b"
+	SL	1
+	LD	G_PLAYER
+	MSG	S_replaceCurrentItemWithPlayerItem_, "b"
+	LD	G_PLAYER
+	MSG	S_play
+	NCALL	local_poll
+	HERE	Lp_fallback_end
+	OP_END
+	.popsection
 
 ; mp4_open() -> w0 = 1 when the mapped file is an MP4 or QuickTime movie with a picture or sound CoreMedia knows: its tracks are read and the first of each kind plays.
 mp4_open:
@@ -8797,20 +9197,32 @@ mp4_open:
 	cmp	w9, w10
 	cset	w9, ne
 	str	w9, [x27, #E_ISO]
+	ldr	w9, [x0]
+	TYPE	w10, 'M','4','A',' '
+	ldr	w11, [x27, #E_M4A]
+	cmp	w9, w10
+	ccmp	w11, #0, #0, eq
+	b.eq	Lmo_m4a
 Lmo_moov:
 	mov	x0, x19
 	mov	x1, x20
 	TYPE	w2, 'm','o','o','v'
 	bl	box_find
-	cbz	x0, Lmo_no
+	cbz	x0, Lnil4
+	b	Lmo_go
+Lmo_m4a:
+	mov	w9, #1                    ; sound alone: AudioFileStream packs its packets (one per sample costs the renderer more)
+	str	w9, [x27, #E_M4A]
+	b	Lnil4
+Lmo_go:
 	mov	x21, x0
 	mov	x22, x1
 	TYPE	w2, 'm','v','h','d'
 	bl	box_find
-	cbz	x0, Lmo_no
+	cbz	x0, Lnil4
 	add	x9, x0, #32
 	cmp	x9, x1
-	b.hi	Lmo_no
+	b.hi	Lnil4
 	ldrb	w9, [x0]                  ; version: 32- or 64-bit times
 	ldr	w10, [x0, #12]
 	ldr	w11, [x0, #16]
@@ -8820,7 +9232,7 @@ Lmo_moov:
 	ldr	x11, [x0, #24]
 	rev	x11, x11
 1:	rev	w10, w10                  ; movie timescale
-	cbz	w10, Lmo_no
+	cbz	w10, Lnil4
 	str	w10, [x27, #E_MTS]
 	mov	x12, #1000
 	mul	x11, x11, x12
@@ -8857,15 +9269,35 @@ Lmo_each:
 	cmp	x9, x10
 	b.lo	Lmo_each
 	ldr	x9, [x27, #E_VT]
+	ldr	x0, [x27, #E_AT]
+	cbnz	x9, 3f
+	cbz	x0, 3f
+	bl	snd_fd                    ; no picture: the sound's format now, so one CoreMedia cannot read falls back
+	cbnz	x0, 3f
+	str	xzr, [x27, #E_AT]
+3:	ldr	x9, [x27, #E_VT]
 	ldr	x10, [x27, #E_AT]
 	orr	x9, x9, x10
 	cmp	x9, #0
 	cset	w0, ne
 	b	Lret4
-Lmo_no:
-	mov	w0, #0
-	b	Lret4
 
+; snd_fd(track) -> x0 = its sound format, from its sample description the first time; 0 if CoreMedia cannot read it. A file's is made as it first plays: the first one costs ~12 ms, after the picture's first samples.
+snd_fd:
+	FRAME	1, 0, 1
+	ldr	x0, [x19, #TR_FD]
+	cbnz	x0, Lret1
+	ldr	x1, [x19, #TR_STSD]
+	ldr	w2, [x19, #TR_STSDN]
+	mov	x3, #0                    ; QuickTime
+	ldr	w9, [x27, #E_ISO]
+	cbz	w9, 1f
+	ldr	x3, [x27, #F_kCMSoundDescriptionFlavor_ISOFamily]
+	ldr	x3, [x3]
+1:	add	x4, x19, #TR_FD
+	CALLF	CMAudioFormatDescriptionCreateFromBigEndianSoundDescriptionData
+	ldr	x0, [x19, #TR_FD]
+	b	Lret1
 ; trak_open(trak, end, fragmented, track) -> x0 = the track (the next free one if 0), read: kind, timescale, edit, tables (empty when fragmented) and format; 0 for one this player cannot use.
 trak_open:
 	FRAME	4
@@ -8876,17 +9308,17 @@ trak_open:
 	cbnz	x19, 1f
 	ldr	w9, [x27, #E_NTR]
 	cmp	w9, #TRACKS
-	b.hs	Lto_no
+	b.hs	Lnil4
 	add	w10, w9, #1
 	str	w10, [x27, #E_NTR]
 	BADDR	x19, E_TR
 	add	x19, x19, x9, lsl #9      ; TR_SIZE
 1:	TYPE	w2, 't','k','h','d'
 	bl	box_find
-	cbz	x0, Lto_no
+	cbz	x0, Lnil4
 	add	x9, x0, #24
 	cmp	x9, x1
-	b.hi	Lto_no
+	b.hi	Lnil4
 	ldrb	w9, [x0]
 	ldr	w10, [x0, #12]
 	cbz	w9, 1f
@@ -8915,30 +9347,30 @@ trak_open:
 	mov	x1, x21
 	TYPE	w2, 'm','d','i','a'
 	bl	box_find
-	cbz	x0, Lto_no
+	cbz	x0, Lnil4
 	mov	x22, x0
 	mov	x23, x1
 	TYPE	w2, 'h','d','l','r'
 	bl	box_find
-	cbz	x0, Lto_no
+	cbz	x0, Lnil4
 	add	x9, x0, #12
 	cmp	x9, x1
-	b.hi	Lto_no
+	b.hi	Lnil4
 	ldr	w24, [x0, #8]             ; the handler: 'vide', 'soun', ...
 	mov	x0, x22
 	mov	x1, x23
 	TYPE	w2, 'm','d','h','d'
 	bl	box_find
-	cbz	x0, Lto_no
+	cbz	x0, Lnil4
 	add	x9, x0, #24
 	cmp	x9, x1
-	b.hi	Lto_no
+	b.hi	Lnil4
 	ldrb	w9, [x0]
 	ldr	w10, [x0, #12]
 	cbz	w9, 1f
 	ldr	w10, [x0, #20]
 1:	rev	w10, w10
-	cbz	w10, Lto_no
+	cbz	w10, Lnil4
 	str	w10, [x19, #TR_TS]
 	add	x11, x0, #20              ; its language: three letters, 5 bits each
 	cbz	w9, 2f
@@ -8966,25 +9398,25 @@ trak_open:
 	mov	x1, x23
 	TYPE	w2, 'm','i','n','f'
 	bl	box_find
-	cbz	x0, Lto_no
+	cbz	x0, Lnil4
 	TYPE	w2, 's','t','b','l'
 	bl	box_find
-	cbz	x0, Lto_no
+	cbz	x0, Lnil4
 	mov	x22, x0
 	mov	x23, x1
 	TYPE	w2, 's','t','s','d'
 	bl	box_find
-	cbz	x0, Lto_no
+	cbz	x0, Lnil4
 	add	x9, x0, #12
 	cmp	x9, x1
-	b.hi	Lto_no
+	b.hi	Lnil4
 	ldr	w10, [x0, #8]
 	rev	w10, w10                  ; the first description's size
 	sub	x11, x1, x0
 	sub	x11, x11, #8
 	cmp	x10, #16
 	ccmp	x10, x11, #2, hs
-	b.hi	Lto_no
+	b.hi	Lnil4
 	add	x0, x0, #8
 	str	x0, [x19, #TR_STSD]
 	str	w10, [x19, #TR_STSDN]
@@ -9008,7 +9440,7 @@ Lto_tbl:
 1:	and	w10, w10, #0x7f
 	umaddl	x11, w12, w10, x11
 	cmp	x11, x1
-	b.hi	Lto_no                     ; cut short: not a track to trust
+	b.hi	Lnil4                     ; cut short: not a track to trust
 	ldrb	w9, [x25, #4]
 	str	x0, [x19, x9]
 	ldrb	w9, [x25, #5]
@@ -9018,7 +9450,7 @@ Lto_next:
 	b	Lto_tbl
 Lto_tables:
 	ldr	x9, [x19, #TR_STSZ]
-	cbz	x9, Lto_no
+	cbz	x9, Lnil4
 	ldr	w10, [x9, #4]
 	rev	w10, w10
 	str	w10, [x19, #TR_FIXED]
@@ -9031,7 +9463,7 @@ Lto_tables:
 	ccmp	w10, #0, #4, ne
 	ccmp	w11, #0, #4, ne
 	ccmp	w12, #0, #4, ne
-	b.eq	Lto_no                     ; no samples, or a table missing
+	b.eq	Lnil4                     ; no samples, or a table missing
 Lto_edit:
 	mov	x0, x20
 	mov	x1, x21
@@ -9057,12 +9489,16 @@ Lto_fmt:
 	TYPE	w10, 's','o','u','n'
 	cmp	w24, w10
 	b.ne	Lto_text
-	mov	x3, #0                    ; QuickTime
-	cbz	w9, 1f
-	ldr	x3, [x27, #F_kCMSoundDescriptionFlavor_ISOFamily]
-	ldr	x3, [x3]
-1:	add	x4, x19, #TR_FD
-	bl	_CMAudioFormatDescriptionCreateFromBigEndianSoundDescriptionData
+	ldr	w9, [x27, #E_NET]
+	cbz	w9, Lto_snd               ; a file's sound format comes when it first plays (snd_fd)
+	mov	x0, x19
+	bl	snd_fd
+	cmp	x0, #0
+	cset	w0, eq
+	mov	w9, #'a'
+	b	Lto_kind
+Lto_snd:
+	mov	w0, #0
 	mov	w9, #'a'
 	b	Lto_kind
 Lto_vide:
@@ -9072,24 +9508,21 @@ Lto_vide:
 	ldr	x4, [x27, #F_kCMImageDescriptionFlavor_ISOFamily]
 	ldr	x4, [x4]
 1:	add	x5, x19, #TR_FD
-	bl	_CMVideoFormatDescriptionCreateFromBigEndianImageDescriptionData
-	cbnz	w0, Lto_no
+	CALLF	CMVideoFormatDescriptionCreateFromBigEndianImageDescriptionData
+	cbnz	w0, Lnil4
 	bl	vid_dims
 	mov	w0, #0
 	mov	w9, #'v'
 Lto_kind:
-	cbnz	w0, Lto_no                 ; a format CoreMedia does not know
+	cbnz	w0, Lnil4                 ; a format CoreMedia does not know
 	str	w9, [x19, #TR_KIND]
 	mov	x0, x19
-	b	Lret4
-Lto_no:
-	mov	x0, #0
 	b	Lret4
 Lto_text:
 	ldr	w3, [x1, #4]              ; subtitles or captions, known by their sample description
 	adr	x10, Ltext
 1:	ldr	w11, [x10], #4
-	cbz	w11, Lto_no
+	cbz	w11, Lnil4
 	cmp	w3, w11
 	b.ne	1b
 	rev	w1, w3
@@ -9394,7 +9827,7 @@ setflag:
 	ldr	x1, [x1]
 	ldr	x2, [x27, #F_kCFBooleanTrue]
 	ldr	x2, [x2]
-	b	_CFDictionarySetValue
+	JUMPF	CFDictionarySetValue
 
 ; mk_sample(bb, offset, size, dts, pts, duration, sync) -> a ready CMSampleBuffer (retained) over bb's bytes, marked for the track's target; 0 if it could not be made (x19 = track).
 	.equ MS_TIME,	16                ; CMSampleTimingInfo: duration, presentation and decode times
@@ -9436,7 +9869,7 @@ mk_sample:
 	mov	x0, #0
 	mov	w4, #0
 	add	x5, sp, #MS_BB
-	bl	_CMBlockBufferCreateWithBufferReference
+	CALLF	CMBlockBufferCreateWithBufferReference
 	cbnz	w0, Lms_none
 	ldr	w24, [x19, #TR_TS]
 	orr	x24, x24, #(1 << 32)      ; timescale, kCMTimeFlags_Valid
@@ -9456,7 +9889,7 @@ mk_sample:
 	add	x5, sp, #MS_TIME
 	mov	x6, #1
 	add	x7, sp, #MS_LEN
-	bl	_CMSampleBufferCreateReady
+	CALLF	CMSampleBufferCreateReady
 	mov	w23, w0
 	ldr	x0, [sp, #MS_BB]
 	bl	_CFRelease                ; the sample keeps it
@@ -9464,9 +9897,9 @@ mk_sample:
 	ldr	x23, [sp, #MS_SB]
 	mov	x0, x23
 	mov	w1, #1
-	bl	_CMSampleBufferGetSampleAttachmentsArray
+	CALLF	CMSampleBufferGetSampleAttachmentsArray
 	mov	x1, #0
-	bl	_CFArrayGetValueAtIndex
+	CALLF	CFArrayGetValueAtIndex
 	mov	x24, x0
 	cbnz	w22, 1f
 	ldr	x1, [x27, #F_kCMSampleAttachmentKey_NotSync]
@@ -9486,7 +9919,15 @@ mk_sample:
 	mov	x0, x23
 	bl	_CFRelease
 	b	Lms_none
-2:	mov	x0, x24                   ; decoded, never shown
+2:	ldr	w9, [x27, #E_NET]         ; a stream's first picture after a seek is shown at once, while the rest comes
+	ldr	w10, [x27, #E_PREV]
+	cmp	w9, #0
+	ccmp	w10, #0, #0, ne
+	b.ne	3f
+	mov	w9, #1
+	str	w9, [x27, #E_PREV]
+	b	Lms_ok
+3:	mov	x0, x24                   ; decoded, never shown
 	ldr	x1, [x27, #F_kCMSampleAttachmentKey_DoNotDisplay]
 	bl	setflag
 	b	Lms_ok
@@ -9584,7 +10025,7 @@ cur_sample:
 	ldr	w9, [x19, #TR_I]
 	ldr	w10, [x19, #TR_N]
 	cmp	w9, w10
-	b.hs	Lcp_none
+	b.hs	Lnil4
 	bl	cur_size
 	mov	x20, x0
 	bl	cur_delta
@@ -9608,10 +10049,6 @@ cur_sample:
 	bl	cur_step
 	mov	x0, x20
 	b	Lret4
-Lcp_none:
-	mov	x0, #0
-	b	Lret4
-
 ; produce() -> the track's next sample (retained): from the mapped file, or from its stream's queue; 0 when there is none now (x19 = track).
 produce:
 	FRAME	1
@@ -9622,6 +10059,21 @@ Lpd_file:
 	ldr	w10, [x19, #TR_N]
 	cmp	w9, w10
 	b.hs	Lpd_none
+	ldr	w9, [x19, #TR_KIND]       ; a playing picture at most LEAD_MS ahead of the clock: a seek's flush costs ~1 ms per queued sample
+	ldr	w10, [x27, #E_SLOW]
+	cmp	w9, #'v'
+	ccmp	w10, #0, #0, eq
+	b.ne	1f
+	bl	now_ms
+	add	x0, x0, #LEAD_MS
+	ldr	w9, [x19, #TR_TS]
+	mul	x0, x0, x9
+	mov	x9, #1000
+	udiv	x0, x0, x9
+	ldr	x9, [x19, #TR_DTS]
+	cmp	x9, x0
+	b.gt	Lpd_none                  ; net_tick asks again
+1:
 	bl	cur_size
 	ldr	x9, [x19, #TR_OFF]
 	add	x9, x9, x0
@@ -9679,6 +10131,12 @@ q_push:
 	b	trk_request
 1:	ret
 
+; trk_clear(track) — q_clear for a UI program.
+trk_clear:
+	FRAME	1, 0, 1
+	bl	q_clear
+	b	Lret1
+
 ; q_clear — drop the track's queued samples and fragment list (x19 = track).
 q_clear:
 	FRAME	1
@@ -9729,9 +10187,7 @@ trk_request:
 	ldr	x1, [x27, #E_AR]
 ; feed(track, renderer) — enqueue samples while the renderer takes them; at the end it stops asking.
 feed:
-	FRAME	2
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	2, 0, 1
 	cbz	x19, Lfe_stop
 Lfe_more:
 	mov	x0, x20
@@ -9753,12 +10209,16 @@ Lfe_stop:
 
 ; trk_play(track, renderer, block, ms) — the renderer drops what it holds, and the track plays from that moment, decoded from the sync sample before it.
 trk_play:
-	FRAME	2
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	2, 0, 1
 	mov	x21, x2
 	mov	x22, x3
-	mov	x0, x20
+	ldr	w9, [x19, #TR_KIND]
+	cmp	w9, #'a'
+	b.ne	1f
+	mov	x0, x19
+	bl	snd_fd
+	cbz	x0, Lret2                 ; a sound CoreMedia cannot read does not play
+1:	mov	x0, x20
 	SEND	S_stopRequestingMediaData
 	mov	x0, x20
 	SEND	S_flush
@@ -9787,68 +10247,78 @@ trk_play:
 	b	Lret2
 
 ; eng_seek(ms) — show that moment exactly: the clock holds there until its picture is ready, then goes on as before.
-	ENTRY	eng_seek
-	FRAME	1
-	mov	x19, x0
-	str	x19, [x27, #E_TGTMS]
-	str	xzr, [x27, #E_FIRSTMS]
-	ldr	w9, [x27, #E_NET]
-	cbnz	w9, Lsq_net
-	ldr	x9, [x27, #E_VT]
-	ldr	x10, [x27, #E_AT]
-	orr	x9, x9, x10
-	cbz	x9, Lret1                 ; nothing open
-	mov	x0, x19
-	bl	hold
-	ldr	x0, [x27, #E_VT]
-	cbz	x0, Lsq_sound
-	ldr	w9, [x28, #G_AONLY]
-	cbnz	w9, Lsq_sound             ; Audio Only: no picture is decoded
-	ldr	x1, [x27, #E_VR]
-	ADDR	x2, Lblk_v
-	mov	x3, x19
-	bl	trk_play
-Lsq_sound:
-	ldr	x0, [x27, #E_AT]
-	cbz	x0, Lsq_wait
-	ldr	x1, [x27, #E_AR]
-	ADDR	x2, Lblk_a
-	mov	x3, x19
-	bl	trk_play
-Lsq_wait:
-	mov	x0, x19
-	bl	sub_seek
-	bl	await
-	b	Lret1
-Lsq_net:
-	mov	x0, x19
-	bl	hold
-	ldr	x0, [x27, #E_VR]          ; streams: both renderers drop what they hold, each stream seeks
-	SEND	S_stopRequestingMediaData
-	ldr	x0, [x27, #E_VR]
-	SEND	S_flush
-	ldr	x0, [x27, #E_AR]
-	SEND	S_stopRequestingMediaData
-	ldr	x0, [x27, #E_AR]
-	SEND	S_flush
-	ldr	w9, [x28, #G_AONLY]
-	cbnz	w9, 1f                    ; Audio Only: the picture's stream stays still
-	BADDR	x0, E_ST
-	mov	x1, x19
-	bl	st_seek
-1:	BADDR	x0, (E_ST + ST_SIZE)
-	mov	x1, x19
-	bl	st_seek
-	BADDR	x0, (E_ST + 2 * ST_SIZE)
-	mov	x1, x19
-	bl	st_seek
-	b	Lsq_wait
+	VMENTRY	eng_seek, Lp_seek
+	.pushsection __DATA,__data
+Lp_seek:
+	GL	0
+	STE	E_TGTMS
+	IMM	0
+	STE	E_FIRSTMS
+	STEW	E_PREV
+	LDEW	E_NET
+	JNZ	Lp_seek_net
+	LDE	E_VT
+	SL	1
+	LDE	E_AT
+	SL	2
+	ADDL	1
+	JZ	Lp_seek_end               ; nothing open
+	GL	1
+	JZ	Lp_seek_sound
+	LW	G_AONLY
+	JNZ	Lp_seek_sound             ; Audio Only: no picture is decoded
+	NCALL	hold_async, "a"
+	NCALL	trk_play, "bEPa"
+	.short	E_VR
+	.long	Lblk_v - Lvm_base
+	GL	2
+	JZ	Lp_seek_wait
+	LDE	E_AR                      ; the old sound stops now, the new comes after the first pictures
+	MSG	S_stopRequestingMediaData
+	CALL	F_dispatch_async_f, "OaP"
+	.byte	G_MEDIAQ >> 3
+	.long	seek_sound - Lvm_base
+	JMP	Lp_seek_wait
+	HERE	Lp_seek_sound             ; no picture: the clock and the sound at once
+	NCALL	hold, "a"
+	GL	2
+	JZ	Lp_seek_wait
+	NCALL	trk_play, "cEPa"
+	.short	E_AR
+	.long	Lblk_a - Lvm_base
+	HERE	Lp_seek_wait
+	NCALL	sub_seek, "a"
+	NCALL	await
+	HERE	Lp_seek_end
+	OP_END
+	HERE	Lp_seek_net
+	NCALL	hold_async, "a"
+	LDE	E_VR                      ; streams: both renderers drop what they hold, each stream seeks
+	MSG	S_stopRequestingMediaData
+	LDE	E_VR
+	MSG	S_flush
+	LDE	E_AR
+	MSG	S_stopRequestingMediaData
+	LW	G_AONLY
+	JNZ	Lp_seek_streams           ; Audio Only: the picture's stream stays still
+	NCALL	st_seek, "Ba"
+	.short	E_ST
+	HERE	Lp_seek_streams
+	NCALL	st_seek, "Ba"
+	.short	E_ST + ST_SIZE
+	NCALL	st_seek, "Ba"
+	.short	E_ST + 2 * ST_SIZE
+	LDE	E_AR                      ; the sound's flush once the requests are out
+	MSG	S_flush
+	JMP	Lp_seek_wait
+	.popsection
 
 ; hold(ms) — the clock stops at that moment until await lets it go.
 hold:
-	FRAME	0, 32
 	mov	w9, #1
 	str	w9, [x27, #E_HOLD]
+Lhold_rate:
+	FRAME	0, 32
 	mov	x9, #1000
 	orr	x9, x9, #(1 << 32)
 	stp	x0, x9, [sp]              ; CMTime in milliseconds
@@ -9858,6 +10328,67 @@ hold:
 	mov	x2, sp
 	SEND	S_setRate_time_
 	b	Lret0
+
+; hold_async(ms) — hold, with the stop itself on the clock queue: stopping a playing clock waits ~35 ms for the sound device, so the media queue waits only until the clock shows the moment.
+hold_async:
+	VM	Lp_holda
+	.pushsection __DATA,__data
+Lp_holda:
+	IMM	1
+	STEW	E_HOLD
+	LDEW	E_HOLDGEN
+	ADDI	1
+	STEW	E_HOLDGEN
+	SL	2                         ; c: this hold
+	SHL	48
+	ADDL	0
+	SL	3                         ; d: it with the moment
+	CALL	F_dispatch_async_f, "OdP"
+	.byte	G_CLOCKQ >> 3
+	.long	hold_job - Lvm_base
+	IMM	0
+	SL	1                         ; b: tries, ~30 ms of them at most
+	HERE	Lp_holda_wait
+	NCALL	now_ms, "="
+	EQL	0
+	JZ	Lp_holda_next             ; not at the moment yet
+	LDEW	E_HOLDGO
+	EQL	2
+	JNZ	Lp_holda_end              ; and this hold started: the clock shows it
+	HERE	Lp_holda_next
+	GL	1
+	ADDI	1
+	SL	1
+	BIT	15
+	JZ	Lp_holda_wait
+	HERE	Lp_holda_end
+	OP_END
+	.popsection
+
+; hold_job(hold << 48 | ms) — the clock queue's part of hold_async.
+	ENTRY	hold_job
+	FRAME	1, 0, 1
+	lsr	x9, x19, #48
+	str	w9, [x27, #E_HOLDGO]
+	and	x0, x19, #0xffffffffffff
+	bl	Lhold_rate
+	lsr	x9, x19, #48
+	str	w9, [x27, #E_HOLDDONE]
+	b	Lret1
+
+; seek_sound(ms) — the sound track from that moment: after a seek's first pictures, as its renderer's flush takes ~11 ms.
+	VMENTRY	seek_sound, Lp_ssound
+	.pushsection __DATA,__data
+Lp_ssound:
+	LDE	E_AT
+	SL	1
+	JZ	Lp_ssound_end
+	NCALL	trk_play, "bEPa"
+	.short	E_AR
+	.long	Lblk_a - Lvm_base
+	HERE	Lp_ssound_end
+	OP_END
+	.popsection
 
 ; await — wait for the first picture, then the clock may run.
 await:
@@ -9873,7 +10404,7 @@ await:
 	add	x9, x28, #G_SEEKPEND
 	swpal	wzr, w10, [x9]
 	ldr	x0, [x28, #G_SEEKTO]
-	b	Leng_seek
+	b	eng_seek
 
 ; eng_wait(generation) — every 5 ms until the picture at the seek is ready (or a second passed): then the clock may run.
 	ENTRY	eng_wait
@@ -9891,10 +10422,18 @@ await:
 	str	w9, [x27, #E_WAITN]
 	ldr	x0, [x28, #G_SBLAYER]
 	SEND	S_isReadyForDisplay
-	cbnz	w0, Lew_go
+	ldr	x10, [x27, #E_FIRSTMS]
+	cmp	w0, #0
+	ccmp	x10, #0, #4, ne
+	b.eq	2f                        ; not ready with the seek's own picture (a stream's first, shown early, does not count)
+	tbnz	x10, #63, Lew_go          ; ready on the poll before too: the first picture ready may be a B-picture's reference, after the target
+	orr	x10, x10, #(1 << 63)
+	str	x10, [x27, #E_FIRSTMS]
+2:
+	ldr	w9, [x27, #E_WAITN]
 	cmp	w9, #(WAIT_TRIES - 40)
 	b.hi	1f                        ; a moment for every picture of the first segment to come
-	ldr	x0, [x27, #E_FIRSTMS]     ; the earliest picture comes after the target (HLS segments): the clock holds at it
+	mov	x0, x10                   ; the earliest picture comes after the target (HLS segments): the clock holds at it
 	ldr	x9, [x27, #E_TGTMS]
 	cmp	x0, x9
 	b.le	1f
@@ -9912,7 +10451,16 @@ await:
 	b	Lret0
 Lew_go:
 	str	wzr, [x27, #E_HOLD]
-	bl	Leng_rate
+	ldr	w9, [x27, #E_HOLDGEN]
+	ldr	w10, [x27, #E_HOLDDONE]
+	cmp	w9, w10
+	b.eq	1f
+	ldr	x0, [x28, #G_CLOCKQ]      ; the clock goes on after its hold, on the queue that holds it
+	mov	x1, #0
+	adr	x2, eng_rate
+	bl	_dispatch_async_f
+	b	Lret0
+1:	bl	Leng_rate
 	b	Lret0
 
 ; eng_rate — the clock runs at the chosen speed while playing, else holds; not while a seek waits for its picture.
@@ -9959,13 +10507,13 @@ Lsb_next:
 	cbz	x0, Lsb_end
 	str	x0, [x27, #E_SUBN]
 1:	mov	x8, sp
-	bl	_CMSampleBufferGetPresentationTimeStamp
+	CALLF	CMSampleBufferGetPresentationTimeStamp
 	ldr	x21, [sp]
 	cmp	x21, x20
 	b.gt	Lsb_end                   ; not yet
 	ldr	x0, [x27, #E_SUBN]
 	mov	x8, sp
-	bl	_CMSampleBufferGetDuration
+	CALLF	CMSampleBufferGetDuration
 	ldr	x9, [sp]
 	add	x9, x21, x9
 	str	x9, [x27, #E_SUBEND]
@@ -9985,9 +10533,8 @@ Lsb_end:
 
 ; sub_cue(sample) — the cue's text, from its format: tx3g or QuickTime text (a length, then UTF-8), or WebVTT boxes; the sample is released.
 sub_cue:
-	FRAME	3, 32
-	mov	x19, x0
-	bl	_CMSampleBufferGetFormatDescription
+	FRAME	3, 32, 1
+	CALLF	CMSampleBufferGetFormatDescription
 	bl	_CMFormatDescriptionGetMediaSubType
 	mov	w20, w0
 	mov	x0, x19
@@ -10058,9 +10605,7 @@ Lsu_608:
 
 ; sub_textn(bytes, length) — show that cue text: tags dropped, &amp; &lt; &gt; decoded; nothing clears it.
 sub_textn:
-	FRAME	2
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	2, 0, 1
 	mov	x0, #0
 	cbz	x20, 1f
 	add	x0, x20, #1
@@ -10161,6 +10706,7 @@ sub_seek:
 	FRAME	1
 	mov	x20, x0
 	bl	sub_reset
+	bl	sub_obs
 	ldr	x19, [x27, #E_CCT]        ; the captions' cues come again with the picture
 	cbz	x19, 1f
 	bl	q_clear
@@ -10174,192 +10720,225 @@ sub_seek:
 	bl	trk_play
 	b	Lret1
 
+; sub_obs — the subtitles follow the clock every 1/30 s, and on every jump, only while a track is shown: the observer costs about 1% of a core.
+sub_obs:
+	VM	Lp_subobs
+	.pushsection __DATA,__data
+Lp_subobs:
+	LDE	E_SUBOBS
+	SL	0                         ; a: the observer, if any
+	LDE	E_SUBT
+	JZ	Lp_subobs_off
+	GL	0
+	JNZ	Lp_subobs_end
+	LDE	E_SYNC
+	MSG	S_addPeriodicTimeObserverForInterval_queue_usingBlock_, "=MOP"
+	.byte	24
+	.quad	1
+	.long	30, 1
+	.quad	0
+	.byte	G_MEDIAQ >> 3
+	.long	Lblk_s - Lvm_base
+	MSG	S_retain, "="
+	STE	E_SUBOBS
+	OP_END
+	HERE	Lp_subobs_off
+	GL	0
+	JZ	Lp_subobs_end
+	LDE	E_SYNC
+	MSG	S_removeTimeObserver_, "a"
+	GL	0
+	MSG	S_release
+	IMM	0
+	STE	E_SUBOBS
+	HERE	Lp_subobs_end
+	OP_END
+	.popsection
+
 ; sub_show(text) — the subtitle layer over the picture shows the text (released), centered near the bottom; 0 clears it.
-	ENTRY	sub_show
-	FRAME	2, 48
-	mov	x19, x0
-	ldr	x20, [x27, #B_SUBL]
-	cbnz	x20, 1f
-	CLASS	x0, CATextLayer
-	SEND	S_new
-	mov	x20, x0
-	str	x0, [x27, #B_SUBL]
-	CSTR	x0, "center"
-	bl	mkstr
-	mov	x2, x0
-	mov	x0, x20
-	SEND	S_setAlignmentMode_
-	ldr	x0, [x28, #G_WIN]
-	SEND	S_backingScaleFactor
-	mov	x0, x20
-	SEND	S_setContentsScale_       ; sharp on Retina
-	mov	x0, x20
-	fmov	s0, #1.0
-	SEND	S_setShadowOpacity_
-	CLASS	x0, NSFont
-	movi	d0, #0
-	ldr	x9, [x27, #F_NSFontWeightSemibold]
-	ldr	d1, [x9]
-	SEND	S_systemFontOfSize_weight_
-	mov	x2, x0
-	mov	x0, x20
-	SEND	S_setFont_
-	ldr	x0, [x28, #G_SBV]         ; beside the picture, not turned with it
-	SEND	S_layer
-	mov	x2, x20
-	SEND	S_addSublayer_
-1:	CLASS	x0, CATransaction         ; at once, not faded in
-	SEND	S_begin
-	CLASS	x0, CATransaction
-	mov	w2, #1
-	SEND	S_setDisableActions_
-	ldr	x0, [x28, #G_SBV]
-	SEND	S_bounds
-	stp	d2, d3, [sp]              ; the view's width and height
-	fmov	d0, #0.125
-	fmul	d0, d3, d0
-	fmov	d1, #0.375
-	fmul	d0, d0, d1                ; the text: about 1/20 of the picture's height
-	str	d0, [sp, #32]
-	mov	x0, x20
-	SEND	S_setFontSize_
-	mov	x0, x20
-	mov	w2, #0                    ; measured on its own lines (wrapped, it measures stale)
-	SEND	S_setWrapped_
-	mov	x0, x20
-	mov	x2, x19
-	SEND	S_setString_
-	mov	x0, x20
-	SEND	S_preferredFrameSize      ; d0, d1: its size
-	ldp	d2, d3, [sp]
-	fmov	d4, #0.875
-	fmul	d4, d2, d4                ; the widest it goes
-	fcmp	d0, d4
-	b.le	2f
-	fdiv	d5, d0, d4                ; wider: wrapped into more lines
-	frintp	d5, d5
-	fmul	d1, d1, d5
-	fmov	d0, d4
-	stp	d0, d1, [sp, #16]
-	mov	x0, x20
-	mov	w2, #1
-	SEND	S_setWrapped_
-	ldp	d0, d1, [sp, #16]
-	ldp	d2, d3, [sp]
-2:	fsub	d4, d2, d0
-	fmov	d5, #0.5
-	fmul	d4, d4, d5                ; centered
-	ldr	d5, [sp, #32]             ; a line above the bottom edge
-	fmov	d2, d0
-	fmov	d3, d1
-	fmov	d0, d4
-	fmov	d1, d5
-	mov	x0, x20
-	SEND	S_setFrame_
-	CLASS	x0, CATransaction
-	SEND	S_commit
-	mov	x0, x19
-	SEND	S_release
-	b	Lret2
+	VMTENTRY	sub_show
+	LDE	B_SUBL
+	JNZ	Lp_subshow_made
+	CLS	CATextLayer
+	MSG	S_new, "="
+	STE	B_SUBL
+	MSG	S_setAlignmentMode_, "S"
+	.asciz	"center"
+	LD	G_WIN
+	MSG	S_backingScaleFactor, "^"
+	LDE	B_SUBL
+	MSG	S_setContentsScale_, "Z"  ; sharp on Retina
+	.byte	4
+	FK	16
+	FS	4
+	LDE	B_SUBL
+	MSG	S_setShadowOpacity_, "W"
+	.byte	4
+	CLS	NSFont
+	MSG	S_systemFontOfSize_weight_, "=DF"
+	.short	0
+	.byte	X_SEMIBOLD
+	SL	1
+	LDE	B_SUBL
+	MSG	S_setFont_, "b"
+	LD	G_SBV                     ; beside the picture, not turned with it
+	MSG	S_layer, "="
+	MSG	S_addSublayer_, "E"
+	.short	B_SUBL
+	HERE	Lp_subshow_made
+	CLS	CATransaction             ; at once, not faded in
+	MSG	S_begin
+	CLS	CATransaction
+	MSG	S_setDisableActions_, "I"
+	.byte	1
+	LD	G_SBV
+	MSG	S_bounds, "^"             ; g, h: the view's width and height
+	FL	7
+	FOPK	2, 2
+	FOPK	2, 6                      ; the text: about 1/20 of the picture's height
+	FS	3
+	LDE	B_SUBL
+	MSG	S_setFontSize_, "Z"
+	.byte	3
+	LDE	B_SUBL
+	MSG	S_setWrapped_, "I"        ; measured on its own lines (wrapped, it measures stale)
+	.byte	0
+	LDE	B_SUBL
+	MSG	S_setString_, "a"
+	FL	6
+	FS	1
+	FOPK	2, 14                     ; the widest it goes
+	FS	2
+	LDE	B_SUBL
+	MSG	S_preferredFrameSize, "^" ; e, f: its size
+	FL	4
+	FOP	6, 2
+	JZ	Lp_subshow_fits
+	FL	4                         ; wider: wrapped into more lines
+	FOP	3, 2
+	FOPK	7, 0
+	FOP	2, 5
+	FS	5
+	FL	2
+	FS	4
+	LDE	B_SUBL
+	MSG	S_setWrapped_, "I"
+	.byte	1
+	HERE	Lp_subshow_fits
+	FL	1
+	FOP	1, 4
+	FOPK	2, 8                      ; centered, a line above the bottom edge
+	FS	6
+	LDE	B_SUBL
+	MSG	S_setFrame_, "ZZZZ"
+	.byte	6, 3, 4, 5
+	CLS	CATransaction
+	MSG	S_commit
+	GL	0
+	MSG	S_release
+	OP_END
+	.p2align 2
 
 ; eng_vol — the sound renderer takes G's volume and mute.
 	ENTRY	eng_vol
-	FRAME	0
 	ldr	x0, [x27, #E_AR]
-	ldr	w9, [x28, #G_VOLPCT]
-	scvtf	s0, w9
-	ldr	s1, [x28, #(Lf_100 - G)]
-	fdiv	s0, s0, s1
-	SEND	S_setVolume_
-	ldr	x0, [x27, #E_AR]
-	ldr	w2, [x28, #G_MUTED]
-	SEND	S_setMuted_
-	b	Lret0
+	b	vol_to
 
 ; eng_aonly — Audio Only: the picture stops being decoded, or comes back a moment ahead, decoded from its sync sample.
-	ENTRY	eng_aonly
-	FRAME	1, 32
-	ldr	w9, [x27, #E_NET]
-	cbnz	w9, Lea_net
-	ldr	x0, [x27, #E_VT]
-	cbz	x0, Lret1
-	ldr	w9, [x28, #G_AONLY]
-	cbz	w9, Lea_back
-	ldr	x0, [x27, #E_VR]
-	SEND	S_stopRequestingMediaData
-	ldr	x0, [x27, #E_VR]
-	mov	w2, #1
-	mov	x3, #0
-	SEND	S_flushWithRemovalOfDisplayedImage_completionHandler_
-	b	Lret1
-Lea_back:
-	bl	now_ms
-	add	x3, x0, #300              ; 0.3 s ahead, while it decodes
-	ldr	x0, [x27, #E_VT]
-	ldr	x1, [x27, #E_VR]
-	ADDR	x2, Lblk_v
-	bl	trk_play
-	b	Lret1
-Lea_net:
-	ldr	w9, [x27, #E_LIVE]
-	cbz	w9, Lea_vod
-	mov	x0, #32                   ; a broadcast: opened again with the other stream
-	bl	_malloc
-	cbz	x0, Lret1
-	mov	x19, x0
-	ldr	w9, [x27, #E_GEN]
-	mov	w10, #1
-	stp	w9, w10, [x19, #YT_GEN]
-	str	xzr, [x19, #YT_DUR]
-	ldr	x0, [x27, #(E_ST + ST_URL)]
-	bl	_strdup
-	str	x0, [x19, #YT_V]
-	ldr	x0, [x27, #(E_ST + ST_SIZE + ST_URL)]
-	bl	_strdup
-	str	x0, [x19, #YT_A]
-	mov	x0, x19
-	bl	Leng_tube
-	b	Lret1
-Lea_vod:
-	ldr	x0, [x27, #E_VR]          ; streams: the picture's stream stops, or starts again just ahead
-	SEND	S_stopRequestingMediaData
-	ldr	x0, [x27, #E_VR]
-	mov	w2, #1
-	mov	x3, #0
-	SEND	S_flushWithRemovalOfDisplayedImage_completionHandler_
-	ldr	x9, [x27, #(E_ST + ST_SIZE + ST_URL)]
-	ldr	x10, [x27, #(E_ST + ST_SIZE + ST_PLURL)]
-	orr	x9, x9, x10
-	ldr	w10, [x28, #G_AONLY]
-	cbz	w10, 1f
-	ldr	x19, [x27, #E_VT]         ; on: what is queued goes; YouTube's picture stream stops (one stream for both goes on, its pictures dropped)
-	cbz	x19, 2f
-	bl	q_clear
-2:	cbz	x9, Lret1
-	BADDR	x0, E_ST
-	bl	st_reset
-	b	Lret1
-1:	mov	x19, x9
-	bl	now_ms
-	mov	x1, x0
-	cbz	x19, 3f                   ; off, one stream for both: everything restarts from now
-	add	x1, x1, #1000             ; YouTube: its picture stream from a second ahead, fetched and decoded meanwhile
-	BADDR	x0, E_ST
-	bl	st_seek
-	b	Lret1
-3:	mov	x0, x1
-	bl	Leng_seek
-	b	Lret1
+	VMENTRY	eng_aonly, Lp_eaonly
+	.pushsection __DATA,__data
+Lp_eaonly:
+	LDEW	E_NET
+	JNZ	Lp_eaonly_net
+	LDE	E_VT
+	JZ	Lp_eaonly_end
+	LW	G_AONLY
+	JZ	Lp_eaonly_back
+	LDE	E_VR
+	MSG	S_stopRequestingMediaData
+	LDE	E_VR
+	MSG	S_flushWithRemovalOfDisplayedImage_completionHandler_, "II"
+	.byte	1, 0
+	OP_END
+	HERE	Lp_eaonly_back
+	NCALL	now_ms, "="
+	ADDH	300                       ; 0.3 s ahead, while it decodes
+	SL	0
+	LDE	E_VT
+	NCALL	trk_play, "VEPa"
+	.short	E_VR
+	.long	Lblk_v - Lvm_base
+	HERE	Lp_eaonly_end
+	OP_END
+	HERE	Lp_eaonly_net
+	LDEW	E_LIVE
+	JZ	Lp_eaonly_vod
+	CALL	F_malloc, "=I"            ; a broadcast: opened again with the other stream
+	.byte	32
+	JZ	Lp_eaonly_none
+	SL	1
+	LDEW	E_GEN
+	STW	1, YT_GEN
+	IMM	1
+	STW	1, YT_LIVE
+	IMM	0
+	STX	1, YT_DUR
+	LDE	E_ST + ST_URL
+	CALL	F_strdup, "=V"
+	STX	1, YT_V
+	LDE	E_ST + ST_SIZE + ST_URL
+	CALL	F_strdup, "=V"
+	STX	1, YT_A
+	NCALL	eng_tube, "b"
+	HERE	Lp_eaonly_none
+	OP_END
+	HERE	Lp_eaonly_vod
+	LDE	E_VR                      ; streams: the picture's stream stops, or starts again just ahead
+	MSG	S_stopRequestingMediaData
+	LDE	E_VR
+	MSG	S_flushWithRemovalOfDisplayedImage_completionHandler_, "II"
+	.byte	1, 0
+	LDE	E_ST + ST_SIZE + ST_URL
+	SL	2
+	LDE	E_ST + ST_SIZE + ST_PLURL
+	ADDL	2
+	SL	2                         ; c: a sound stream of its own
+	LW	G_AONLY
+	JZ	Lp_eaonly_off
+	LDE	E_VT                      ; on: what is queued goes; YouTube's picture stream stops (one stream for both goes on, its pictures dropped)
+	JZ	Lp_eaonly_kept
+	NCALL	trk_clear, "V"
+	HERE	Lp_eaonly_kept
+	GL	2
+	JZ	Lp_eaonly_done
+	NCALL	st_reset, "B"
+	.short	E_ST
+	OP_END
+	HERE	Lp_eaonly_off
+	NCALL	now_ms, "="
+	SL	3
+	GL	2
+	JZ	Lp_eaonly_all             ; off, one stream for both: everything restarts from now
+	IMM	0                         ; its first picture shown at once, like a seek's
+	STEW	E_PREV
+	GL	3
+	ADDH	1000                      ; YouTube: its picture stream from a second ahead, fetched and decoded meanwhile
+	NCALL	st_seek, "BV"
+	.short	E_ST
+	OP_END
+	HERE	Lp_eaonly_all
+	NCALL	eng_seek, "d"
+	HERE	Lp_eaonly_done
+	OP_END
+	.popsection
 
-; net_tick(generation) — every quarter second while streams play: a track running dry holds the clock until STALL_FULL ms are in again.
+; net_tick(generation) — every eighth of a second: a stream's track running dry holds the clock until STALL_FULL ms are in again; a picture held back by its lead is asked for again.
 	ENTRY	net_tick
 	FRAME	2, 32
 	mov	w19, w0
 	ldr	w9, [x27, #E_GEN]
-	ldr	w10, [x27, #E_NET]
 	cmp	w0, w9
-	ccmp	w10, #0, #4, eq
-	b.eq	Lret2                     ; other media now: no more ticks
+	b.ne	Lret2                     ; other media now: no more ticks
 	bl	now_ms
 	mov	x20, x0                   ; the clock, ms
 	mov	x21, #0x7fffffffffffffff
@@ -10394,17 +10973,28 @@ Lnt_dry:
 	str	w9, [x27, #E_HOLD]
 	bl	Leng_rate
 Lnt_again:
+	ldr	w9, [x28, #G_PLAYING]
+	cmp	w9, #0
+	cset	w1, eq                    ; paused: a tick a second, the picture fed freely until a playing tick
+	str	w1, [x27, #E_SLOW]
+	add	w1, w1, w1, lsl #1
 	mov	w0, w19
-	bl	tick_later
+	bl	Ltick_shift
+	ldr	x19, [x27, #E_VT]
+	cbz	x19, Lret2
+	bl	trk_request
 	b	Lret2
 
-; tick_later(generation) — net_tick in a quarter second.
+; tick_later(generation) — net_tick in an eighth of a second (Ltick_shift: shifted left by w1).
 tick_later:
+	mov	w1, #0
+Ltick_shift:
 	FRAME	1
 	mov	w19, w0
+	mov	w9, #(TICK_NS & 0xffff)
+	movk	w9, #(TICK_NS >> 16), lsl #16
+	lsl	w1, w9, w1
 	mov	x0, #0
-	mov	w1, #(TICK_NS & 0xffff)
-	movk	w1, #(TICK_NS >> 16), lsl #16
 	bl	_dispatch_time
 	ldr	x1, [x28, #G_MEDIAQ]
 	mov	w2, w19
@@ -10430,85 +11020,100 @@ ahead_ms:
 	ret
 
 ; eng_tube(request) — YouTube on This Mac: its picture and sound streams; request = {generation, live, ms, picture URL, sound URL}, freed here (URLs become the streams').
-	ENTRY	eng_tube
-	FRAME	1
-	mov	x19, x0
-	bl	Leng_close
-	mov	x9, #-1
-	str	x9, [x27, #E_T0]
-	mov	x0, #0
-	bl	hold
-	ldp	w9, w10, [x19, #YT_GEN]
-	str	w9, [x27, #E_GEN]
-	ldr	x9, [x19, #YT_DUR]
-	str	x9, [x27, #E_DURMS]
-	mov	w9, #1
-	str	w9, [x27, #E_NET]
-	str	w9, [x27, #E_ISO]
-	ldr	w20, [x19, #YT_LIVE]
-	str	w20, [x27, #E_LIVE]
-	ldr	w21, [x28, #G_AONLY]
-	ldr	x1, [x19, #YT_V]
-	cbz	x1, 2f
-	eor	w9, w21, #1
-	str	w9, [x27, #E_WANTV]
-	BADDR	x0, E_ST
-	cbnz	w9, 1f
-	str	x1, [x0, #ST_URL]         ; Audio Only: kept for later
-	b	2f
-1:	mov	w2, #0
-	bl	st_open
-	cbz	w20, 2f
-	ldr	x0, [x19, #YT_A]          ; a broadcast's picture is its HLS, sound in it: the DASH sound is kept for Audio Only
-	str	x0, [x27, #(E_ST + ST_SIZE + ST_URL)]
-	b	3f
-2:	BADDR	x0, (E_ST + ST_SIZE)
-	ldr	x1, [x19, #YT_A]
-	mov	w2, w20
-	bl	st_open
-3:
-	mov	x0, x19
-	bl	_free
-	bl	await                     ; the clock held at 0 until the picture is ready
-	ldr	w0, [x27, #E_GEN]
-	bl	tick_later
-	adr	x0, ui_poll
-	mov	x1, #0
-	bl	post_main
-	b	Lret1
+	VMENTRY	eng_tube, Lp_tube
+	.pushsection __DATA,__data
+Lp_tube:
+	NCALL	eng_close
+	IMM	-1
+	STE	E_T0
+	NCALL	hold, "I"
+	.byte	0
+	GL	0
+	LDW	YT_GEN
+	STEW	E_GEN
+	GL	0
+	LDX	YT_DUR
+	STE	E_DURMS
+	IMM	1
+	STEW	E_NET
+	STEW	E_ISO
+	GL	0
+	LDW	YT_LIVE
+	SL	1
+	STEW	E_LIVE
+	GL	0
+	LDX	YT_V
+	SL	2
+	JZ	Lp_tube_sound
+	LW	G_AONLY
+	EQ	0
+	STEW	E_WANTV
+	JNZ	Lp_tube_open
+	GL	2                         ; Audio Only: kept for later
+	STE	E_ST + ST_URL
+	JMP	Lp_tube_sound
+	HERE	Lp_tube_open
+	NCALL	st_open, "BcI"
+	.short	E_ST
+	.byte	0
+	GL	1
+	JZ	Lp_tube_sound
+	GL	0                         ; a broadcast's picture is its HLS, sound in it: the DASH sound is kept for Audio Only
+	LDX	YT_A
+	STE	E_ST + ST_SIZE + ST_URL
+	JMP	Lp_tube_done
+	HERE	Lp_tube_sound
+	GL	0
+	LDX	YT_A
+	SL	3
+	NCALL	st_open, "Bdb"
+	.short	E_ST + ST_SIZE
+	HERE	Lp_tube_done
+	CALL	F_free, "a"
+	NCALL	await                     ; the clock held at 0 until the picture is ready
+	LDEW	E_GEN
+	NCALL	tick_later, "V"
+	NCALL	post_main, "PI"
+	.long	ui_poll - Lvm_base
+	.byte	0
+	OP_END
+	.popsection
 
 ; eng_web(request) — any other web address on This Mac: one stream, its tracks as its movie box lists them; request = {generation, URL} like eng_open's.
-	ENTRY	eng_web
-	FRAME	1
-	mov	x19, x0
-	bl	Leng_close
-	mov	x9, #-1                   ; HLS: the timeline is anchored at the first time stamp
-	str	x9, [x27, #E_T0]
-	mov	x0, #0
-	bl	hold
-	ldr	w9, [x19]
-	str	w9, [x27, #E_GEN]
-	mov	w9, #1
-	str	w9, [x27, #E_NET]
-	str	w9, [x27, #E_ISO]
-	str	w9, [x27, #E_WANTV]       ; until its tracks say otherwise
-	add	x0, x19, #8
-	bl	_strdup
-	mov	x20, x0
-	mov	x0, x19
-	bl	_free
-	cbz	x20, Lret1
-	BADDR	x0, E_ST
-	mov	x1, x20
-	mov	w2, #0
-	bl	st_open
-	bl	await
-	ldr	w0, [x27, #E_GEN]
-	bl	tick_later
-	adr	x0, ui_poll
-	mov	x1, #0
-	bl	post_main
-	b	Lret1
+	VMENTRY	eng_web, Lp_web
+	.pushsection __DATA,__data
+Lp_web:
+	NCALL	eng_close
+	IMM	-1                        ; HLS: the timeline is anchored at the first time stamp
+	STE	E_T0
+	NCALL	hold, "I"
+	.byte	0
+	GL	0
+	LDW	0
+	STEW	E_GEN
+	IMM	1
+	STEW	E_NET
+	STEW	E_ISO
+	STEW	E_WANTV                   ; until its tracks say otherwise
+	GL	0
+	ADDI	8
+	CALL	F_strdup, "=V"
+	SL	1
+	CALL	F_free, "a"
+	GL	1
+	JZ	Lp_web_end
+	NCALL	st_open, "BbI"
+	.short	E_ST
+	.byte	0
+	NCALL	await
+	LDEW	E_GEN
+	NCALL	tick_later, "V"
+	NCALL	post_main, "PI"
+	.long	ui_poll - Lvm_base
+	.byte	0
+	HERE	Lp_web_end
+	OP_END
+	.popsection
 
 ; ---- Actions (Objective-C methods: self, _cmd, sender) ----
 
@@ -10529,30 +11134,40 @@ ahead_ms:
 
 ; skip(delta) — seek from the position on screen and show the target at once, inside the track.
 skip:
-	FRAME	2
-	mov	x19, x0
-	ldr	x0, [x28, #G_POS]
-	SEND	S_isEnabled
-	cbz	w0, Lret2                 ; unknown duration: nowhere to skip to
-	ldr	x0, [x28, #G_POS]
-	SEND	S_maxValue
-	fcvtzs	x20, d0
-	ldr	x0, [x28, #G_POS]
-	SEND	S_doubleValue
-	fcvtzs	x9, d0
-	add	x19, x9, x19
-	sub	x9, x20, #1               ; at most the last second
-	cmp	x19, x9
-	csel	x19, x19, x9, lt
-	cmp	x19, #0
-	csel	x19, x19, xzr, gt
-	mov	x0, x19
-	mov	x1, x20
-	bl	show_time
-	mov	x9, #1000
-	mul	x0, x19, x9
-	bl	seek_route
-	b	Lret2
+	VM	Lp_skip
+	.pushsection __DATA,__data
+Lp_skip:
+	LD	G_POS
+	MSG	S_isEnabled, ">"
+	JZ	Lp_skip_end               ; unknown duration: nowhere to skip to
+	LD	G_LTDUR
+	SL	1
+	LD	G_SHOWPOS
+	ADDL	0
+	SL	2
+	GL	1
+	ADDI	-1                        ; at most the last second
+	SL	3
+	GL	2
+	SUBL	3
+	LT	0
+	JNZ	Lp_skip_low
+	GL	3
+	SL	2
+	HERE	Lp_skip_low
+	GL	2
+	LT	1
+	JZ	Lp_skip_go
+	IMM	0
+	SL	2
+	HERE	Lp_skip_go
+	NCALL	show_time, "cb"
+	GL	2
+	MULH	1000
+	NCALL	seek_route, "V"
+	HERE	Lp_skip_end
+	OP_END
+	.popsection
 
 ; seek_route(ms) — hold polled positions for the seek, then send it.
 seek_route:
@@ -10575,114 +11190,138 @@ seek_route:
 
 ; dragging() — w0 = 1 while the mouse button is still down.
 dragging:
-	FRAME	0
-	ldr	x0, [x28, #G_APP]
-	SEND	S_currentEvent
-	SEND	S_type                    ; a nil event gives 0
-	cmp	x0, #NSEventTypeLeftMouseDown
-	ccmp	x0, #NSEventTypeLeftMouseDragged, #4, ne
-	cset	w0, eq
-	b	Lret0
+	VM	Lp_drag
+	.pushsection __DATA,__data
+Lp_drag:
+	LD	G_APP
+	MSG	S_currentEvent, "="
+	MSG	S_type, "="               ; a nil event gives 0
+	SL	0
+	EQ	NSEventTypeLeftMouseDown
+	JNZ	Lp_drag_end
+	GL	0
+	EQ	NSEventTypeLeftMouseDragged
+	HERE	Lp_drag_end
+	OP_END
+	.popsection
 
 ; play_text(text) — resolve and play a link, search, web address or file path (copied); the newest one wins.
 play_text:
-	FRAME	2
-	mov	x19, x0
-	ldrb	w9, [x19]
-	cbz	w9, Lret2                 ; empty
-	mov	x0, #1
-	mov	x1, #JOB_SIZE
-	bl	_calloc
-	cbz	x0, Lret2
-	mov	x20, x0
-	mov	x0, x19
-	bl	_strdup                   ; the caller's text dies with its pool
-	str	x0, [x20, #JOB_QUERY]
-	cbz	x0, Lpt_drop
-	ldr	w9, [x28, #G_PLAYGEN]
-	add	w9, w9, #1
-	str	w9, [x28, #G_PLAYGEN]
-	str	w9, [x20, #JOB_GEN]
-	mov	w9, #1
-	str	w9, [x28, #G_LOADING]
-	ADDR	x0, Lprog_busy
-	bl	ui_run
-	GADDR	x0, Ls_slash+1
-	mov	w1, #0
-	bl	set_status
-	bl	stage_update
-	ldr	x0, [x20, #JOB_QUERY]     ; a file needs no lookup: resolved here, at once
-	ldrb	w9, [x0]
-	cmp	w9, #'/'
-	b.eq	1f
-	CSTR	x1, "file://"
-	mov	x2, #7
-	bl	_strncmp
-	cbnz	w0, 2f
-1:	mov	x0, x20
-	bl	Lplay_resolve
-	b	Lret2
-2:	WORKQ
-	mov	x1, x20
-	adr	x2, play_resolve
-	bl	_dispatch_async_f
-	b	Lret2
-Lpt_drop:
-	mov	x0, x20
-	bl	_free
-	b	Lret2
+	VM	Lp_text
+	.pushsection __DATA,__data
+Lp_text:
+	GL	0
+	LDB	0
+	JZ	Lp_text_end               ; empty
+	CALL	F_calloc, "=IX"
+	.byte	1
+	.long	JOB_SIZE
+	JZ	Lp_text_end
+	SL	1
+	CALL	F_strdup, "=a"            ; the caller's text dies with its pool
+	STX	1, JOB_QUERY
+	JZ	Lp_text_drop
+	LW	G_PLAYGEN
+	ADDI	1
+	SW	G_PLAYGEN
+	STW	1, JOB_GEN
+	IMM	1
+	SW	G_LOADING
+	LD	G_SPIN                    ; the spinner turns while it resolves
+	MSG	S_startAnimation_, "I"
+	.byte	0
+	NCALL	set_status, "CI"
+	.asciz	""
+	.byte	0
+	NCALL	stage_update
+	GL	1
+	LDX	JOB_QUERY                 ; a file needs no lookup: resolved here, at once
+	SL	2
+	LDB	0
+	EQ	'/'
+	JNZ	Lp_text_now
+	CALL	F_strncmp, ">cCI"
+	.asciz	"file://"
+	.byte	7
+	JNZ	Lp_text_later
+	HERE	Lp_text_now
+	NCALL	resolve, "=b"
+	STW	1, JOB_RESULT
+	NCALL	ui_play_done, "b"         ; already on main: no turn of the run loop to wait
+	OP_END
+	HERE	Lp_text_later
+	CALL	F_dispatch_async_f, "ObP"
+	.byte	G_WORKQ >> 3
+	.long	play_resolve - Lvm_base
+	OP_END
+	HERE	Lp_text_drop
+	CALL	F_free, "b"
+	HERE	Lp_text_end
+	OP_END
+	.popsection
 
 ; play_url(url) — play an NSURL: a file by its path, anything else by its text.
 play_url:
-	FRAME	1
-	mov	x19, x0
-	SEND	S_isFileURL
-	mov	x9, x0
-	mov	x0, x19
-	cbz	w9, Lpu_web
-	SEND	S_path
-	b	Lpu_text
-Lpu_web:
-	SEND	S_absoluteString
-Lpu_text:
-	SEND	S_UTF8String
-	cbz	x0, Lret1
-	bl	play_text
-	b	Lret1
+	VM	Lp_url
+	.pushsection __DATA,__data
+Lp_url:
+	GL	0
+	MSG	S_isFileURL, ">"
+	JZ	Lp_url_web
+	GL	0
+	MSG	S_path, "="
+	JMP	Lp_url_text
+	HERE	Lp_url_web
+	GL	0
+	MSG	S_absoluteString, "="
+	HERE	Lp_url_text
+	MSG	S_UTF8String, "="
+	JZ	Lp_url_end
+	NCALL	play_text, "V"
+	HERE	Lp_url_end
+	OP_END
+	.popsection
 
 ; act_play — Return in the link field: play what it holds.
-	ENTRY	act_play
-	FRAME	1
-	ldr	x0, [x28, #G_FIELD]
-	SEND	S_stringValue
-	mov	x19, x0
-	CLASS	x0, NSCharacterSet
-	SEND	S_whitespaceAndNewlineCharacterSet
-	mov	x2, x0
-	mov	x0, x19
-	SEND	S_stringByTrimmingCharactersInSet_
-	SEND	S_UTF8String
-	mov	x19, x0
-	bl	url_hide
-	cbz	x19, Lret1
-	mov	x0, x19
-	bl	play_text
-	b	Lret1
+	VMENTRY	act_play, Lp_play
+	.pushsection __DATA,__data
+Lp_play:
+	CLS	NSCharacterSet
+	MSG	S_whitespaceAndNewlineCharacterSet, "="
+	SL	0
+	LD	G_FIELD
+	MSG	S_stringValue, "="
+	MSG	S_stringByTrimmingCharactersInSet_, "=a"
+	MSG	S_UTF8String, "="
+	SL	0
+	NCALL	url_hide
+	GL	0
+	JZ	Lp_play_1
+	NCALL	play_text, "V"
+	HERE	Lp_play_1
+	OP_END
+	.popsection
 
 ; act_focus — Open from URL (Cmd-L): the link field floats in, ready to paste.
-	ENTRY	act_focus
-	ADDR	x0, Lprog_focus
-	b	ui_run
+	VMENTRY	act_focus, Lprog_focus
 
 ; url_hide() — the link field goes away and the window keeps the keyboard.
 url_hide:
-	FRAME	0
-	ldr	x0, [x28, #G_URLBOX]
-	SEND	S_isHidden
-	cbnz	w0, Lret0                 ; already
-	ADDR	x0, Lprog_urlhide
-	bl	ui_run
-	b	Lret0
+	VM	Lp_urlhide
+	.pushsection __DATA,__data
+Lp_urlhide:
+	LD	G_URLBOX
+	MSG	S_isHidden, ">"
+	JNZ	Lp_urlhide_1                        ; already
+	LD	G_URLBOX
+	MSG	S_setHidden_, "I"
+	.byte	1
+	LD	G_WIN
+	MSG	S_makeFirstResponder_, "O"
+	.byte	G_CONTENT >> 3
+	HERE	Lp_urlhide_1
+	OP_END
+	.popsection
 
 ; act_urlcmd(control, text view, command) -> YES for Escape, which closes the link field.
 	ENTRY	act_urlcmd
@@ -10696,275 +11335,317 @@ url_hide:
 	b	Lret0
 
 ; act_open — Open (Cmd-O): pick an audio or video file.
-	ENTRY	act_open
-	FRAME	1
-	CLASS	x0, NSOpenPanel
-	SEND	S_openPanel
-	mov	x19, x0
-	CSTR	x0, "public.audiovisual-content"
-	bl	mkstr
-	mov	x2, x0
-	CLASS	x0, UTType
-	SEND	S_typeWithIdentifier_
-	mov	x2, x0
-	CLASS	x0, NSArray
-	SEND	S_arrayWithObject_
-	mov	x2, x0
-	mov	x0, x19
-	SEND	S_setAllowedContentTypes_
-	mov	x0, x19
-	SEND	S_runModal
-	cmp	x0, #1                    ; NSModalResponseOK
-	b.ne	Lret1
-	mov	x0, x19
-	SEND	S_URL
-	bl	play_url
-	b	Lret1
+	VMENTRY	act_open, Lp_open
+	.pushsection __DATA,__data
+Lp_open:
+	CLS	UTType
+	MSG	S_typeWithIdentifier_, "=S"
+	.asciz	"public.audiovisual-content"
+	SL	0
+	CLS	NSArray
+	MSG	S_arrayWithObject_, "=a"
+	SL	0
+	CLS	NSOpenPanel
+	MSG	S_openPanel, "="
+	SL	1
+	MSG	S_setAllowedContentTypes_, "a"
+	MSG	S_runModal, "="
+	EQ	1                         ; NSModalResponseOK
+	JZ	Lp_open_1
+	GL	1
+	MSG	S_URL, "="
+	NCALL	play_url, "V"
+	HERE	Lp_open_1
+	OP_END
+	.popsection
 
 ; act_openurls(app, urls) — files opened with Beam from the Finder or the Dock.
-	ENTRY	act_openurls
-	FRAME	0
-	mov	x0, x3
-	SEND	S_firstObject
-	cbz	x0, Lret0
-	bl	play_url
-	b	Lret0
+	VMENTRY	act_openurls, Lp_openurls
+	.pushsection __DATA,__data
+Lp_openurls:
+	GL	3
+	MSG	S_firstObject, "="
+	JZ	Lp_openurls_1
+	NCALL	play_url, "V"
+	HERE	Lp_openurls_1
+	OP_END
+	.popsection
 
 ; act_drop(drag) -> YES when a dropped file, link or text was taken.
-	ENTRY	act_drop
-	FRAME	1
-	mov	x0, x2
-	SEND	S_draggingPasteboard
-	mov	x19, x0
-	CLASS	x2, NSURL
-	CLASS	x0, NSArray
-	SEND	S_arrayWithObject_
-	mov	x2, x0
-	mov	x0, x19
-	mov	x3, #0
-	SEND	S_readObjectsForClasses_options_
-	SEND	S_firstObject
-	cbz	x0, Ldp_text
-	bl	play_url
-	mov	w0, #1
-	b	Lret1
-Ldp_text:
-	CSTR	x0, "public.utf8-plain-text"
-	bl	mkstr
-	mov	x2, x0
-	mov	x0, x19
-	SEND	S_stringForType_
-	SEND	S_UTF8String
-	cbz	x0, Lret1
-	bl	play_text
-	mov	w0, #1
-	b	Lret1
+	VMENTRY	act_drop, Lp_drop
+	.pushsection __DATA,__data
+Lp_drop:
+	GL	2
+	MSG	S_draggingPasteboard, "="
+	SL	2
+	CLS	NSURL
+	SL	3
+	CLS	NSArray
+	MSG	S_arrayWithObject_, "=d"
+	SL	3
+	GL	2
+	MSG	S_readObjectsForClasses_options_, "=dI"
+	.byte	0
+	MSG	S_firstObject, "="
+	JZ	Lp_drop_1
+	NCALL	play_url, "V"
+	IMM	1
+	OP_END
+	HERE	Lp_drop_1
+	GL	2
+	MSG	S_stringForType_, "=S"
+	.asciz	"public.utf8-plain-text"
+	MSG	S_UTF8String, "="
+	JZ	Lp_drop_2
+	NCALL	play_text, "V"
+	IMM	1
+	HERE	Lp_drop_2
+	OP_END
+	.popsection
 
 ; act_click(event) — a click on the stage closes the link field; a double click toggles full screen.
-	ENTRY	act_click
-	FRAME	1
-	mov	x19, x2
-	bl	url_hide
-	mov	x0, x19
-	SEND	S_clickCount
-	cmp	x0, #2
-	b.ne	Lret1
-	ldr	x0, [x28, #G_WIN]
-	mov	x2, #0
-	SEND	S_toggleFullScreen_
-	b	Lret1
+	VMENTRY	act_click, Lp_click
+	.pushsection __DATA,__data
+Lp_click:
+	NCALL	url_hide
+	GL	2
+	MSG	S_clickCount, "="
+	EQ	2
+	JZ	Lp_click_1
+	LD	G_WIN
+	MSG	S_toggleFullScreen_, "I"
+	.byte	0
+	HERE	Lp_click_1
+	OP_END
+	.popsection
 
 ; act_moved(event) — the mouse moved: the controls come back, and note whether it is over them.
-	ENTRY	act_moved
-	FRAME	0
-	str	wzr, [x28, #G_IDLE]
-	mov	x0, x2
-	SEND	S_locationInWindow        ; d1 = height above the bottom
-	mov	w9, #(BAR_M + BAR_H + 8)
-	scvtf	d2, w9
-	fcmp	d1, d2
-	cset	w9, mi
-	str	w9, [x28, #G_HOVER]
-	bl	bar_show
-	b	Lret0
+	VMENTRY	act_moved, Lp_moved
+	.pushsection __DATA,__data
+Lp_moved:
+	IMM	0
+	SW	G_IDLE
+	GL	2
+	MSG	S_locationInWindow, "^"   ; f: its height above the bottom
+	FK	(BAR_M + BAR_H + 8) * 16
+	FOP	6, 5                      ; over the bar
+	SW	G_HOVER
+	NCALL	bar_show
+	OP_END
+	.popsection
 
 ; act_aonly — Audio Only (the headphones and Opt-Cmd-A): no picture is fetched, decoded or shown.
-	ENTRY	act_aonly
-	FRAME	1
-	ldr	w9, [x28, #G_AONLY]
-	eor	w19, w9, #1
-	str	w19, [x28, #G_AONLY]
-	ldr	x0, [x28, #G_AOITEM]
-	mov	w2, w19
-	SEND	S_setState_
-	ldr	x9, [x28, #G_YEL]
-	ldr	x10, [x28, #G_SECOND]
-	cmp	w19, #0
-	csel	x2, x9, x10, ne
-	ldr	x0, [x28, #G_AOBTN]
-	SEND	S_setContentTintColor_
-	adr	x0, eng_aonly
-	mov	x1, #0
-	bl	eng_cmd
-	bl	local_poll
-	b	Lret1
+	VMENTRY	act_aonly, Lp_aonly
+	.pushsection __DATA,__data
+Lp_aonly:
+	LW	G_AONLY
+	EQ	0
+	SW	G_AONLY
+	SL	0
+	LD	G_AOITEM
+	MSG	S_setState_, "a"
+	LD	G_SECOND
+	SL	1
+	GL	0
+	JZ	Lp_aonly_1
+	LD	G_YEL
+	SL	1
+	HERE	Lp_aonly_1
+	LD	G_AOBTN
+	MSG	S_setContentTintColor_, "b"
+	NCALL	eng_cmd, "PI"
+	.long	eng_aonly - Lvm_base
+	.byte	0
+	NCALL	local_poll
+	OP_END
+	.popsection
 
 ; act_vol — the volume slider.
-	ENTRY	act_vol
-	FRAME	1
-	ldr	x0, [x28, #G_VOL]
-	SEND	S_intValue
-	mov	w19, w0
-	bl	dragging
-	str	w0, [x28, #G_VOLDRAG]
-	ldr	x9, [x28, #G_TICK]
-	add	x9, x9, #HOLD_TICKS
-	str	x9, [x28, #G_VOLH]
-	mov	w0, w19
-	bl	local_setvol
-	b	Lret1
+	VMENTRY	act_vol, Lp_vol
+	.pushsection __DATA,__data
+Lp_vol:
+	LD	G_VOL
+	MSG	S_intValue, ">"
+	SL	0
+	NCALL	dragging, "="
+	SW	G_VOLDRAG
+	LD	G_TICK
+	ADDI	HOLD_TICKS
+	STO	G_VOLH
+	NCALL	local_setvol, "a"
+	OP_END
+	.popsection
 
 ; act_seek — the position slider: This Mac follows the drag frame by frame.
-	ENTRY	act_seek
-	FRAME	1
-	ldr	x0, [x28, #G_POS]
-	SEND	S_doubleValue
-	mov	x9, #1000
-	scvtf	d1, x9
-	fmul	d0, d0, d1
-	fcvtzs	x19, d0                   ; to the millisecond
-	ldr	x0, [x28, #G_POS]
-	SEND	S_maxValue
-	fcvtzs	x1, d0
-	mov	x9, #1000
-	sdiv	x0, x19, x9
-	bl	show_time
-	bl	dragging
-	str	w0, [x28, #G_SEEKDRAG]
-	cbz	w0, Lsk_release
-	mov	x0, x19
-	bl	local_seekms
-	b	Lret1
-Lsk_release:
-	mov	x0, x19
-	bl	seek_route
-	b	Lret1
+	VMENTRY	act_seek, Lp_aseek
+	.pushsection __DATA,__data
+Lp_aseek:
+	LD	G_POS
+	MSG	S_doubleValue, "^"
+	FL	4
+	FOPK	2, 16000                  ; to the millisecond
+	FT
+	SL	0
+	LD	G_POS
+	MSG	S_maxValue, "@"
+	SL	1
+	GL	0
+	DIVH	1000
+	NCALL	show_time, "Vb"
+	NCALL	dragging, "="
+	SW	G_SEEKDRAG
+	JZ	Lp_aseek_rel
+	NCALL	local_seekms, "a"
+	OP_END
+	HERE	Lp_aseek_rel
+	NCALL	seek_route, "a"
+	OP_END
+	.popsection
 
 ; act_tick — the 1 Hz timer: the controls' idle fade; This Mac renders itself.
-	ENTRY	act_tick
-	FRAME	0
-	ldr	x10, [x28, #G_TICK]
-	add	x10, x10, #1
-	str	x10, [x28, #G_TICK]
-	bl	idle_tick
-	bl	local_poll
-	b	Lret0
+	VMENTRY	act_tick, Lp_tick
+	.pushsection __DATA,__data
+Lp_tick:
+	LD	G_TICK
+	ADDI	1
+	STO	G_TICK
+	NCALL	idle_tick
+	NCALL	local_poll
+	OP_END
+	.popsection
 
 ; idle_tick() — a picture playing on This Mac: after a few still seconds the controls and the pointer fade away.
 idle_tick:
-	FRAME	0
-	ldr	w9, [x28, #G_IDLE]
-	add	w9, w9, #1
-	str	w9, [x28, #G_IDLE]
-	cmp	w9, #HIDE_TICKS
-	b.lo	Lret0
-	ldr	w9, [x28, #G_BARHID]
-	ldr	w10, [x28, #G_HOVER]
-	orr	w9, w9, w10
-	ldr	w10, [x28, #G_AONLY]
-	orr	w9, w9, w10
-	cbnz	w9, Lret0
-	ldr	w9, [x28, #G_HASVIDEO]
-	ldr	w10, [x28, #G_PPSHOWN]
-	and	w9, w9, w10
-	cbz	w9, Lret0
-	ldr	x0, [x28, #G_URLBOX]
-	SEND	S_isHidden
-	cbz	w0, Lret0                 ; a link is being typed
-	mov	w9, #1
-	str	w9, [x28, #G_BARHID]
-	fmov	d0, xzr
-	bl	bar_alpha
-	CLASS	x0, NSCursor
-	mov	w2, #1
-	SEND	S_setHiddenUntilMouseMoves_
-	b	Lret0
+	VM	Lp_idle
+	.pushsection __DATA,__data
+Lp_idle:
+	LW	G_IDLE
+	ADDI	1
+	SW	G_IDLE
+	LT	HIDE_TICKS
+	JNZ	Lp_idle_1
+	LW	G_BARHID
+	JNZ	Lp_idle_1
+	LW	G_HOVER
+	JNZ	Lp_idle_1
+	LW	G_AONLY
+	JNZ	Lp_idle_1
+	LW	G_HASVIDEO
+	JZ	Lp_idle_1
+	LW	G_PPSHOWN
+	JZ	Lp_idle_1
+	LD	G_URLBOX
+	MSG	S_isHidden, ">"
+	JZ	Lp_idle_1                        ; a link is being typed
+	IMM	1
+	SW	G_BARHID
+	NCALL	bar_alpha, "D"
+	.short	0
+	CLS	NSCursor
+	MSG	S_setHiddenUntilMouseMoves_, "I"
+	.byte	1
+	HERE	Lp_idle_1
+	OP_END
+	.popsection
 
 ; act_key(event) — keys on the stage: Space plays and pauses, arrows skip and change the volume, F toggles full screen (Escape leaves it), M mutes.
-	ENTRY	act_key
-	FRAME	0
-	mov	x0, x2
-	SEND	S_keyCode
-	cmp	x0, #49                   ; Space
-	b.eq	Lak_toggle
-	cmp	x0, #123                  ; left
-	b.eq	Lak_back
-	cmp	x0, #124                  ; right
-	b.eq	Lak_fwd
-	cmp	x0, #126                  ; up
-	b.eq	Lak_up
-	cmp	x0, #125                  ; down
-	b.eq	Lak_down
-	cmp	x0, #46                   ; M
-	b.eq	Lak_mute
-	cmp	x0, #3                    ; F
-	b.eq	Lak_full
-	cmp	x0, #53                   ; Escape
-	b.ne	Lret0
-	ldr	x0, [x28, #G_WIN]
-	SEND	S_styleMask
-	tbnz	x0, #14, Lak_full
-	b	Lret0                     ; not full screen
-Lak_full:
-	ldr	x0, [x28, #G_WIN]
-	mov	x2, #0
-	SEND	S_toggleFullScreen_
-	b	Lret0
-Lak_toggle:
-	bl	Lact_toggle
-	b	Lret0
-Lak_back:
-	bl	Lact_back
-	b	Lret0
-Lak_fwd:
-	bl	Lact_fwd
-	b	Lret0
-Lak_up:
-	bl	Lact_volup
-	b	Lret0
-Lak_down:
-	bl	Lact_voldown
-	b	Lret0
-Lak_mute:
-	bl	Lact_mute
-	b	Lret0
+	VMENTRY	act_key, Lp_key
+	.pushsection __DATA,__data
+Lp_key:
+	GL	2
+	MSG	S_keyCode, ">"
+	SL	3
+	EQ	49                        ; Space
+	JNZ	Lp_key_toggle
+	GL	3
+	EQ	123                       ; left
+	JNZ	Lp_key_back
+	GL	3
+	EQ	124                       ; right
+	JNZ	Lp_key_fwd
+	GL	3
+	EQ	126                       ; up
+	JNZ	Lp_key_up
+	GL	3
+	EQ	125                       ; down
+	JNZ	Lp_key_down
+	GL	3
+	EQ	46                        ; M
+	JNZ	Lp_key_mute
+	GL	3
+	EQ	3                         ; F
+	JNZ	Lp_key_full
+	GL	3
+	EQ	53                        ; Escape: only in full screen
+	JZ	Lp_key_end
+	LD	G_WIN
+	MSG	S_styleMask, "="
+	BIT	14
+	JZ	Lp_key_end
+	HERE	Lp_key_full
+	LD	G_WIN
+	MSG	S_toggleFullScreen_, "I"
+	.byte	0
+	OP_END
+	HERE	Lp_key_toggle
+	NCALL	Lact_toggle
+	OP_END
+	HERE	Lp_key_back
+	NCALL	Lact_back
+	OP_END
+	HERE	Lp_key_fwd
+	NCALL	Lact_fwd
+	OP_END
+	HERE	Lp_key_up
+	NCALL	Lact_volup
+	OP_END
+	HERE	Lp_key_down
+	NCALL	Lact_voldown
+	OP_END
+	HERE	Lp_key_mute
+	NCALL	Lact_mute
+	HERE	Lp_key_end
+	OP_END
+	.popsection
 
 ; act_speed(item) — Playback > Speed: This Mac plays at the item's tag / 100, now and after.
-	ENTRY	act_speed
-	FRAME	3
-	mov	x19, x2
-	mov	x0, x19
-	SEND	S_tag
-	mov	x20, x0
-	mov	x0, x19                   ; the checkmark moves to it
-	SEND	S_menu
-	SEND	S_itemArray
-	mov	x21, x0
-	SEND	S_count
-	mov	x22, x0
-Lsp_mark:
-	subs	x22, x22, #1
-	b.lt	Lsp_rate
-	mov	x0, x21
-	mov	x2, x22
-	SEND	S_objectAtIndex_
-	cmp	x0, x19
-	cset	w2, eq
-	SEND	S_setState_
-	b	Lsp_mark
-Lsp_rate:
-	scvtf	s0, w20
-	ldr	s1, [x28, #(Lf_100 - G)]
+	VMENTRY	act_speed, Lp_speed
+	.pushsection __DATA,__data
+Lp_speed:
+	GL	2
+	MSG	S_tag, "="
+	SL	4
+	GL	2                         ; the checkmark moves to it
+	MSG	S_menu, "="
+	MSG	S_itemArray, "="
+	SL	5
+	MSG	S_count, "="
+	SL	6
+	HERE	Lp_speed_mark
+	GL	6
+	ADDI	-1
+	SL	6
+	LT	0
+	JNZ	Lp_speed_rate
+	GL	5
+	MSG	S_objectAtIndex_, "=g"
+	SL	7
+	EQL	2
+	SL	3
+	GL	7
+	MSG	S_setState_, "d"
+	JMP	Lp_speed_mark
+	HERE	Lp_speed_rate
+	NCALL	speed_rate, "e"
+	OP_END
+	.popsection
+
+; speed_rate(percent) — This Mac plays at percent / 100, now and after.
+speed_rate:
+	FRAME	0
+	scvtf	s0, w0
+	mov	w9, #100
+	scvtf	s1, w9
 	fdiv	s0, s0, s1
 	str	s0, [x28, #G_RATE]
 	adr	x0, eng_rate
@@ -10974,282 +11655,366 @@ Lsp_rate:
 	SEND	S_setDefaultRate_         ; play uses it from now on
 	ldr	x0, [x28, #G_PLAYER]
 	SEND	S_timeControlStatus
-	cbz	x0, Lret3                 ; paused: it stays paused
+	cbz	x0, Lret0                 ; paused: it stays paused
 	ldr	s0, [x28, #G_RATE]
 	ldr	x0, [x28, #G_PLAYER]
 	SEND	S_setRate_
-	b	Lret3
+	b	Lret0
 
 ; media_group(kind) -> This Mac's item's subtitles (0) or sound tracks (1), or nil.
 media_group:
-	FRAME	1
-	CSTR	x9, "AVMediaCharacteristicLegible"
-	CSTR	x10, "AVMediaCharacteristicAudible"
-	cmp	w0, #0
-	csel	x0, x9, x10, eq
-	bl	mkstr
-	mov	x19, x0
-	ldr	x0, [x28, #G_PLAYER]
-	SEND	S_currentItem
-	SEND	S_asset
-	mov	x2, x19
-	SEND	S_mediaSelectionGroupForMediaCharacteristic_
-	b	Lret1
+	VM	Lp_group
+	.pushsection __DATA,__data
+Lp_group:
+	LD	G_PLAYER
+	MSG	S_currentItem, "="
+	MSG	S_asset, "="
+	SL	1
+	GL	0
+	JNZ	Lp_group_sound
+	GL	1
+	MSG	S_mediaSelectionGroupForMediaCharacteristic_, "=S"
+	.asciz	"AVMediaCharacteristicLegible"
+	OP_END
+	HERE	Lp_group_sound
+	GL	1
+	MSG	S_mediaSelectionGroupForMediaCharacteristic_, "=S"
+	.asciz	"AVMediaCharacteristicAudible"
+	OP_END
+	.popsection
 
 ; act_options(menu) — View > Subtitles and Audio Track as they open: the tracks, the chosen one checked.
-	ENTRY	act_options
-	FRAME	4
-	mov	x19, x2
-	mov	x0, x19
-	SEND	S_removeAllItems
-	ldr	w9, [x28, #G_MODE]
-	cbnz	w9, Lop_av
-	ldr	x0, [x28, #G_MEDIAQ]      ; the engine's own, read while its queue waits
-	mov	x1, x19
-	adr	x2, eng_options
-	bl	_dispatch_sync_f
-	b	Lret4
-Lop_av:
-	ldr	x9, [x28, #G_SUBMENU]
-	cmp	x19, x9
-	cset	w20, ne                   ; 0: subtitles, 1: sound tracks
-	mov	w0, w20
-	bl	media_group
-	mov	x21, x0
-	mov	x22, #0                   ; the chosen option
-	cbz	x0, Lop_none
-	ldr	x0, [x28, #G_PLAYER]
-	SEND	S_currentItem
-	SEND	S_currentMediaSelection
-	mov	x2, x21
-	SEND	S_selectedMediaOptionInMediaSelectionGroup_
-	mov	x22, x0
-Lop_none:
-	CSTR	x1, "Off"                 ; subtitles can be off; a sound track cannot
-	CSTR	x9, "Default"
-	cmp	x20, #0
-	csel	x1, x1, x9, eq
-	mov	x0, x19
-	mov	x2, #-1
-	cmp	x22, #0
-	cset	w3, eq
-	bl	opt_item
-	cbz	x20, Lop_list
-	mov	w2, #0                    ; with one sound track there is nothing to choose
-	SEND	S_setEnabled_
-Lop_list:
-	cbz	x21, Lret4
-	mov	x0, x21
-	SEND	S_options
-	mov	x24, x0
-	SEND	S_count
-	mov	x25, x0
-	mov	x26, #0
-Lop_each:
-	cmp	x26, x25
-	b.hs	Lret4
-	mov	x0, x24
-	mov	x2, x26
-	SEND	S_objectAtIndex_
-	mov	x20, x0
-	SEND	S_displayName
-	SEND	S_UTF8String
-	mov	x1, x0
-	mov	x0, x19
-	mov	x2, x26
-	cmp	x20, x22
-	cset	w3, eq
-	bl	opt_item
-	add	x26, x26, #1
-	b	Lop_each
+	VMENTRY	act_options, Lp_options
+	.pushsection __DATA,__data
+Lp_options:
+	GL	2
+	MSG	S_removeAllItems
+	LW	G_MODE
+	JNZ	Lp_options_av
+	LD	G_MEDIAQ                  ; the engine's own, read while its queue waits
+	SL	0
+	CALL	F_dispatch_sync_f, "acP"
+	.long	eng_options - Lvm_base
+	OP_END
+	HERE	Lp_options_av
+	GL	2
+	EQS	G_SUBMENU
+	EQ	0
+	SL	3                         ; d: 0 subtitles, 1 sound tracks
+	NCALL	media_group, "=d"
+	SL	4                         ; e: the group
+	IMM	0
+	SL	5                         ; f: the chosen option
+	GL	4
+	JZ	Lp_options_none
+	LD	G_PLAYER
+	MSG	S_currentItem, "="
+	MSG	S_currentMediaSelection, "="
+	MSG	S_selectedMediaOptionInMediaSelectionGroup_, "=e"
+	SL	5
+	HERE	Lp_options_none
+	GL	5
+	EQ	0
+	SL	6
+	GL	3
+	JNZ	Lp_options_sound
+	NCALL	opt_item, "cCJg"          ; subtitles can be off; a sound track cannot
+	.asciz	"Off"
+	.byte	-1
+	JMP	Lp_options_list
+	HERE	Lp_options_sound
+	NCALL	opt_item, "=cCJg"
+	.asciz	"Default"
+	.byte	-1
+	MSG	S_setEnabled_, "I"        ; with one sound track there is nothing to choose
+	.byte	0
+	HERE	Lp_options_list
+	GL	4
+	JZ	Lp_options_end
+	MSG	S_options, "="
+	SL	4                         ; e: the options
+	MSG	S_count, "="
+	SL	7                         ; h: their count
+	IMM	0
+	SL	6                         ; g: the index
+	HERE	Lp_options_each
+	GL	6
+	EQL	7
+	JNZ	Lp_options_end
+	GL	4
+	MSG	S_objectAtIndex_, "=g"
+	SL	1
+	MSG	S_displayName, "="
+	MSG	S_UTF8String, "="
+	SL	0
+	GL	1
+	EQL	5
+	SL	3
+	NCALL	opt_item, "cagd"
+	GL	6
+	ADDI	1
+	SL	6
+	JMP	Lp_options_each
+	HERE	Lp_options_end
+	OP_END
+	.popsection
 
 ; opt_item(menu, title, tag, on) -> x0 = an option for act_option, checked when on.
 opt_item:
-	FRAME	2
-	mov	x19, x2
-	mov	w20, w3
-	ldr	x2, [x27, #S_act_option_]
-	GADDR	x3, Ls_slash+1            ; no key
-	bl	add_item
-	mov	x21, x0
-	mov	x2, x19
-	SEND	S_setTag_
-	mov	x0, x21
-	mov	w2, w20
-	SEND	S_setState_
-	mov	x0, x21
-	b	Lret2
+	VM	Lp_optitem
+	.pushsection __DATA,__data
+Lp_optitem:
+	NCALL	mkstr, "=b"
+	SL	1
+	GL	0
+	MSG	S_addItemWithTitle_action_keyEquivalent_, "=bES"
+	.short	S_act_option_
+	.asciz	""                        ; no key
+	SL	4
+	MSG	S_setTag_, "c"
+	GL	4
+	MSG	S_setState_, "d"
+	GL	4
+	OP_END
+	.popsection
 
 ; eng_options(menu) — the engine's subtitle or sound tracks as options, named by language (on main, the media queue waiting).
-	ENTRY	eng_options
-	FRAME	4, 96
-	mov	x19, x0
-	ldr	x9, [x28, #G_SUBMENU]
-	cmp	x19, x9
-	ldr	x20, [x27, #E_SUBT]
-	ldr	x9, [x27, #E_AT]
-	csel	x20, x20, x9, eq          ; the one playing
-	mov	w21, #'s'
-	mov	w9, #'a'
-	csel	w21, w21, w9, eq          ; the kind listed
-	b.ne	1f
-	mov	x0, x19                   ; subtitles can be off
-	CSTR	x1, "Off"
-	mov	x2, #-1
-	cmp	x20, #0
-	cset	w3, eq
-	bl	opt_item
-1:	ldr	x9, [x27, #E_MASTER]
-	cbnz	x9, Leo_hls
-	BADDR	x22, E_TR
-	mov	w23, #0                   ; the track
-	mov	w24, #0                   ; its number in the list
-Leo_each:
-	ldr	w9, [x27, #E_NTR]
-	cmp	w23, w9
-	b.hs	Lret4
-	ldr	w9, [x22, #TR_KIND]
-	cmp	w9, w21
-	b.ne	Leo_next
-	add	w24, w24, #1
-	ldr	w9, [x22, #TR_LANG]
-	str	w9, [sp, #8]              ; three letters and a NUL
-	cbz	w9, 2f
-	add	x0, sp, #8
-	bl	mkstr
-	mov	x25, x0
-	CLASS	x0, NSLocale
-	SEND	S_currentLocale
-	mov	x2, x25
-	SEND	S_localizedStringForLanguageCode_
-	cbz	x0, 2f
-	SEND	S_UTF8String
-	mov	x1, x0
-	b	3f
-2:	str	x24, [sp]                 ; no language: its number
-	add	x0, sp, #16
-	mov	x1, #16
-	CSTR	x2, "Track %d"
-	bl	_snprintf
-	add	x1, sp, #16
-3:	mov	x0, x19
-	mov	w2, w23
-	cmp	x22, x20
-	cset	w3, eq
-	bl	opt_item
-Leo_next:
-	add	x22, x22, #TR_SIZE
-	add	w23, w23, #1
-	b	Leo_each
-Leo_hls:
-	BADDR	x24, (E_ST + ST_SIZE)     ; HLS: the master's renditions, by NAME; the one its stream plays checked
-	CSTR	x25, "TYPE=AUDIO"
-	cmp	w21, #'s'
-	b.ne	1f
-	add	x24, x24, #ST_SIZE
-	CSTR	x25, "TYPE=SUBTITLES"
-1:	ldr	x24, [x24, #ST_PLURL]
-	mov	x26, #0                   ; sound: the playing one's group, for its siblings
-	cmp	w21, #'s'
-	b.eq	Leo_list
-	ldr	x22, [x27, #E_MASTER]
-2:	mov	x0, x22
-	mov	x1, x25
-	bl	media_next
-	cbz	x0, Lret4                 ; none playing: nothing to choose
-	mov	x22, x2
-	stp	x0, x1, [sp]
-	mov	x3, x24
-	bl	uri_is
-	cbz	w0, 2b
-	ldp	x0, x1, [sp]
-	CSTR	x2, "GROUP-ID="
-	bl	attr
-	mov	x26, x0
-	stp	x0, x1, [sp, #16]         ; its group
-Leo_list:
-	ldr	x22, [x27, #E_MASTER]
-	mov	w23, #0x1000              ; the rendition's tag: 0x1000 + its index
-Leo_rend:
-	mov	x0, x22
-	mov	x1, x25
-	bl	media_next
-	cbz	x0, Leo_cc
-	mov	x22, x2
-	stp	x0, x1, [sp]              ; the line
-	cbz	x26, 3f
-	CSTR	x2, "GROUP-ID="
-	bl	attr
-	cbz	x0, Leo_skip
-	ldp	x9, x10, [sp, #16]
-	sub	x2, x10, x9
-	sub	x11, x1, x0
-	cmp	x11, x2
-	b.ne	Leo_skip
-	mov	x1, x9
-	bl	_strncmp
-	cbnz	w0, Leo_skip
-3:	ldp	x0, x1, [sp]
-	mov	x3, x24
-	bl	uri_is
-	mov	w4, w0
-	ldp	x0, x1, [sp]
-	mov	x2, x19
-	mov	w3, w23
-	bl	opt_named
-Leo_skip:
-	add	w23, w23, #1
-	b	Leo_rend
-Leo_cc:
-	cmp	w21, #'s'                 ; subtitles: then the captions in the picture (CC1 only), tagged 0x2000 + their index
-	b.ne	Lret4
-	ldr	x22, [x27, #E_MASTER]
-	mov	w23, #0x2000
-1:	mov	x0, x22
-	CSTR	x1, "TYPE=CLOSED-CAPTIONS"
-	bl	media_next
-	cbz	x0, Lret4
-	mov	x22, x2
-	stp	x0, x1, [sp]
-	sub	x2, x1, x0
-	CSTR	x1, "\"CC1\""
-	bl	_strnstr
-	cbz	x0, 2f
-	ldr	x9, [x27, #E_CCT]
-	ldr	x10, [x27, #E_SUBT]
-	cmp	x9, #0
-	ccmp	x9, x10, #0, ne
-	cset	w4, eq
-	ldp	x0, x1, [sp]
-	mov	x2, x19
-	mov	w3, w23
-	bl	opt_named
-2:	add	w23, w23, #1
-	b	1b
+	.pushsection __DATA,__data
+Ls_off:	.asciz	"Off"
+Ls_trackn:	.asciz	"Track "
+Ls_tcc:	.asciz	"TYPE=CLOSED-CAPTIONS"
+Ls_cc1:	.asciz	"\"CC1\""
+	.popsection
+	VMTENTRY	eng_options
+	IMM	'a'
+	SL	2                         ; c: the kind listed
+	LDE	E_AT
+	SL	1                         ; b: the one playing
+	GL	0
+	EQS	G_SUBMENU
+	JZ	Leo_kind
+	IMM	's'
+	SL	2
+	LDE	E_SUBT
+	SL	1
+	EQ	0
+	SL	7
+	NCALL	opt_item, "aPJh"          ; subtitles can be off
+	.long	Ls_off - Lvm_base
+	.byte	0xff
+	HERE	Leo_kind
+	LDE	E_MASTER
+	JNZ	Leo_hlsj
+	IMM	0
+	SL	3                         ; d: the track's index
+	SL	4                         ; e: its number in the list
+	HERE	Leo_each
+	GL	3
+	LT	TRACKS
+	JZ	Leo_end1                  ; the slots past the tracks read are empty
+	GL	3
+	SHL	9
+	SL	5
+	LEAB	E_TR
+	ADDL	5
+	SL	5                         ; f: the track (TR_SIZE 512)
+	LDW	TR_KIND
+	EQL	2
+	JZ	Leo_next
+	GL	4
+	ADDI	1
+	SL	4
+	GL	5
+	ADDH	TR_LANG
+	SL	6                         ; g: its language's three letters
+	LDB	0
+	JZ	Leo_num
+	NCALL	mkstr, "=g"
+	SL	7
+	CLS	NSLocale
+	MSG	S_currentLocale, "="
+	MSG	S_localizedStringForLanguageCode_, "=h"
+	JZ	Leo_num
+	MSG	S_UTF8String, "="
+	SL	6
+	JMP	Leo_item
+	HERE	Leo_num
+	LEAB	B_UJ                      ; no language: its number, in the media queue's scratch (it waits); one digit (TRACKS 8)
+	SL	6
+	CALL	F_strlcpy, "gPI"
+	.long	Ls_trackn - Lvm_base
+	.byte	16
+	GL	4
+	ADDI	'0'
+	STW	6, 6
+	HERE	Leo_item
+	GL	1
+	EQL	5
+	SL	7
+	NCALL	opt_item, "agdh"
+	HERE	Leo_next
+	GL	3
+	ADDI	1
+	SL	3
+	JMP	Leo_each
+	HERE	Leo_end1
+	OP_END
+	HERE	Leo_hlsj
+	LEAB	E_ST + ST_SIZE            ; HLS: the master's renditions, by NAME; the one its stream plays checked
+	SL	6
+	GL	2
+	EQ	's'
+	SL	5                         ; f: subtitles
+	JZ	Leo_h1
+	LEAB	E_ST + 2 * ST_SIZE
+	SL	6
+	HERE	Leo_h1
+	GL	6
+	LDX	ST_PLURL
+	SL	1                         ; b: the playing rendition's playlist
+	IMM	0
+	SL	4                         ; e: its group, for its siblings (none: every one)
+	GL	5
+	JNZ	Leo_list
+	LDE	E_MASTER
+	HERE	Leo_find
+	NCALL	media_next, "?VP"
+	.long	Ls_taudio - Lvm_base
+	JZ	Leo_end2                  ; none playing: nothing to choose
+	SL	6                         ; g, h: its line
+	NCALL	uri_is, "ghIb"
+	.byte	0
+	JNZ	Leo_grp
+	LDE	B_MNEXT
+	JMP	Leo_find
+	HERE	Leo_grp
+	NCALL	attr, "?ghP"
+	.long	Ls_group - Lvm_base
+	SL	4                         ; e, f: its group
+	GL	7
+	SL	5
+	HERE	Leo_list
+	IMM	16
+	SHL	8
+	SL	3                         ; d: the rendition's tag, 0x1000 + its index
+	LDE	E_MASTER
+	HERE	Leo_rend
+	SL	6
+	GL	2
+	EQ	's'
+	JZ	Leo_ra
+	GL	6
+	NCALL	media_next, "?VP"
+	.long	Ls_tsubs - Lvm_base
+	JMP	Leo_rgot
+	HERE	Leo_end2
+	OP_END
+	HERE	Leo_ra
+	GL	6
+	NCALL	media_next, "?VP"
+	.long	Ls_taudio - Lvm_base
+	HERE	Leo_rgot
+	JZ	Leo_ccj
+	SL	6                         ; g, h: the line
+	GL	4
+	JZ	Leo_rok                   ; no group to match
+	GL	6                         ; the line kept: attr gives the group's span in its place
+	STE	B_UJ + 80
+	GL	7
+	STE	B_UJ + 64
+	NCALL	attr, "?ghP"
+	.long	Ls_group - Lvm_base
+	JZ	Leo_rskip
+	SL	6
+	GL	7
+	SUBL	6
+	SL	7                         ; its length
+	GL	5
+	SUBL	4
+	EQL	7
+	JZ	Leo_rskip
+	CALL	F_strncmp, "=geh"
+	JNZ	Leo_rskip                 ; another group
+	LDE	B_UJ + 80
+	SL	6
+	LDE	B_UJ + 64
+	SL	7
+	HERE	Leo_rok
+	NCALL	uri_is, "ghIb"
+	.byte	0
+	NCALL	opt_named, "ghadV"
+	HERE	Leo_rskip
+	GL	3
+	ADDI	1
+	SL	3
+	LDE	B_MNEXT
+	JMP	Leo_rend
+	HERE	Leo_ccj
+	GL	2                         ; subtitles: then the captions in the picture (CC1 only), tagged 0x2000 + their index
+	EQ	's'
+	JZ	Leo_end3
+	IMM	32
+	SHL	8
+	SL	3
+	LDE	E_MASTER
+	HERE	Leo_ccn
+	NCALL	media_next, "?VP"
+	.long	Ls_tcc - Lvm_base
+	JZ	Leo_end3
+	SL	6
+	GL	7
+	SUBL	6
+	SL	5
+	CALL	F_strnstr, "=gPf"
+	.long	Ls_cc1 - Lvm_base
+	JZ	Leo_ccskip
+	LDE	E_CCT
+	SL	4
+	JZ	Leo_ccon                  ; on: its track made and shown
+	LDE	E_SUBT
+	EQL	4
+	HERE	Leo_ccon
+	NCALL	opt_named, "ghadV"
+	HERE	Leo_ccskip
+	GL	3
+	ADDI	1
+	SL	3
+	LDE	B_MNEXT
+	JMP	Leo_ccn
+	HERE	Leo_end3
+	OP_END
+	.p2align 2
 
 ; opt_named(line, end, menu, tag, on) — an option titled by the line's NAME (none: no option).
+	.pushsection __DATA,__data
+Ls_name:	.asciz	"NAME="
+	.popsection
 opt_named:
-	FRAME	2, 48
-	mov	x19, x2
-	mov	w20, w3
-	mov	w21, w4
-	CSTR	x2, "NAME="
-	bl	attr
-	cbz	x0, Lret2
-	sub	x2, x1, x0
-	cmp	x2, #47
-	mov	x9, #47
-	csel	x2, x2, x9, lo
-	mov	x1, x0
-	mov	x0, sp
-	strb	wzr, [x0, x2]
-	bl	_memcpy
-	mov	x0, x19
-	mov	x1, sp
-	mov	w2, w20
-	mov	w3, w21
-	bl	opt_item
-	b	Lret2
+	VMT
+	NCALL	attr, "?abP"
+	.long	Ls_name - Lvm_base
+	JZ	Lon_end
+	SL	5                         ; f: the name, h: its end
+	GL	7
+	SUBL	5
+	SL	6                         ; g: its length, at most 47
+	LT	47
+	JNZ	Lon_len
+	IMM	47
+	SL	6
+	HERE	Lon_len
+	LEAB	B_UJ                      ; the media queue's scratch: it waits while the menu is made
+	SL	7
+	CALL	F_memcpy, "hfg"
+	GL	7
+	ADDL	6
+	SL	5
+	IMM	0
+	STW	5, 0
+	NCALL	opt_item, "chde"
+	HERE	Lon_end
+	OP_END
+	.p2align 2
 
 ; txt_fd(track) — the track's format: tx3g text cues.
 txt_fd:
@@ -11293,9 +12058,7 @@ cc_track:
 
 ; media_next(p, type) -> x0 = the next #EXT-X-MEDIA line from p with that TYPE=..., x1 = its end, x2 = the line after it; x0 = 0 at the end.
 media_next:
-	FRAME	3
-	mov	x19, x0
-	mov	x20, x1
+	FRAME	3, 0, 1
 Lmx_line:
 	ldrb	w9, [x19]
 	cbz	w9, Lmx_none
@@ -11304,7 +12067,7 @@ Lmx_line:
 	mov	x21, x0
 	mov	x22, x1
 	mov	x0, x19
-	CSTR	x1, "#EXT-X-MEDIA:"
+	GADDR	x1, Ls_xmedia
 	mov	x2, #13
 	bl	_strncmp
 	cbnz	w0, Lmx_next
@@ -11317,6 +12080,7 @@ Lmx_next:
 	mov	x19, x22
 	b	Lmx_line
 Lmx_found:
+	str	x22, [x27, #B_MNEXT]
 	mov	x0, x19
 	mov	x1, x21
 	mov	x2, x22
@@ -11331,7 +12095,7 @@ uri_is:
 	mov	x19, x3
 	mov	w20, #0
 	cbz	x19, 1f
-	CSTR	x2, "URI="
+	GADDR	x2, Ls_uri
 	bl	attr
 	cbz	x0, 1f
 	mov	x21, x0
@@ -11404,8 +12168,8 @@ Lpk_hls:
 	b	Lret2
 1:	ldr	x19, [x27, #E_MASTER]
 	cbz	x19, Lret2
-	CSTR	x1, "TYPE=AUDIO"
-	CSTR	x9, "TYPE=SUBTITLES"
+	GADDR	x1, Ls_taudio
+	GADDR	x9, Ls_tsubs
 	tst	x20, #(1 << 32)
 	csel	x21, x1, x9, ne
 	and	w22, w20, #0xfff          ; the index-th of its type
@@ -11416,7 +12180,7 @@ Lpk_hls:
 	mov	x19, x2
 	subs	w22, w22, #1
 	b.hs	1b
-	CSTR	x2, "URI="
+	GADDR	x2, Ls_uri
 	bl	attr
 	cbz	x0, Lret2
 	mov	x2, x1
@@ -11468,96 +12232,90 @@ Lpk_free:
 	b	Lret2
 
 ; act_option(item) — a subtitle or sound track picked: This Mac's item switches to it (tag -1: subtitles off).
-	ENTRY	act_option
-	FRAME	2
-	mov	x19, x2
-	ldr	w9, [x28, #G_MODE]
-	cbnz	w9, Lot_av
-	mov	x0, x19                   ; the engine's: picked on its queue
-	SEND	S_tag
-	mov	w20, w0
-	mov	x0, x19
-	SEND	S_menu
-	ldr	x9, [x28, #G_SUBMENU]
-	cmp	x0, x9
-	cset	x9, ne
-	mov	w1, w20
-	orr	x1, x1, x9, lsl #32
-	adr	x0, eng_pick
-	bl	eng_cmd
-	b	Lret2
-Lot_av:
-	mov	x0, x19
-	SEND	S_menu
-	ldr	x9, [x28, #G_SUBMENU]
-	cmp	x0, x9
-	cset	w0, ne
-	bl	media_group
-	cbz	x0, Lret2
-	mov	x20, x0
-	mov	x0, x19
-	SEND	S_tag
-	mov	x21, x0
-	mov	x22, #0
-	tbnz	x21, #63, Lot_pick
-	mov	x0, x20
-	SEND	S_options
-	mov	x2, x21
-	SEND	S_objectAtIndex_
-	mov	x22, x0
-Lot_pick:
-	ldr	x0, [x28, #G_PLAYER]
-	SEND	S_currentItem
-	mov	x2, x22
-	mov	x3, x20
-	SEND	S_selectMediaOption_inMediaSelectionGroup_
-	b	Lret2
+	VMENTRY	act_option, Lp_option
+	.pushsection __DATA,__data
+Lp_option:
+	GL	2
+	MSG	S_menu, "="
+	EQS	G_SUBMENU
+	EQ	0
+	SL	3                         ; d: 0 subtitles, 1 sound tracks
+	GL	2
+	MSG	S_tag, ">"
+	SL	4                         ; e: the tag's word
+	LW	G_MODE
+	JNZ	Lp_option_av
+	GL	3                         ; the engine's: picked on its queue, the kind in bit 32
+	SHL	32
+	ADDL	4
+	SL	5
+	NCALL	eng_cmd, "Pf"
+	.long	eng_pick - Lvm_base
+	OP_END
+	HERE	Lp_option_av
+	NCALL	media_group, "=d"
+	JZ	Lp_option_end
+	SL	6                         ; g: the group
+	IMM	0
+	SL	7                         ; h: the option, none for subtitles off
+	GL	4
+	BIT	31
+	JNZ	Lp_option_pick
+	GL	6
+	MSG	S_options, "="
+	MSG	S_objectAtIndex_, "=e"
+	SL	7
+	HERE	Lp_option_pick
+	LD	G_PLAYER
+	MSG	S_currentItem, "="
+	MSG	S_selectMediaOption_inMediaSelectionGroup_, "hg"
+	HERE	Lp_option_end
+	OP_END
+	.popsection
 
 ; act_pip — View > Picture in Picture (Opt-Cmd-P): This Mac's picture floats in its own window, and comes back.
-	ENTRY	act_pip
-	FRAME	1
-	ldr	w9, [x28, #G_MODE]
-	cbnz	w9, Lpi_av
-	ldr	x19, [x27, #B_PIPE]       ; the engine's picture: its sample buffer layer, played through this controller's PiP methods
-	cbnz	x19, Lpi_toggle
-	CLASS	x0, AVPictureInPictureControllerContentSource
-	SEND	S_alloc
-	ldr	x2, [x28, #G_SBLAYER]
-	ldr	x3, [x28, #G_CTRL]
-	SEND	S_initWithSampleBufferDisplayLayer_playbackDelegate_
-	mov	x19, x0
-	CLASS	x0, AVPictureInPictureController
-	SEND	S_alloc
-	mov	x2, x19
-	SEND	S_initWithContentSource_
-	mov	x19, x0
-	str	x0, [x27, #B_PIPE]
-	cbnz	x0, Lpi_toggle
-	b	Lret1
-Lpi_av:
-	ldr	x19, [x28, #G_PIP]
-	cbnz	x19, Lpi_toggle
-	CLASS	x0, AVPictureInPictureController
-	SEND	S_alloc
-	mov	x19, x0
-	ldr	x0, [x28, #G_VIDEO]
-	SEND	S_layer
-	mov	x2, x0
-	mov	x0, x19
-	SEND	S_initWithPlayerLayer_
-	mov	x19, x0
-	str	x0, [x28, #G_PIP]
-	cbz	x0, Lret1
-Lpi_toggle:
-	mov	x0, x19
-	SEND	S_isPictureInPictureActive
-	ldr	x9, [x27, #S_startPictureInPicture]
-	ldr	x1, [x27, #S_stopPictureInPicture]
-	cmp	w0, #0
-	csel	x1, x9, x1, eq
-	mov	x0, x19
-	bl	_objc_msgSend
-	b	Lret1
+	VMENTRY	act_pip, Lp_pip
+	.pushsection __DATA,__data
+Lp_pip:
+	LW	G_MODE
+	JNZ	Lp_pip_av
+	LDE	B_PIPE                    ; the engine's picture: its sample buffer layer, played through this controller's PiP methods
+	JNZ	Lp_pip_toggle
+	CLS	AVPictureInPictureControllerContentSource
+	MSG	S_alloc, "="
+	MSG	S_initWithSampleBufferDisplayLayer_playbackDelegate_, "=OO"
+	.byte	G_SBLAYER >> 3, G_CTRL >> 3
+	SL	0
+	CLS	AVPictureInPictureController
+	MSG	S_alloc, "="
+	MSG	S_initWithContentSource_, "=a"
+	STE	B_PIPE
+	JMP	Lp_pip_made
+	HERE	Lp_pip_av
+	LD	G_PIP
+	JNZ	Lp_pip_toggle
+	LD	G_VIDEO
+	MSG	S_layer, "="
+	SL	0
+	CLS	AVPictureInPictureController
+	MSG	S_alloc, "="
+	MSG	S_initWithPlayerLayer_, "=a"
+	STO	G_PIP
+	HERE	Lp_pip_made
+	JZ	Lp_pip_end
+	HERE	Lp_pip_toggle
+	SL	0
+	MSG	S_isPictureInPictureActive, ">"
+	JNZ	Lp_pip_stop
+	GL	0
+	MSG	S_startPictureInPicture
+	OP_END
+	HERE	Lp_pip_stop
+	GL	0
+	MSG	S_stopPictureInPicture
+	HERE	Lp_pip_end
+	OP_END
+	.popsection
 
 ; pip_play(self, _cmd, controller, playing) — PiP's play button: This Mac plays or pauses.
 	ENTRY	pip_play
@@ -11618,38 +12376,74 @@ imp_yes:
 ; ---- Entry point ----
 
 ; main() — the registry, then services, the app with its menus and window and the poll timer; then the run loop.
-	.globl	_main
+	.private_extern	_main
 _main:
-	FRAME	0
-	ADDR	x28, G
-	ADDR	x27, B
+	FRAME	0, 128                    ; a name, spelled out
+	ADDR	x19, Ldl
+	ldr	x21, [x19]                ; dlsym, the one import
+	mov	x0, #-2                   ; RTLD_DEFAULT
+	ADDR	x1, Ls_calloc
+	blr	x21
+	mov	x9, x0
+	mov	x0, #1
+	mov	x1, #GB_SIZE
+	blr	x9
+	mov	x28, x0
+	add	x27, x0, #((G_SIZE + 15) & ~15)
+	stp	x28, x27, [x19, #8]
+	mov	x0, #-2
+	ADDR	x1, Ls_dlopen
+	blr	x21
+	mov	x9, x0
+	ADDR	x0, Ls_avkit              ; with AVFoundation and AppKit
+	mov	w1, #9                    ; RTLD_LAZY | RTLD_GLOBAL
+	blr	x9
 	ADDR	x19, Lreg_names
 	BADDR	x20, B_REG
+	mov	x22, sp
 Lmn_reg:
 	ldrb	w9, [x19]
 	cbz	w9, Lmn_regged
-	mov	x0, x19
+	mov	x10, sp
+Lmn_char:
+	ldrb	w9, [x19], #1
+	tbnz	w9, #7, Lmn_word
+	strb	w9, [x10], #1
+	cbnz	w9, Lmn_char
+	cmp	sp, x22                   ; a word's end: on after it
+	b.ne	Lmn_back
+	mov	x0, sp
 	BADDR	x9, B_SEL
 	cmp	x20, x9
 	b.hs	Lmn_sel
 	BADDR	x9, B_CLS
 	cmp	x20, x9
 	b.hs	Lmn_cls
-	mov	x1, x19
+	mov	x1, sp
 	mov	x0, #-2                   ; RTLD_DEFAULT
-	bl	_dlsym
+	blr	x21
 	b	Lmn_store
 Lmn_cls:
-	bl	_objc_getClass
+	CALLF	objc_getClass
 	b	Lmn_store
 Lmn_sel:
 	bl	_sel_registerName
 Lmn_store:
 	str	x0, [x20], #8
-Lmn_skip:
-	ldrb	w9, [x19], #1             ; past the name: nothing is resolved yet
-	cbnz	w9, Lmn_skip
 	b	Lmn_reg
+Lmn_word:
+	str	x19, [sp, #-16]!          ; past n words, then the word, itself spelled with words
+	ADDR	x19, Lreg_words
+	and	w9, w9, #0x7f
+1:	cbz	w9, Lmn_char
+	ldrb	w12, [x19], #1
+	cbnz	w12, 1b
+	sub	w9, w9, #1
+	b	1b
+Lmn_back:
+	sub	x10, x10, #1
+	ldr	x19, [sp], #16
+	b	Lmn_char
 Lmn_regged:
 	ldr	x9, [x27, #F__NSConcreteGlobalBlock]
 	ADDR	x10, Lblk_v
@@ -11662,19 +12456,13 @@ Lmn_regged:
 	str	d0, [x28, #G_ARTASP]      ; a square card until artwork arrives
 	fmov	s0, #1.0
 	str	s0, [x28, #G_RATE]
-	ldr	x16, [x27, #F_VTIsHardwareDecodeSupported]
-	cbz	x16, Lmn_build
-	mov	w0, #0x3031               ; 'av01': AV1 streams only where the chip decodes them
-	movk	w0, #0x6176, lsl #16
-	blr	x16
-	and	w0, w0, #0xff
-	str	w0, [x28, #G_AV1]
-Lmn_build:
 	ADDR	x0, Lprog_build
 	bl	ui_run
-	bl	local_poll
 	ADDR	x0, Lprog_show
 	bl	ui_run
+	ADDR	x0, Lprog_stage
+	bl	ui_run
+	bl	local_poll
 	bl	layout_stage
 	adr	x0, eng_init
 	mov	x1, #0
@@ -11688,231 +12476,20 @@ Lmn_build:
 
 	.section __DATA,__data
 	.p2align 3
-; UI programs for ui_run.
-.macro OP_END
-	.byte	0
-.endm
-.macro STO slot
-	.byte	1, (\slot) >> 3
-.endm
-.macro LD slot
-	.byte	2, (\slot) >> 3
-.endm
-.macro ADDV
-	.byte	3
-.endm
-.macro CLS name
-	.byte	4, (C_\name - B_REG) >> 3
-.endm
-.macro MSG sel, kinds=""
-	.byte	6, (\sel - B_SEL) >> 3
-	.asciz	"\kinds"
-.endm
-.macro CALL fn, kinds=""
-	.byte	5, (\fn - B_REG) >> 3
-	.asciz	"\kinds"
-.endm
-.macro RC x, top, w, h                ; for 'R': from the content's top-left
-	.short	\x, \top, \w, \h
-.endm
-.macro RN x, y, w, h                  ; for 'N': from the container's bottom-left
-	.short	\x, \y, \w, \h
-.endm
-.macro IMG slot, sym, desc
-	CLS	NSImage
-	MSG	S_imageWithSystemSymbolName_accessibilityDescription_, "=SS"
-	.asciz	"\sym", "\desc"
-	STO	\slot
-.endm
-.macro IMAGE slot, sym, desc
-	IMG	\slot, "\sym", "\desc"
-	MSG	S_retain, "="
-	STO	\slot
-.endm
-.macro NEWV class, x, top, w, h       ; a new view in the content; it stays current
-	CLS	\class
-	MSG	S_alloc, "="
-	MSG	S_initWithFrame_, "=R"
-	RC	\x, \top, \w, \h
-	ADDV
-.endm
-.macro ADDIN parent                   ; add the current view to a container; it stays current
-	STO	G_T3
-	LD	\parent
-	MSG	S_addSubview_, "O"
-	.byte	G_T3 >> 3
-	LD	G_T3
-.endm
-.macro MASKV mask                     ; the current view's autoresizing
-	MSG	S_setAutoresizingMask_, "I"
-	.byte	\mask
-.endm
-.macro COLOR slot, r, g, b, a
-	CLS	NSColor
-	MSG	S_colorWithSRGBRed_green_blue_alpha_, "=KKKK"
-	.byte	\r, \g, \b, \a
-	MSG	S_retain, "="
-	STO	\slot
-.endm
-.macro LAYERBG color, radius          ; a flat fill with continuous corners for the current view
-	MSG	S_setWantsLayer_, "I"
-	.byte	1
-	STO	G_T3
-	LD	\color
-	MSG	S_CGColor, "="
-	STO	G_T2
-	LD	G_T3
-	MSG	S_layer, "="
-	MSG	S_setBackgroundColor_, "O"
-	.byte	G_T2 >> 3
-	MSG	S_setCornerRadius_, "D"
-	.short	(\radius) * 4
-	MSG	S_setCornerCurve_, "S"
-	.asciz	"continuous"
-	LD	G_T3
-.endm
-.macro FONT sel, size, weight
-	CLS	NSFont
-	MSG	\sel, "=DF"
-	.short	(\size) * 4
-	.byte	\weight
-	STO	G_T0
-.endm
-.macro LABELIN slot, parent, text, x, y, w, h, align, color, mask
-	CLS	NSTextField
-	MSG	S_labelWithString_, "=S"
-	.asciz	"\text"
-	STO	\slot
-	MSG	S_setFrame_, "N"
-	RN	\x, \y, \w, \h
-	MSG	S_setFont_, "O"
-	.byte	G_T0 >> 3
-	MSG	S_setTextColor_, "O"
-	.byte	\color >> 3
-	MSG	S_setAlignment_, "I"
-	.byte	\align
-	MSG	S_setLineBreakMode_, "I"
-	.byte	4                         ; NSLineBreakByTruncatingTail
-	MASKV	\mask
-	ADDIN	\parent
-.endm
-.macro SLIDERIN slot, parent, action, x, y, w, max, mask
-	CLS	NSSlider
-	MSG	S_sliderWithTarget_action_, "=OL"
-	.byte	G_CTRL >> 3
-	.asciz	"\action"
-	STO	\slot
-	MSG	S_setControlSize_, "I"
-	.byte	1                         ; small: a slim track
-	MSG	S_setFrame_, "N"
-	RN	\x, \y, \w, SLIDER_H
-	MSG	S_setMaxValue_, "D"
-	.short	(\max) * 4
-	MSG	S_setTrackFillColor_, "O"
-	.byte	G_YEL >> 3
-	MASKV	\mask
-	ADDIN	\parent
-.endm
-.macro BTN slot, parent, sym, desc, action, tip, x, y, size, pt, mask, tint
-	CLS	NSImageSymbolConfiguration
-	MSG	S_configurationWithPointSize_weight_, "=DF"
-	.short	(\pt) * 4
-	.byte	X_SEMIBOLD
-	STO	G_T0
-	IMG	G_T1, "\sym", "\desc"
-	CLS	NSButton
-	MSG	S_buttonWithImage_target_action_, "=OOL"
-	.byte	G_T1 >> 3, G_CTRL >> 3
-	.asciz	"\action"
-	STO	\slot
-	MSG	S_setBordered_, "I"
-	.byte	0
-	MSG	S_setSymbolConfiguration_, "O"
-	.byte	G_T0 >> 3
-	MSG	S_setFrame_, "N"
-	RN	\x, \y, \size, \size
-	MSG	S_setToolTip_, "S"
-	.asciz	"\tip"
-	MSG	S_setContentTintColor_, "O"
-	.byte	\tint >> 3
-	MASKV	\mask
-	ADDIN	\parent
-.endm
-.macro SUBMENU title
-	CLS	NSMenu
-	MSG	S_alloc, "="
-	MSG	S_initWithTitle_, "=S"
-	.asciz	"\title"
-	STO	G_T1
-	LD	G_T0
-	MSG	S_addItemWithTitle_action_keyEquivalent_, "=SIS"
-	.asciz	"\title"
-	.byte	0
-	.asciz	""
-	MSG	S_setSubmenu_, "O"
-	.byte	G_T1 >> 3
-.endm
-.macro ITEM title, action, key
-	LD	G_T1
-	MSG	S_addItemWithTitle_action_keyEquivalent_, "=SLS"
-	.asciz	"\title", "\action", "\key"
-.endm
-.macro NESTED title                   ; a submenu in the current menu (G_T1); it becomes current, in G_T2
-	CLS	NSMenu
-	MSG	S_alloc, "="
-	MSG	S_initWithTitle_, "=S"
-	.asciz	"\title"
-	STO	G_T2
-	LD	G_T1
-	MSG	S_addItemWithTitle_action_keyEquivalent_, "=SIS"
-	.asciz	"\title"
-	.byte	0
-	.asciz	""
-	MSG	S_setSubmenu_, "O"
-	.byte	G_T2 >> 3
-	LD	G_T2
-.endm
-.macro SPEED title, percent           ; an item of the Speed submenu (G_T2); it stays current
-	LD	G_T2
-	MSG	S_addItemWithTitle_action_keyEquivalent_, "=SLS"
-	.asciz	"\title", "act_speed:", ""
-	MSG	S_setTag_, "I"
-	.byte	\percent
-.endm
-.macro MASK flags                     ; the last item's modifiers, when not Command alone
-	MSG	S_setKeyEquivalentModifierMask_, "X"
-	.long	\flags
-.endm
-.macro SEP
-	CLS	NSMenuItem
-	MSG	S_separatorItem, "="
-	STO	G_SEP
-	LD	G_T1
-	MSG	S_addItem_, "O"
-	.byte	G_SEP >> 3
-.endm
-
 	.equ X_REGULAR,	(F_NSFontWeightRegular - B_REG) >> 3
 	.equ X_MEDIUM,	(F_NSFontWeightMedium - B_REG) >> 3
 	.equ X_SEMIBOLD,	(F_NSFontWeightSemibold - B_REG) >> 3
 	.equ G_SEP,	G_T3                  ; a separator item
-.macro METHOD name, imp, types="v@:@"    ; - (void)action:(id)sender, unless types say otherwise
-	CALL	F_class_addMethod, "OLQC"
-	.byte	G_T0 >> 3
-	.asciz	"\name"
-	.p2align 3
-	.quad	\imp
-	.asciz	"\types"
-.endm
 
 ; Services, the colors, the controller (every action's target, the app and window delegate), the canvas, the menus (Edit enables Cmd-V), the window and its views.
 Lprog_build:
 	CALL	F_objc_autoreleasePoolPush
-	CALL	F_signal, "II"            ; a vanished client must not kill the app
-	.byte	SIGPIPE, SIG_IGN
 	CALL	F_dispatch_get_global_queue, "=II"
 	.byte	QOS_CLASS_USER_INITIATED, 0
 	STO	G_WORKQ
+	CALL	F_dispatch_async_f, "OIP"
+	.byte	G_WORKQ >> 3, 0
+	.long	av1_check - Lvm_base
 	CALL	F_dispatch_queue_attr_make_with_autorelease_frequency, "=II"
 	.byte	0, 1                      ; serial, a pool per work item
 	CALL	F_dispatch_queue_attr_make_with_qos_class, "=VII"
@@ -11920,6 +12497,10 @@ Lprog_build:
 	CALL	F_dispatch_queue_create, "=CV"
 	.asciz	"beam.media"
 	STO	G_MEDIAQ
+	CALL	F_dispatch_queue_create, "=CI"
+	.asciz	"beam.clock"
+	.byte	0
+	STO	G_CLOCKQ
 
 	; Flat colors: near-black, two surfaces, one yellow accent.
 	COLOR	G_BGC, 21, 21, 21, 255
@@ -11935,36 +12516,36 @@ Lprog_build:
 	.asciz	"BeamController"
 	.byte	0
 	STO	G_T0
-	METHOD	"act_play:", act_play
-	METHOD	"act_toggle:", act_toggle
-	METHOD	"act_stop:", act_stop
-	METHOD	"act_back:", act_back
-	METHOD	"act_fwd:", act_fwd
-	METHOD	"act_vol:", act_vol
-	METHOD	"act_volup:", act_volup
-	METHOD	"act_voldown:", act_voldown
-	METHOD	"act_mute:", act_mute
-	METHOD	"act_seek:", act_seek
-	METHOD	"act_tick:", act_tick
-	METHOD	"act_focus:", act_focus
-	METHOD	"act_open:", act_open
-	METHOD	"act_aonly:", act_aonly
-	METHOD	"menuNeedsUpdate:", act_options
-	METHOD	"act_speed:", act_speed
-	METHOD	"act_option:", act_option
-	METHOD	"act_pip:", act_pip
-	METHOD	"routePickerViewWillBeginPresentingRoutes:", air_prepare
-	METHOD	"pictureInPictureController:setPlaying:", pip_play, "v@:@B"
-	METHOD	"pictureInPictureControllerTimeRangeForPlayback:", pip_range, "{?={?=qiIq}{?=qiIq}}@:@"
-	METHOD	"pictureInPictureControllerIsPlaybackPaused:", pip_paused, "B@:@"
-	METHOD	"pictureInPictureController:didTransitionToRenderSize:", imp_yes, "v@:@{?=ii}"
-	METHOD	"pictureInPictureController:skipByInterval:completionHandler:", pip_skip, "v@:@{?=qiIq}@?"
-	METHOD	"windowDidResize:", act_layout
-	METHOD	"control:textView:doCommandBySelector:", act_urlcmd, "B@:@@:"
-	METHOD	"application:openURLs:", act_openurls, "v@:@@"
-	METHOD	"URLSession:dataTask:didReceiveData:", act_netdata, "v@:@@@"
-	METHOD	"URLSession:task:didCompleteWithError:", act_netdone, "v@:@@@"
-	METHOD	"applicationShouldTerminateAfterLastWindowClosed:", imp_yes, "B@:@"
+	METHOD	S_act_play_, act_play
+	METHOD	S_act_toggle_, act_toggle
+	METHOD	S_act_stop_, act_stop
+	METHOD	S_act_back_, act_back
+	METHOD	S_act_fwd_, act_fwd
+	METHOD	S_act_vol_, act_vol
+	METHOD	S_act_volup_, act_volup
+	METHOD	S_act_voldown_, act_voldown
+	METHOD	S_act_mute_, act_mute
+	METHOD	S_act_seek_, act_seek
+	METHOD	S_act_tick_, act_tick
+	METHOD	S_act_focus_, act_focus
+	METHOD	S_act_open_, act_open
+	METHOD	S_act_aonly_, act_aonly
+	METHOD	S_menuNeedsUpdate_, act_options
+	METHOD	S_act_speed_, act_speed
+	METHOD	S_act_option_, act_option
+	METHOD	S_act_pip_, act_pip
+	METHOD	S_routePickerViewWillBeginPresentingRoutes_, air_prepare
+	METHOD	S_pictureInPictureController_setPlaying_, pip_play, "v@:@B"
+	METHOD	S_pictureInPictureControllerTimeRangeForPlayback_, pip_range, "{?={?=qiIq}{?=qiIq}}@:@"
+	METHOD	S_pictureInPictureControllerIsPlaybackPaused_, pip_paused, "B@:@"
+	METHOD	S_pictureInPictureController_didTransitionToRenderSize_, imp_yes, "v@:@{?=ii}"
+	METHOD	S_pictureInPictureController_skipByInterval_completionHandler_, pip_skip, "v@:@{?=qiIq}@?"
+	METHOD	S_windowDidResize_, act_layout
+	METHOD	S_control_textView_doCommandBySelector_, act_urlcmd, "B@:@@:"
+	METHOD	S_application_openURLs_, act_openurls, "v@:@@"
+	METHOD	S_URLSession_dataTask_didReceiveData_, act_netdata, "v@:@@@"
+	METHOD	S_URLSession_task_didCompleteWithError_, act_netdone, "v@:@@@"
+	METHOD	S_applicationShouldTerminateAfterLastWindowClosed_, imp_yes, "B@:@"
 	CALL	F_objc_registerClassPair, "O"
 	.byte	G_T0 >> 3
 	LD	G_T0
@@ -11977,12 +12558,12 @@ Lprog_build:
 	.asciz	"BeamView"
 	.byte	0
 	STO	G_T0
-	METHOD	"acceptsFirstResponder", imp_yes, "B@:"
-	METHOD	"mouseMoved:", act_moved
-	METHOD	"mouseDown:", act_click
-	METHOD	"keyDown:", act_key
-	METHOD	"draggingEntered:", imp_yes, "Q@:@"  ; NSDragOperationCopy
-	METHOD	"performDragOperation:", act_drop, "B@:@"
+	METHOD	S_acceptsFirstResponder, imp_yes, "B@:"
+	METHOD	S_mouseMoved_, act_moved
+	METHOD	S_mouseDown_, act_click
+	METHOD	S_keyDown_, act_key
+	METHOD	S_draggingEntered_, imp_yes, "Q@:@"  ; NSDragOperationCopy
+	METHOD	S_performDragOperation_, act_drop, "B@:@"
 	CALL	F_objc_registerClassPair, "O"
 	.byte	G_T0 >> 3
 	LD	G_T0
@@ -11991,9 +12572,6 @@ Lprog_build:
 	RC	0, 0, WIN_W, WIN_H
 	STO	G_CONTENT
 
-	CLS	AVPlayer                  ; This Mac's player
-	MSG	S_new, "="
-	STO	G_PLAYER
 	CLS	NSApplication
 	MSG	S_sharedApplication, "="
 	STO	G_APP
@@ -12001,81 +12579,6 @@ Lprog_build:
 	.byte	0                         ; regular
 	MSG	S_setDelegate_, "O"
 	.byte	G_CTRL >> 3
-	CLS	NSMenu
-	MSG	S_new, "="
-	STO	G_T0                      ; the menu bar
-	LD	G_APP
-	MSG	S_setMainMenu_, "O"
-	.byte	G_T0 >> 3
-	SUBMENU	"Beam"
-	ITEM	"About Beam", "orderFrontStandardAboutPanel:", ""
-	MASK	0
-	SEP
-	ITEM	"Hide Beam", "hide:", "h"
-	ITEM	"Hide Others", "hideOtherApplications:", "h"
-	MASK	0x180000
-	ITEM	"Show All", "unhideAllApplications:", ""
-	MASK	0
-	SEP
-	ITEM	"Quit Beam", "terminate:", "q"
-	SUBMENU	"File"
-	ITEM	"Open\342\200\246", "act_open:", "o"
-	ITEM	"Open from URL\342\200\246", "act_focus:", "l"
-	SEP
-	ITEM	"Close", "performClose:", "w"
-	SUBMENU	"Edit"
-	ITEM	"Undo", "undo:", "z"
-	ITEM	"Redo", "redo:", "z"
-	MASK	0x120000
-	SEP
-	ITEM	"Cut", "cut:", "x"
-	ITEM	"Copy", "copy:", "c"
-	ITEM	"Paste", "paste:", "v"
-	ITEM	"Select All", "selectAll:", "a"
-	SUBMENU	"Playback"
-	ITEM	"Play/Pause", "act_toggle:", " "  ; Space, only when not typing a link
-	MASK	0
-	ITEM	"Stop", "act_stop:", "."
-	SEP
-	ITEM	"Back 10 Seconds", "act_back:", "\357\234\202"
-	ITEM	"Forward 10 Seconds", "act_fwd:", "\357\234\203"
-	SEP
-	ITEM	"Volume Up", "act_volup:", "\357\234\200"
-	ITEM	"Volume Down", "act_voldown:", "\357\234\201"
-	ITEM	"Mute", "act_mute:", "\357\234\201"
-	MASK	0x180000
-	SEP
-	ITEM	"Audio Only", "act_aonly:", "a"
-	MASK	0x180000
-	STO	G_AOITEM
-	NESTED	"Speed"
-	SPEED	"0.5\303\227", 50
-	SPEED	"0.75\303\227", 75
-	SPEED	"1\303\227", 100
-	MSG	S_setState_, "I"          ; normal speed to begin with
-	.byte	1
-	SPEED	"1.25\303\227", 125
-	SPEED	"1.5\303\227", 150
-	SPEED	"2\303\227", 200
-	SUBMENU	"View"
-	ITEM	"Enter Full Screen", "toggleFullScreen:", "f"
-	MASK	0x140000
-	ITEM	"Picture in Picture", "act_pip:", "p"
-	MASK	0x180000
-	SEP
-	NESTED	"Subtitles"
-	STO	G_SUBMENU                 ; the item's legible options; Audio Track lists its audible ones
-	MSG	S_setDelegate_, "O"       ; filled as they open
-	.byte	G_CTRL >> 3
-	NESTED	"Audio Track"
-	MSG	S_setDelegate_, "O"
-	.byte	G_CTRL >> 3
-	SUBMENU	"Window"
-	ITEM	"Minimize", "performMiniaturize:", "m"
-	ITEM	"Zoom", "performZoom:", ""
-	LD	G_APP
-	MSG	S_setWindowsMenu_, "O"
-	.byte	G_T1 >> 3
 
 	CLS	NSWindow
 	MSG	S_alloc, "="
@@ -12109,15 +12612,6 @@ Lprog_build:
 	LD	G_WIN
 	MSG	S_setAppearance_, "O"
 	.byte	G_T0 >> 3
-	CLS	NSString                  ; drops: files, links and text
-	MSG	S_stringWithUTF8String_, "=C"
-	.asciz	"public.file-url public.url public.utf8-plain-text"
-	MSG	S_componentsSeparatedByString_, "=S"
-	.asciz	" "
-	STO	G_T1
-	LD	G_CONTENT
-	MSG	S_registerForDraggedTypes_, "O"
-	.byte	G_T1 >> 3
 	CLS	NSTrackingArea            ; mouse moves bring the controls back
 	MSG	S_alloc, "="
 	MSG	S_initWithRect_options_owner_userInfo_, "=RXOI"
@@ -12129,6 +12623,102 @@ Lprog_build:
 	MSG	S_addTrackingArea_, "O"
 	.byte	G_T1 >> 3
 
+	OP_END
+
+; The stage's views, made once the window is on screen.
+Lprog_stage:
+	LD	G_CONTENT                 ; the views are placed at the window's least size
+	MSG	S_setFrameSize_, "DD"
+	.short	WIN_W * 4, WIN_H * 4
+	CLS	AVPlayer                  ; This Mac's player
+	MSG	S_new, "="
+	STO	G_PLAYER
+	CLS	NSString                  ; drops: files, links and text
+	MSG	S_stringWithUTF8String_, "=C"
+	.asciz	"public.file-url public.url public.utf8-plain-text"
+	MSG	S_componentsSeparatedByString_, "=S"
+	.asciz	" "
+	STO	G_T1
+	LD	G_CONTENT
+	MSG	S_registerForDraggedTypes_, "O"
+	.byte	G_T1 >> 3
+	CLS	NSMenu
+	MSG	S_new, "="
+	STO	G_T0                      ; the menu bar
+	LD	G_APP
+	MSG	S_setMainMenu_, "O"
+	.byte	G_T0 >> 3
+	SUBMENU	"Beam"
+	ITEM	"About Beam", S_orderFrontStandardAboutPanel_, ""
+	MASK	0
+	SEP
+	ITEM	"Hide Beam", S_hide_, "h"
+	ITEM	"Hide Others", S_hideOtherApplications_, "h"
+	MASK	0x180000
+	ITEM	"Show All", S_unhideAllApplications_, ""
+	MASK	0
+	SEP
+	ITEM	"Quit Beam", S_terminate_, "q"
+	SUBMENU	"File"
+	ITEM	"Open\342\200\246", S_act_open_, "o"
+	ITEM	"Open from URL\342\200\246", S_act_focus_, "l"
+	SEP
+	ITEM	"Close", S_performClose_, "w"
+	SUBMENU	"Edit"
+	ITEM	"Undo", S_undo_, "z"
+	ITEM	"Redo", S_redo_, "z"
+	MASK	0x120000
+	SEP
+	ITEM	"Cut", S_cut_, "x"
+	ITEM	"Copy", S_copy_, "c"
+	ITEM	"Paste", S_paste_, "v"
+	ITEM	"Select All", S_selectAll_, "a"
+	SUBMENU	"Playback"
+	ITEM	"Play/Pause", S_act_toggle_, " "  ; Space, only when not typing a link
+	MASK	0
+	ITEM	"Stop", S_act_stop_, "."
+	SEP
+	ITEM	"Back 10 Seconds", S_act_back_, "\357\234\202"
+	ITEM	"Forward 10 Seconds", S_act_fwd_, "\357\234\203"
+	SEP
+	ITEM	"Volume Up", S_act_volup_, "\357\234\200"
+	ITEM	"Volume Down", S_act_voldown_, "\357\234\201"
+	ITEM	"Mute", S_act_mute_, "\357\234\201"
+	MASK	0x180000
+	SEP
+	ITEM	"Audio Only", S_act_aonly_, "a"
+	MASK	0x180000
+	STO	G_AOITEM
+	NESTED	"Speed"
+	SPEED	"0.5\303\227", 50
+	SPEED	"0.75\303\227", 75
+	SPEED	"1\303\227", 100
+	MSG	S_setState_, "I"          ; normal speed to begin with
+	.byte	1
+	SPEED	"1.25\303\227", 125
+	SPEED	"1.5\303\227", 150
+	SPEED	"2\303\227", 200
+	SUBMENU	"View"
+	LD	G_T1
+	MSG	S_addItemWithTitle_action_keyEquivalent_, "=SLS"
+	.asciz	"Enter Full Screen", "toggleFullScreen:", "f"
+	MASK	0x140000
+	ITEM	"Picture in Picture", S_act_pip_, "p"
+	MASK	0x180000
+	SEP
+	NESTED	"Subtitles"
+	STO	G_SUBMENU                 ; the item's legible options; Audio Track lists its audible ones
+	MSG	S_setDelegate_, "O"       ; filled as they open
+	.byte	G_CTRL >> 3
+	NESTED	"Audio Track"
+	MSG	S_setDelegate_, "O"
+	.byte	G_CTRL >> 3
+	SUBMENU	"Window"
+	ITEM	"Minimize", S_performMiniaturize_, "m"
+	ITEM	"Zoom", S_performZoom_, ""
+	LD	G_APP
+	MSG	S_setWindowsMenu_, "O"
+	.byte	G_T1 >> 3
 	; The pictures, fitted to the window: the engine's (its layer comes from the media queue), then AVPlayer's.
 	NEWV	NSView, 0, 0, WIN_W, WIN_H
 	STO	G_SBV
@@ -12218,18 +12808,18 @@ Lprog_build:
 	FONT	S_monospacedDigitSystemFontOfSize_weight_, 11, X_MEDIUM
 	LABELIN	G_CUR, G_BAR, "", 16, ROW1_Y + 2, TIME_W, LABEL_H, 0, G_SECOND, AR_RIGHT
 	LABELIN	G_DUR, G_BAR, "", BAR_W - 16 - TIME_W, ROW1_Y + 2, TIME_W, LABEL_H, 2, G_SECOND, AR_LEFT
-	SLIDERIN	G_POS, G_BAR, "act_seek:", 24 + TIME_W, ROW1_Y, BAR_W - 2 * (24 + TIME_W), 1, AR_WIDTH
+	SLIDERIN	G_POS, G_BAR, S_act_seek_, 24 + TIME_W, ROW1_Y, BAR_W - 2 * (24 + TIME_W), 1, AR_WIDTH
 	FONT	S_systemFontOfSize_weight_, 13, X_SEMIBOLD
 	LABELIN	G_TITLE, G_BAR, "", 16, ROW2_C - 9, TEXT_W, 18, 0, G_TEXT, AR_WIDTH | AR_RIGHT
 	FONT	S_systemFontOfSize_weight_, 12, X_REGULAR
 	LABELIN	G_ARTIST, G_BAR, "", 16, ROW2_C - 17, TEXT_W, 16, 0, G_SECOND, AR_WIDTH | AR_RIGHT
-	BTN	G_BACK, G_BAR, "gobackward.10", "Back 10 seconds", "act_back:", "Back 10 seconds (\342\214\230\342\206\220)", BACK_X, ROW2_C - BTN_S / 2, BTN_S, 16, AR_LEFT | AR_RIGHT, G_TEXT
-	BTN	G_PP, G_BAR, "play.fill", "Play or pause", "act_toggle:", "Play or pause (Space)", PLAY_X, ROW2_C - PLAY_S / 2, PLAY_S, 17, AR_LEFT | AR_RIGHT, G_BGC
+	BTN	G_BACK, G_BAR, "gobackward.10", "Back 10 seconds", S_act_back_, "Back 10 seconds (\342\214\230\342\206\220)", BACK_X, ROW2_C - BTN_S / 2, BTN_S, 16, AR_LEFT | AR_RIGHT, G_TEXT
+	BTN	G_PP, G_BAR, "play.fill", "Play or pause", S_act_toggle_, "Play or pause (Space)", PLAY_X, ROW2_C - PLAY_S / 2, PLAY_S, 17, AR_LEFT | AR_RIGHT, G_BGC
 	LAYERBG	G_YEL, PLAY_S / 2
-	BTN	G_FWD, G_BAR, "goforward.10", "Forward 10 seconds", "act_fwd:", "Forward 10 seconds (\342\214\230\342\206\222)", FWD_X, ROW2_C - BTN_S / 2, BTN_S, 16, AR_LEFT | AR_RIGHT, G_TEXT
-	BTN	G_AOBTN, G_BAR, "headphones", "Audio only", "act_aonly:", "Audio Only (\342\214\245\342\214\230A)", AO_X, ROW2_C - ICON_S / 2, ICON_S, 13, AR_LEFT, G_SECOND
-	BTN	G_MUTE, G_BAR, "speaker.wave.2.fill", "Mute", "act_mute:", "Mute (\342\214\245\342\214\230\342\206\223)", MUTE_X, ROW2_C - ICON_S / 2, ICON_S, 13, AR_LEFT, G_SECOND
-	SLIDERIN	G_VOL, G_BAR, "act_vol:", VOL_X, ROW2_C - SLIDER_H / 2, VOL_W, 100, AR_LEFT
+	BTN	G_FWD, G_BAR, "goforward.10", "Forward 10 seconds", S_act_fwd_, "Forward 10 seconds (\342\214\230\342\206\222)", FWD_X, ROW2_C - BTN_S / 2, BTN_S, 16, AR_LEFT | AR_RIGHT, G_TEXT
+	BTN	G_AOBTN, G_BAR, "headphones", "Audio only", S_act_aonly_, "Audio Only (\342\214\245\342\214\230A)", AO_X, ROW2_C - ICON_S / 2, ICON_S, 13, AR_LEFT, G_SECOND
+	BTN	G_MUTE, G_BAR, "speaker.wave.2.fill", "Mute", S_act_mute_, "Mute (\342\214\245\342\214\230\342\206\223)", MUTE_X, ROW2_C - ICON_S / 2, ICON_S, 13, AR_LEFT, G_SECOND
+	SLIDERIN	G_VOL, G_BAR, S_act_vol_, VOL_X, ROW2_C - SLIDER_H / 2, VOL_W, 100, AR_LEFT
 
 	; AirPlay: This Mac's picture and sound to an Apple TV or an AirPlay TV or speaker; lit while it does.
 	CLS	AVRoutePickerView
@@ -12286,8 +12876,8 @@ Lprog_build:
 	.asciz	"Link or search"
 	MSG	S_setTarget_, "O"
 	.byte	G_CTRL >> 3
-	MSG	S_setAction_, "L"
-	.asciz	"act_play:"
+	MSG	S_setAction_, "Y"
+	.byte	(S_act_play_ - B_ACT) >> 3
 	MSG	S_setDelegate_, "O"       ; Escape closes it
 	.byte	G_CTRL >> 3
 	ADDIN	G_URLBOX
@@ -12302,9 +12892,12 @@ Lprog_build:
 	IMAGE	G_IMGPAUSE, "pause.fill", "Pause"
 	IMAGE	G_IMGMUTED, "speaker.slash.fill", "Unmute"
 	IMAGE	G_IMGUNMUTED, "speaker.wave.2.fill", "Mute"
+	LD	G_CONTENT                 ; then to the window's first size, as the views grow with it
+	MSG	S_setFrameSize_, "DD"
+	.short	START_W * 4, START_H * 4
 	OP_END
 
-; The first size, centered; neither is saved, so the app writes no preferences.
+; The first size, centered; neither is saved, so the app writes no preferences. The window is drawn and sent at once: its stage comes after.
 Lprog_show:
 	LD	G_WIN
 	MSG	S_setContentSize_, "DD"
@@ -12314,6 +12907,10 @@ Lprog_show:
 	.byte	0
 	MSG	S_makeFirstResponder_, "O"
 	.byte	G_CONTENT >> 3
+	LD	G_WIN
+	MSG	S_displayIfNeeded
+	CLS	CATransaction
+	MSG	S_flush
 	OP_END
 
 ; The engine's layer into its view, laid out by pic_layout.
@@ -12326,24 +12923,7 @@ Lprog_attach:
 	.byte	G_SBLAYER >> 3
 	OP_END
 
-; While a link resolves the spinner turns; then it rests.
-Lprog_busy:
-	LD	G_SPIN
-	MSG	S_startAnimation_, "I"
-	.byte	0
-	OP_END
-Lprog_idle:
-	LD	G_SPIN
-	MSG	S_stopAnimation_, "I"
-	.byte	0
-	OP_END
 
-; Played: the link field empties.
-Lprog_played:
-	LD	G_FIELD
-	MSG	S_setStringValue_, "S"
-	.asciz	""
-	OP_END
 
 ; Open from URL: the window forward, the field shown and focused with its text selected.
 Lprog_focus:
@@ -12358,24 +12938,12 @@ Lprog_focus:
 	.byte	0
 	OP_END
 
-; The field goes away and the canvas keeps the keyboard.
-Lprog_urlhide:
-	LD	G_URLBOX
-	MSG	S_setHidden_, "I"
-	.byte	1
-	LD	G_WIN
-	MSG	S_makeFirstResponder_, "O"
-	.byte	G_CONTENT >> 3
-	OP_END
-
 ; The 1 Hz poll timer (macOS may coalesce its wakeups), then the run loop.
 Lprog_run:
 	CLS	NSTimer
-	MSG	S_scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_, "=DOLII"
+	MSG	S_scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_, "=DOYII"
 	.short	4
-	.byte	G_CTRL >> 3
-	.asciz	"act_tick:"
-	.byte	0, 1
+	.byte	G_CTRL >> 3, (S_act_tick_ - B_ACT) >> 3, 0, 1
 	MSG	S_setTolerance_, "D"
 	.short	1
 	LD	G_APP
@@ -12395,60 +12963,218 @@ Lapi_headers:
 	.asciz	"Accept-Language", "en-US,en;q=0.9"
 	.byte	0
 
-; InnerTube clients: User-Agent, context fields, headers. The player chain is tried in order: VISIONOS URLs serve whole streams, the rest cover what it refuses.
+; InnerTube clients: User-Agent, name, version, OS and its version, other context fields, the name's number. The player chain is tried in order: VISIONOS URLs serve whole streams, the rest cover what it refuses.
 Lclients:
 	.short	Lcl2 - Lclients
 	.asciz	"Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15"
-	.asciz	"\"clientName\":\"VISIONOS\",\"clientVersion\":\"1.02\",\"osName\":\"visionOS\",\"osVersion\":\"26.5.23O471\",\"deviceModel\":\"RealityDevice17,1\",\"deviceMake\":\"Apple\","
-	.asciz	"X-YouTube-Client-Name", "101"
-	.asciz	"X-YouTube-Client-Version", "1.02"
-	.byte	0
+	.asciz	"VISIONOS", "1.02", "visionOS", "26.5.23O471"
+	.asciz	"\"deviceModel\":\"RealityDevice17,1\",\"deviceMake\":\"Apple\",", "101"
 Lcl2:
 	.short	Lcl3 - Lcl2
 	.asciz	"com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; en_US) gzip"
-	.asciz	"\"clientName\":\"ANDROID_VR\",\"clientVersion\":\"1.65.10\",\"osName\":\"Android\",\"osVersion\":\"12L\",\"deviceModel\":\"Quest 3\",\"androidSdkVersion\":32,"
-	.asciz	"X-YouTube-Client-Name", "28"
-	.asciz	"X-YouTube-Client-Version", "1.65.10"
-	.byte	0
+	.asciz	"ANDROID_VR", "1.65.10", "Android", "12L"
+	.asciz	"\"deviceModel\":\"Quest 3\",\"androidSdkVersion\":32,", "28"
 Lcl3:
 	.short	Lcl4 - Lcl3
 Lc_android:	                          ; also the search client
 	.asciz	"com.google.android.youtube/20.10.38 (Linux; U; Android 14; en_US) gzip"
-	.asciz	"\"clientName\":\"ANDROID\",\"clientVersion\":\"20.10.38\",\"osName\":\"Android\",\"osVersion\":\"14\",\"androidSdkVersion\":34,"
-	.asciz	"X-YouTube-Client-Name", "3"
-	.asciz	"X-YouTube-Client-Version", "20.10.38"
-	.byte	0
+	.asciz	"ANDROID", "20.10.38", "Android", "14"
+	.asciz	"\"androidSdkVersion\":34,", "3"
 Lcl4:
 	.short	Lcl5 - Lcl4
 	.asciz	"com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X; en_US)"
-	.asciz	"\"clientName\":\"IOS\",\"clientVersion\":\"20.10.4\",\"osName\":\"iOS\",\"osVersion\":\"18.3.2.22D82\",\"deviceModel\":\"iPhone16,2\","
-	.asciz	"X-YouTube-Client-Name", "5"
-	.asciz	"X-YouTube-Client-Version", "20.10.4"
-	.byte	0
+	.asciz	"IOS", "20.10.4", "iOS", "18.3.2.22D82"
+	.asciz	"\"deviceModel\":\"iPhone16,2\",", "5"
 Lcl5:
 	.short	0
 Lc_web:	                                  ; the visitorData client
 	.asciz	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-	.asciz	"\"clientName\":\"WEB\",\"clientVersion\":\"2.20260114.08.00\",\"osName\":\"Windows\",\"osVersion\":\"10.0\","
-	.asciz	"X-YouTube-Client-Name", "1"
-	.asciz	"X-YouTube-Client-Version", "2.20260114.08.00"
+	.asciz	"WEB", "2.20260114.08.00", "Windows", "10.0"
+	.asciz	"", "1"
+
+; WORDS m, p — the words of the registry's names, most used first: byte 0x80 + n in a name or a word stands for word n.
+.macro WORDS m, p
+	\m	\p, set
+	\m	\p, NS
+	\m	\p, With
+	\m	\p, in
+	\m	\p, CM
+	\m	\p, ing, in, g
+	\m	\p, str
+	\m	\p, act_
+	\m	\p, ent
+	\m	\p, URL
+	\m	\p, ack
+	\m	\p, ation, a, tion
+	\m	\p, is
+	\m	\p, In
+	\m	\p, lay
+	\m	\p, ed:
+	\m	\p, tion
+	\m	\p, SampleBuffer, Sa, mple, Buffer
+	\m	\p, String, Str, ing
+	\m	\p, loc
+	\m	\p, ter
+	\m	\p, Content, C, ont, ent
+	\m	\p, Data
+	\m	\p, For
+	\m	\p, Get
+	\m	\p, Value
+	\m	\p, der
+	\m	\p, dispatch_, d, is, patch_
+	\m	\p, Item
+	\m	\p, Media
+	\m	\p, Time, T, ime
+	\m	\p, ate
+	\m	\p, ction, c, tion
+	\m	\p, ele
+	\m	\p, ont
+	\m	\p, Image
+	\m	\p, Layer
+	\m	\p, Picture
+	\m	\p, ame
+	\m	\p, ate:, ate, :
+	\m	\p, for
+	\m	\p, per
+	\m	\p, res
+	\m	\p, ueue
+	\m	\p, add
+	\m	\p, ance
+	\m	\p, ize
+	\m	\p, olor
+	\m	\p, ound
+	\m	\p, tor
+	\m	\p, Buffer
+	\m	\p, Create, Cre, ate
+	\m	\p, Set
+	\m	\p, Size:, S, ize, :
+	\m	\p, Type
+	\m	\p, View
+	\m	\p, able
+	\m	\p, ask
+	\m	\p, enu
+	\m	\p, er:
+	\m	\p, initWith, in, it, With
+	\m	\p, ode
+	\m	\p, Audio
+	\m	\p, Block, B, loc, k
+	\m	\p, Description, Descrip, tion
+	\m	\p, InPictureController, In, Picture, C, ontrol, ler
+	\m	\p, Player, P, lay, er
+	\m	\p, Session, Ses, sion
+	\m	\p, ime
+	\m	\p, lass
+	\m	\p, mple
+	\m	\p, objc_
+	\m	\p, rea
+	\m	\p, tes
+	\m	\p, use
+	\m	\p, val
+	\m	\p, AudioFileStream, Audio, FileSt, rea, m
+	\m	\p, Display, D, is, p, lay
+	\m	\p, FormatDescription, For, mat, Description
+	\m	\p, Object
+	\m	\p, Ready
+	\m	\p, Title
+	\m	\p, equest
+	\m	\p, picture
+	\m	\p, pplication, pplic, ation
+	\m	\p, sion
+	\m	\p, Array
+	\m	\p, Configuration, Configur, ation
+	\m	\p, HTTP
+	\m	\p, Render, Ren, der
+	\m	\p, Text
+	\m	\p, Trans
+	\m	\p, Window, W, in, dow
+	\m	\p, arget:
+	\m	\p, cale
+	\m	\p, ctiv
+	\m	\p, current, curr, ent
+	\m	\p, data
+	\m	\p, elease, ele, ase
+	\m	\p, ity:
+	\m	\p, open
+	\m	\p, ppear
+	\m	\p, select, s, ele, ct
+	\m	\p, stop
+	\m	\p, Attachment, Attachm, ent
+	\m	\p, Button
+	\m	\p, CMVideo, CM, Video
+	\m	\p, Character, Charac, ter
+	\m	\p, FormatDescriptionCreateFrom, FormatDescription, Create, From
+	\m	\p, Hidden
+	\m	\p, Interval:, In, ter, val, :
+	\m	\p, RoutePicker
+	\m	\p, Symbol
+	\m	\p, length
+	\m	\p, ontrol, ont, rol
+	\m	\p, semaphore_
+	\m	\p, weight:
+	\m	\p, Flavor_ISOFamily
+	\m	\p, NSFontWeight, NS, F, ont, Weight
+	\m	\p, SelectionGroup, S, ele, ction, Group
+	\m	\p, register, reg, is, ter
+	\m	\p, FirstResponder, FirstRespon, der
+	\m	\p, HTTPHeaderField:, HTTP, Hea, der, Field:
+	\m	\p, VTDecompression, VTDecomp, res, sion
+	\m	\p, completionHandler:, co, mple, tion, Handl, er:
+	\m	\p, kCMSampleAttachmentKey_, k, CM, Sa, mple, Attachment, Key_
+	\m	\p, os_unfair_lock_, os_unfair_, loc, k_
+	\m	\p, queue_attr_make_with_, q, ueue, _attr_make_with_
+.endm
+.macro WMATCH p, w, parts:vararg
+	.ifc	\p, _\w
+	.byte	Lwn
+	.set	Lwf, 1
+	.endif
+	.set	Lwn, Lwn + 1
+.endm
+.macro WEMIT p, w, a, b, c, d, e, f, g, h ; a word, whole or in words of its own that spell it
+	.ifb	\a
+	.asciz	"\w"
+	.else
+	.ifnc	\w, \a\b\c\d\e\f\g\h
+	.error	"the pieces do not spell the word"
+	.endif
+	NAME	\a, \b, \c, \d, \e, \f, \g, \h
+	.endif
+.endm
+.macro NAME parts:vararg                   ; each piece a word's byte, else as it is
+	.irp	p, \parts
+	.ifnb	\p
+	.set	Lwn, 0x80
+	.set	Lwf, 0
+	WORDS	WMATCH, _\p
+	.if	Lwf == 0
+	.ascii	"\p"
+	.endif
+	.endif
+	.endr
 	.byte	0
+.endm
+Lreg_words:
+	WORDS	WEMIT
 
 ; The registry's names, in its order.
-.macro REG sym, name
-	.asciz	"\name"
+.macro REG sym, parts:vararg
+	NAME	\parts
 .endm
 .macro REGSEL
 .endm
 .macro REGCLS
 .endm
-.macro FN name
-	.asciz	"\name"
+.macro REGACT
+.endm
+.macro FN name, a, b, c, d, e, f, g, h, i, j, k, l, m
+	SPELL	F_\name, \name, \a, \b, \c, \d, \e, \f, \g, \h, \i, \j, \k, \l, \m
 .endm
 Lreg_names:
 	REGISTRY
 	.byte	0
+Ls_avkit:	.asciz	"/System/Library/Frameworks/AVKit.framework/AVKit"
+Ls_calloc:	.asciz	"calloc"
+Ls_dlopen:	.asciz	"dlopen"
+	.p2align 3
+Ldl:	.quad	_dlsym, 0, 0              ; then G and B, for callbacks
 
-	.section __DATA,__objc_imageinfo,regular,no_dead_strip
-	.long	0
-	.long	64
