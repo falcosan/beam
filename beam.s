@@ -1,31 +1,3 @@
-	.pushsection __DATA,__data
-Ldbase:                                   ; data pointers in programs count from here
-	.popsection
-; One atom for the code: its labels are entry points into it, so the programs' two-byte offsets to functions resolve as the file assembles.
-.macro ALT names:vararg
-	.irp	f, \names
-	.alt_entry	\f
-	.endr
-.endm
-	ALT	layer_in, bar_draw, vm_entry, tramp, strtol10, nextstr, lock, unlock, post_main, mkurl, make_item, box_find, is_link, video_id, jfind
-	ALT	jstr, jesc, resolve_file, resolve_web, url_title, api, ythdrs, within, jnum, fmt_info, parse_player, resolve, mkstr
-	ALT	setstr, frame_rect, ui_run, vm_run, cache_update, show_track, show_art, art_show, layout_stage, pic_layout, center_box
-	ALT	stage_update, bar_show, bar_alpha, render_status, set_status, ui_refresh, fmt_time, glyph_row, show_time, fail_status, local_play
-	ALT	eng_mode, local_poll, video_tracks, local_toggle, local_seek, local_seekms, local_stop, local_setvol, local_volstep
-	ALT	local_mute, vol_apply, vol_to, air_handoff, mkreq, hdrs, rq_find, rq_drop, sink_buf, done_sync, fetch, st_pump, st_end
-	ALT	st_sink, st_done, st_reset, st_seek, trk_target, st_cursors, trk_seek, sidx_find, st_parse, arena_new, st_keep, emit
-	ALT	aonly_drop, box_done, on_moov, trk_attach, trk_aim, trk_new, trex_read, on_moof, trun_read, st_open, st_close
-	ALT	line_end, attr, attr_num, seg_scan, url_join, hls_pick, pl_set, st_get, st_get_own, st_later, seg_reset, hexbyte
-	ALT	hls_pump, hls_text, hls_done, seg_decrypt, txt_add, vtt_cues, vtt_time, seg_bytes, seg_flush, ts_feed, ts_packet
-	ALT	ts_pat, ts_pmt, pes_add, buf_add, pes_done, pts33, next_sc, ts_video, cc_avcc, cc_sei, cc_add, cc_pair, cc_put, cc_cue
-	ALT	vau_next, vau_flush, ps_store, ps_format, vid_dims, afs_file, afs_more, afs_get16, afs_get, afs_dur, afs_seek
-	ALT	afs_stream, afs_sfeed, no_pic, afs_open, afs_feed, trim, pa_feed, id3_pts, eng_cmd, vt_warm, eng_frees, mp4_open
-	ALT	snd_fd, trak_open, elst_shift, cur_size, cur_delta, cur_cts, cur_sync, snap, unsnap, cur_reset, cur_chunk, cur_norm
-	ALT	cur_step, cur_seek, setflag, mk_sample, pic_ref, cur_sample, produce, q_push, trk_clear, q_clear, trk_request, feed
-	ALT	trk_play, hold, hold_async, await, now_ms, sub_cue, sub_textn, sub_text, sub_reset, sub_seek, sub_obs, tick_later
-	ALT	ahead_ms, skip, seek_route, dragging, play_text, play_url, url_hide, idle_tick, speed_rate, media_group, opt_item
-	ALT	opt_named, txt_fd, cc_track, media_next, uri_is, imp_yes, _main
-
 ; ---- Macros ----
 
 ; FRAME pairs, locals, args — prologue: fp/lr, then `pairs` register pairs from x19 (stored by Lpro<pairs>), then locals; with args, x19 = x0 and x20 = x1.
@@ -53,7 +25,6 @@ Ldbase:                                   ; data pointers in programs count from
 
 ; ENTRY name — a function called from outside (AppKit, GCD, pthreads): its body Lname runs with x28 = G, x27 = B.
 .macro ENTRY name
-	.alt_entry	\name
 \name:
 	adr	x16, L\name
 	b	tramp
@@ -66,7 +37,6 @@ L\name:
 	b	vm_run
 .endm
 .macro VMENTRY name, program
-	.alt_entry	\name
 \name:
 	ADDR	x9, \program
 	b	vm_entry
@@ -78,7 +48,6 @@ L\name:
 Lvmt\@:
 .endm
 .macro VMTENTRY name
-	.alt_entry	\name
 \name:
 	adr	x9, Lvmt\@
 	b	vm_entry
@@ -217,24 +186,6 @@ Lc\@:	.asciz	"\text"
 	.ifc	"\kinds", ""
 	.set	Lmk, 67
 	.endif
-	.ifc	"\kinds", "S"
-	.set	Lmk, 68
-	.endif
-	.ifc	"\kinds", "^"
-	.set	Lmk, 69
-	.endif
-	.ifc	"\kinds", "D"
-	.set	Lmk, 70
-	.endif
-	.ifc	"\kinds", "b"
-	.set	Lmk, 71
-	.endif
-	.ifc	"\kinds", ">"
-	.set	Lmk, 72
-	.endif
-	.ifc	"\kinds", "N"
-	.set	Lmk, 73
-	.endif
 	.byte	Lmk, (\sel - B_SEL) >> 3
 	.if	Lmk == 6
 	.asciz	"\kinds"
@@ -245,14 +196,9 @@ Lc\@:	.asciz	"\text"
 	.asciz	"\kinds"
 .endm
 .macro NCALL fn, kinds=""                ; a function of this file
-	.ifc	"\kinds", ""
-	.byte	95
-	.short	\fn - Lvm_base
-	.else
 	.byte	11
-	.short	\fn - Lvm_base
+	.long	\fn - Lvm_base
 	.asciz	"\kinds"
-	.endif
 .endm
 .macro JUMP op, label                     ; a jump of at most 127 bytes either way to a HERE, checked as it assembles
 	.byte	\op
@@ -324,82 +270,82 @@ Lc\@:	.asciz	"\text"
 	.byte	55 + \n
 .endm
 .macro LDX off                           ; current = the xword, word or byte at current + off
-	.byte	74
+	.byte	68
 	.short	\off
 .endm
 .macro LDW off
-	.byte	75
+	.byte	69
 	.short	\off
 .endm
 .macro LDB off
-	.byte	76
+	.byte	70
 	.short	\off
 .endm
 .macro ADDH n                            ; current += n, up to 65535
-	.byte	77
+	.byte	71
 	.short	\n
 .endm
 .macro MULH n
-	.byte	78
+	.byte	72
 	.short	\n
 .endm
 .macro DIVH n
-	.byte	79
+	.byte	73
 	.short	\n
 .endm
 .macro ANDH n
-	.byte	80
+	.byte	74
 	.short	\n
 .endm
 .macro LDEW field                        ; a B word into current, and back
-	.byte	85
+	.byte	79
 	.short	\field
 .endm
 .macro STEW field
-	.byte	86
+	.byte	80
 	.short	\field
 .endm
 .macro FL n                              ; f = local n (a double)
-	.byte	88, \n
+	.byte	82, \n
 .endm
 .macro FS n
-	.byte	89, \n
+	.byte	83, \n
 .endm
 .macro FK k                              ; f = k / 16
-	.byte	90
+	.byte	84
 	.short	\k
 .endm
 .macro FI                                ; f = current
-	.byte	91
+	.byte	85
 .endm
 .macro FT                                ; current = f, truncated
-	.byte	92
+	.byte	86
 .endm
 .macro FOP op, n                         ; f = f op local n: 0 +, 1 -, 2 *, 3 /, 4 min, 5 max, 6 current = f > it, 7 ceil, 8 floor, 9 |f - it|
-	.byte	93, \op, \n
+	.byte	87, \op, \n
 .endm
 .macro FOPK op, k                        ; the same with k / 16
-	.byte	94, \op
+	.byte	88, \op
 	.short	\k
 .endm
 .macro LEA label                         ; current = the address of a label
-	.byte	87
+	.byte	81
 	.long	\label - Lvm_base
 .endm
 .macro LEAB off                          ; current = the address of a B field
-	.byte	81
+	.byte	75
 	.short	\off
 .endm
 .macro LDBE off                          ; current = the big-endian word at current + off
-	.byte	82
+	.byte	76
 	.short	\off
 .endm
 .macro STX n, off                        ; current into the xword or word at local n + off
-	.byte	83, \n
+	.byte	77, \n
 	.short	\off
 .endm
 .macro STW n, off
-	.byte	84, \n
+	.byte	78, \n
 	.short	\off
 .endm
 .macro EQS slot                          ; current = current == a G slot
@@ -497,38 +443,21 @@ Lc\@:	.asciz	"\text"
 	MASKV	\mask
 	ADDIN	\parent
 .endm
-.macro BARIN slot, x, y, w, mask         ; a bar of the control bar: a BeamBar, its track and fill layers
-	LD	G_BARCLS
-	MSG	S_new, "="
+.macro SLIDERIN slot, parent, action, x, y, w, max, mask
+	CLS	NSSlider
+	MSG	S_sliderWithTarget_action_, "=OY"
+	.byte	G_CTRL >> 3, (\action - B_ACT) >> 3
 	STO	\slot
+	MSG	S_setControlSize_, "I"
+	.byte	1                         ; small: a slim track
 	MSG	S_setFrame_, "N"
 	RN	\x, \y, \w, SLIDER_H
+	MSG	S_setMaxValue_, "D"
+	.short	(\max) * 4
+	MSG	S_setTrackFillColor_, "O"
+	.byte	G_YEL >> 3
 	MASKV	\mask
-	MSG	S_setWantsLayer_, "I"
-	.byte	1
-	MSG	S_setAccessibilityElement_, "I"
-	.byte	1
-	MSG	S_setAccessibilityRole_, "S"
-	.asciz	"AXSlider"
-	ADDIN	G_BAR
-	MSG	S_layer, "="
-	NCALL	layer_in, "=VIOI"         ; the track, as wide as the bar
-	.byte	(SLIDER_H - TRACK_H) / 2, G_TRACK >> 3, AR_WIDTH
-	NCALL	layer_in, "VIOI"          ; the fill, in it
-	.byte	0, G_YEL >> 3, 0
-.endm
-.macro ROWIN slot, x, y, mask              ; a time's row in the control bar: a layer for its 8 glyph layers
-	CLS	CALayer
-	MSG	S_new, "="
-	STO	\slot
-	MSG	S_setFrame_, "N"
-	RN	\x, \y, TIME_W, LABEL_H
-	MSG	S_setAutoresizingMask_, "I"
-	.byte	\mask
-	LD	G_BAR
-	MSG	S_layer, "="
-	MSG	S_addSublayer_, "O"
-	.byte	(\slot) >> 3
+	ADDIN	\parent
 .endm
 .macro BTN slot, parent, sym, desc, action, tip, x, y, size, pt, mask, tint
 	CLS	NSImageSymbolConfiguration
@@ -612,7 +541,7 @@ Lc\@:	.asciz	"\text"
 .endm
 .macro METHOD sel, imp, types=""         ; - (void)action:(id)sender, unless types say otherwise
 	.byte	7, (\sel - B_ACT) >> 3
-	.short	\imp - Lvm_base
+	.long	\imp - Lvm_base
 	.asciz	"\types"
 .endm
 
@@ -640,23 +569,20 @@ Lc\@:	.asciz	"\text"
 .equ RENDER_FAILED,              2        ; AVQueuedSampleBufferRenderingStatusFailed
 .equ WAIT_TRIES,                 2000     ; 5 ms polls for the first picture before the clock starts anyway
 .equ WAIT_NS,                    5000000
-.equ LEAD_MS,                    350      ; a picture queued at most this far ahead (net_tick asks again every quarter second of media: 100 ms to spare)
-.equ PAUSE_LEAD_MS,              100      ; paused: no more than the decoder needs to show the moment, little for a seek to flush
-.equ ABATCH,                     7        ; at most 2^7 sound samples in a row per buffer: each buffer costs the renderer ~130k instructions
-.equ AWAIT_MS,                   2000     ; a stream's sound buffer waits to be whole while this much is made past the clock
+.equ LEAD_MS,                    350      ; a picture queued at most this far ahead (net_tick asks again every eighth of a second; 2x speed still has a tick to spare)
 .equ AUDIO_PREROLL,              2        ; packets decoded before a seek target, so the decoder has its overlap
 .equ TRACKS,                     8
 .equ RQS,                        16       ; requests at once
 .equ STREAMS,                    3        ; network streams: picture, sound, subtitles
 .equ FIFO_N,                     2048     ; samples a track's queue holds
-.equ AHEAD_V,                    480      ; queued pictures before a stream stops fetching
-.equ AHEAD_A,                    0x4000   ; and ms of sound past the clock (a buffer holds many packets)
+.equ AHEAD_V,                    480      ; queued pictures and sound packets before a stream stops fetching
+.equ AHEAD_A,                    768
 .equ AHEAD_S,                    64       ; and cues
 .equ ARENA_MAX,                  0x800000 ; 8 MiB of media data per arena
 .equ BOX_MAX,                    0x1000000 ; the largest box collected (moov, moof, sidx)
 .equ RETRY_NS,                   1000000000
 .equ NET_TRIES,                  3
-.equ TICK_NS,                    250000000 ; net_tick's period at 1x, shorter as faster; the network check: a stall holds the clock until STALL_FULL ms are in
+.equ TICK_NS,                    125000000 ; the network check: a stall holds the clock until STALL_FULL ms are in
 .equ STALL_LOW,                  250
 .equ STALL_FULL,                 2000
 .equ BPS_START,                  4000000  ; HLS starts with the best variant under this, then follows the measured speed
@@ -752,7 +678,7 @@ Lc\@:	.asciz	"\text"
 .equ TR_FL,                      248      ; the fragment's samples: {offset, size, duration, composition, flags}[]
 .equ TR_ST,                      256      ; the stream that feeds it
 .equ TR_FDTS,                    264      ; the next fragment sample's decode time
-.equ TR_LAST,                    272      ; where the samples made so far end, presentation time
+.equ TR_LAST,                    272      ; the last sample made's presentation time
 .equ TR_AFS,                     280      ; its AudioFileStream, which finds the packets of a sound stream
 .equ TR_APTS,                    288      ; the next packet's presentation time
 .equ TR_ASR,                     296      ; w: sample rate and frames per packet
@@ -903,7 +829,6 @@ Lc\@:	.asciz	"\text"
 .equ STATUS_T,                   36
 .equ LABEL_H,                    16
 .equ SLIDER_H,                   20
-.equ TRACK_H,                    4        ; the bars' track and fill
 .equ TIME_W,                     52
 .equ ROW1_Y,                     BAR_H - 12 - SLIDER_H ; position slider
 .equ ROW2_C,                     34       ; middle of the second row
@@ -1005,11 +930,7 @@ Lc\@:	.asciz	"\text"
 .equ G_SEEKTO,                   G_SEEKPEND + 8 ; its target, ms
 .equ G_CLOCKQ,                   G_SEEKTO + 8 ; a serial queue for the clock's slow stops
 .equ G_SHOWPOS,                  G_CLOCKQ + 8 ; the position show_time was given, drawn or not (main)
-.equ G_BARCLS,                   G_SHOWPOS + 8 ; the bars' class (main)
-.equ G_TRACK,                    G_BARCLS + 8 ; their track's color (main)
-.equ G_AIRUP,                    G_TRACK + 8 ; the AirPlay button is made (main)
-.equ G_DRAWN,                    G_AIRUP + 8 ; the position and duration show_time last drew (main)
-.equ G_SIZE,                     G_DRAWN + 8
+.equ G_SIZE,                     G_SHOWPOS + 8
 
 ; ---- Data ----
 
@@ -1055,10 +976,6 @@ Lc\@:	.asciz	"\text"
 	SYM	CMSampleBufferGetSampleAttachmentsArray, CM,SampleBuffer,Get,Sa,mple,Attachment,s,Array
 	SYM	CMSetAttachment, CM,Set,Attachment
 	SYM	CMTimeCopyAsDictionary, CM,Time,CopyAsDi,ction,ary
-	SYM	CGColorGetColorSpace, CGC,olor,Get,C,olor,Space
-	SYM	CGBitmapContextCreate, CGBitmapC,ont,ext,Create
-	SYM	CGBitmapContextCreateImage, CGBitmapC,ont,ext,Create,Image
-	SYM	CGContextScaleCTM, CGC,ont,extS,cale,CTM
 	SYM	CMVideoFormatDescriptionCreateFromBigEndianImageDescriptionData, CMVideo,FormatDescriptionCreateFrom,BigEndian,Image,Description,Data
 	FN	CMVideoFormatDescriptionCreateFromH264ParameterSets, CMVideo,FormatDescriptionCreateFrom,H264Par,ame,ter,Set,s
 	FN	CMVideoFormatDescriptionCreateFromHEVCParameterSets, CMVideo,FormatDescriptionCreateFrom,HEVCPar,ame,ter,Set,s
@@ -1178,6 +1095,7 @@ Lc\@:	.asciz	"\text"
 	OBJC	NSOpenPanel, NS,OpenPanel
 	OBJC	NSOperationQueue, NS,O,per,ation,Q,ueue
 	OBJC	NSProgressIndicator, NS,Prog,res,s,In,dica,tor
+	OBJC	NSSlider, NS,Sli,der
 	OBJC	NSString, NS,String
 	OBJC	NSTextField, NS,Text,Field
 	OBJC	NSTimer, NS,Time,r
@@ -1185,7 +1103,6 @@ Lc\@:	.asciz	"\text"
 	OBJC	NSURL, NS,URL
 	OBJC	NSURLSession, NS,URL,Session
 	OBJC	NSURLSessionConfiguration, NS,URL,Session,Configuration
-	OBJC	NSNumber, NS,Number
 	OBJC	NSView, NS,View
 	OBJC	NSWindow, NS,Window
 	OBJC	UTType, UT,Type
@@ -1210,11 +1127,10 @@ Lc\@:	.asciz	"\text"
 	REG	S_arrayWithObject_, array,With,Object,:
 	REG	S_assetTrack, as,set,Tr,ack
 	REG	S_bounds, b,ound,s
-	REG	S_convertPoint_fromView_, convertPo,in,t:from,View,:
 	REG	S_buttonWithImage_target_action_, button,With,Image,:t,arget:,a,ction,:
 	REG	S_cancelOperation_, c,ance,lO,per,ation,:
 	REG	S_cell, cell
-	REG	S_center, c,ent,er
+	REG	S_center, cen,ter
 	REG	S_clickCount, clickCount
 	REG	S_colorWithSRGBRed_green_blue_alpha_, c,olor,With,SRGBR,ed:,green:blue:alpha:
 	REG	S_componentsSeparatedByString_, compon,ent,sSepar,ate,dBy,String,:
@@ -1224,18 +1140,20 @@ Lc\@:	.asciz	"\text"
 	REG	S_currentTime, current,Time
 	REG	S_dataWithBytes_length_, data,With,By,tes,:,length,:
 	REG	S_dataWithBytesNoCopy_length_freeWhenDone_, data,With,By,tes,NoCopy:,length,:freeWhenDone:
+	REG	S_doubleValue, double,Value
 	REG	S_draggingPasteboard, dragg,ing,Pasteboard
 	REG	S_duration, dur,ation
 	REG	S_fileURLWithPath_, file,URL,With,Path:
 	REG	S_firstObject, first,Object
 	REG	S_host, host
 	REG	S_imageViewWithImage_, image,View,With,Image,:
-	REG	S_imageWithSystemSymbolName_accessibilityDescription_, image,With,System,Symbol,N,ame,:a,ccessibility,Description,:
+	REG	S_imageWithSystemSymbolName_accessibilityDescription_, image,With,System,Symbol,N,ame,:accessibility,Description,:
 	REG	S_initWithContentRect_styleMask_backing_defer_, initWith,Content,Rect:styleM,ask,:b,ack,ing,:def,er:
 	REG	S_initWithData_, initWith,Data,:
 	REG	S_initWithFrame_, initWith,Fr,ame,:
 	REG	S_initWithRect_options_owner_userInfo_, initWith,Rect:op,tion,s:own,er:,use,r,In,fo:
 	REG	S_initWithTitle_, initWith,Title,:
+	REG	S_intValue, in,t,Value
 	REG	S_isEnabled, is,En,able,d
 	REG	S_isEqualToString_, is,EqualTo,String,:
 	REG	S_isExternalPlaybackActive, is,Ex,ter,nalP,lay,b,ack,A,ctiv,e
@@ -1246,10 +1164,10 @@ Lc\@:	.asciz	"\text"
 	REG	S_locationInWindow, loc,ation,In,Window
 	REG	S_makeFirstResponder_, make,FirstResponder,:
 	REG	S_makeKeyAndOrderFront_, makeKeyAndOr,der,Fr,ont,:
+	REG	S_maxValue, max,Value
 	REG	S_mediaType, media,Type
 	REG	S_menu, m,enu
 	REG	S_new, new
-	REG	S_numberWithInt_, number,With,In,t:
 	REG	S_openPanel, open,Panel
 	REG	S_path, path
 	REG	S_pause, pa,use
@@ -1274,9 +1192,7 @@ Lc\@:	.asciz	"\text"
 	REG	S_setAllowedContentTypes_, set,Allowed,Content,Type,s:
 	REG	S_setAlphaValue_, set,Alpha,Value,:
 	REG	S_setAppearance_, set,A,ppear,ance,:
-	REG	S_setAccessibilityElement_, set,A,ccessibility,Elem,ent,:
-	REG	S_setAccessibilityRole_, set,A,ccessibility,Role:
-	REG	S_setAutoresizingMask_, set,Au,tor,esiz,ing,M,ask,:
+	REG	S_setAutoresizingMask_, set,Auto,res,iz,ing,M,ask,:
 	REG	S_setBackgroundColor_, set,B,ack,gr,ound,C,olor,:
 	REG	S_setBezeled_, set,Bezel,ed:
 	REG	S_setBordered_, set,Bor,der,ed:
@@ -1288,10 +1204,12 @@ Lc\@:	.asciz	"\text"
 	REG	S_setContents_, set,Content,s:
 	REG	S_setContentsGravity_, set,Content,sGrav,ity:
 	REG	S_setContentsRect_, set,Content,sRect:
+	REG	S_setControlSize_, set,C,ontrol,Size:
 	REG	S_setCornerCurve_, set,CornerCurve:
 	REG	S_setCornerRadius_, set,CornerRadius:
 	REG	S_setDelegate_, set,D,ele,g,ate:
 	REG	S_setDisplayedWhenStopped_, set,Display,edWhenStopp,ed:
+	REG	S_setDoubleValue_, set,Double,Value,:
 	REG	S_setDrawsBackground_, set,DrawsB,ack,gr,ound,:
 	REG	S_setEnabled_, set,En,able,d:
 	REG	S_setFocusRingType_, set,FocusR,ing,Type,:
@@ -1306,7 +1224,7 @@ Lc\@:	.asciz	"\text"
 	REG	S_setLayer_, set,Layer,:
 	REG	S_setLineBreakMode_, set,L,in,eB,rea,kM,ode,:
 	REG	S_setMainMenu_, set,Ma,in,M,enu,:
-	REG	S_setMasksToBounds_, set,M,ask,sToB,ound,s:
+	REG	S_setMaxValue_, set,Max,Value,:
 	REG	S_setMovableByWindowBackground_, set,Mov,able,By,Window,B,ack,gr,ound,:
 	REG	S_setMuted_, set,Mut,ed:
 	REG	S_setPlaceholderString_, set,Placehol,der,String,:
@@ -1323,10 +1241,10 @@ Lc\@:	.asciz	"\text"
 	REG	S_setTitlebarAppearsTransparent_, set,Title,barA,ppear,s,Trans,par,ent,:
 	REG	S_setTolerance_, set,Toler,ance,:
 	REG	S_setToolTip_, set,ToolTip:
+	REG	S_setTrackFillColor_, set,Tr,ack,FillC,olor,:
 	REG	S_setUsesSingleLineMode_, set,UsesS,ing,leL,in,eM,ode,:
 	REG	S_setVolume_, set,Volume:
 	REG	S_setWantsLayer_, set,Wants,Layer,:
-	REG	S_sublayers, sub,lay,ers
 	REG	S_setWindowsMenu_, set,Window,sM,enu,:
 	REG	S_sharedApplication, sharedA,pplication
 	REG	S_startAnimation_, startAnim,ation,:
@@ -1336,7 +1254,7 @@ Lc\@:	.asciz	"\text"
 	REG	S_stringForType_, str,ing,For,Type,:
 	REG	S_stringValue, str,ing,Value
 	REG	S_stringWithUTF8String_, str,ing,With,UTF8,String,:
-	REG	S_timeControlStatus, t,ime,C,ont,rolStatus
+	REG	S_timeControlStatus, t,ime,C,ontrol,Status
 	REG	S_toggleFullScreen_, toggleFullScreen:
 	REG	S_tracks, tr,ack,s
 	REG	S_type, type
@@ -1371,9 +1289,7 @@ Lc\@:	.asciz	"\text"
 	REG	S_objectAtIndex_, objectAt,In,dex:
 	REG	S_setContentView_, set,Content,View,:
 	REG	S_size, s,ize
-	REG	S_renderInContext_, ren,der,In,C,ont,ext:
-	REG	S_attributedStringValue, attributed,String,Value
-	REG	S_attributedSubstringFromRange_, attributedSub,str,ing,FromRange:
+	REG	S_sliderWithTarget_action_, sli,der,With,T,arget:,a,ction,:
 	REG	S_addRenderer_, add,Render,er:
 	REG	S_enqueueSampleBuffer_, enq,ueue,SampleBuffer,:
 	REG	S_displayIfNeeded, d,is,p,lay,IfNeeded
@@ -1438,15 +1354,17 @@ Lc\@:	.asciz	"\text"
 	REG	S_act_option_, act_,op,tion,:
 	REG	S_act_pip_, act_,pip:
 	REG	S_act_play_, act_,p,lay,:
+	REG	S_act_seek_, act_,seek:
 	REG	S_act_speed_, act_,spe,ed:
 	REG	S_act_stop_, act_,stop,:
 	REG	S_act_tick_, act_,tick:
 	REG	S_act_toggle_, act_,toggle:
+	REG	S_act_vol_, act_,vol:
 	REG	S_act_voldown_, act_,voldown:
 	REG	S_act_volup_, act_,volup:
 	REG	S_application_openURLs_, a,pplication,:,open,URL,s:
 	REG	S_applicationShouldTerminateAfterLastWindowClosed_, a,pplication,ShouldTerm,in,ate,Af,ter,Last,Window,Clos,ed:
-	REG	S_control_textView_doCommandBySelector_, c,ont,rol:text,View,:doCommandByS,ele,c,tor,:
+	REG	S_control_textView_doCommandBySelector_, c,ontrol,:text,View,:doCommandByS,ele,c,tor,:
 	REG	S_copy_, copy:
 	REG	S_cut_, cut:
 	REG	S_draggingEntered_, dragg,ing,En,ter,ed:
@@ -1454,12 +1372,7 @@ Lc\@:	.asciz	"\text"
 	REG	S_hideOtherApplications_, hideOtherA,pplication,s:
 	REG	S_keyDown_, keyDown:
 	REG	S_menuNeedsUpdate_, m,enu,NeedsUpd,ate:
-	REG	S_accessibilityPerformDecrement, a,ccessibility,Per,for,mDecrem,ent
-	REG	S_accessibilityPerformIncrement, a,ccessibility,Per,for,m,In,crem,ent
-	REG	S_accessibilityValue, a,ccessibility,Value
 	REG	S_mouseDown_, mo,use,Down:
-	REG	S_mouseDragged_, mo,use,Dragg,ed:
-	REG	S_mouseUp_, mo,use,Up:
 	REG	S_mouseMoved_, mo,use,Mov,ed:
 	REG	S_orderFrontStandardAboutPanel_, or,der,Fr,ont,StandardAboutPanel:
 	REG	S_paste_, paste:
@@ -1497,7 +1410,6 @@ Lc\@:	.asciz	"\text"
 .macro FN name, a, b, c, d, e, f, g, h, i, j, k, l, m ; its stub jumps through the slot
 	REG	F_\name
 	.pushsection __TEXT,__text,regular,pure_instructions
-	.alt_entry	_\name
 _\name:
 	ldr	x16, [x27, #F_\name]
 	br	x16
@@ -1515,7 +1427,7 @@ _\name:
 .equ E_VR,                       E_AR + 8 ; and picture renderer
 .equ E_SESSION,                  E_VR + 8 ; the NSURLSession; its delegate calls run on the media queue
 .equ E_WAITGEN,                  E_SESSION + 8 ; w: the newest wait for a first picture
-.equ E_SLOW,                     E_WAITGEN + 4 ; w: a resume since net_tick last ran: the picture is fed past its lead
+.equ E_SLOW,                     E_WAITGEN + 4 ; w: paused when net_tick last ran: its ticks slow down and no picture is held to its lead
 .equ E_SUBOBS,                   E_WAITGEN + 8 ; the subtitles' periodic observer, while a subtitle track is shown
 .equ E_HOLDGEN,                  E_SUBOBS + 8 ; w: the newest hold sent to the clock queue, the one it started, the one it finished
 .equ E_HOLDGO,                   E_HOLDGEN + 4
@@ -1547,8 +1459,8 @@ _\name:
 .equ E_SUBN,                     E_SUBT + 8 ; its next cue, taken early (retained)
 .equ E_SUBEND,                   E_SUBN + 8 ; when the cue shown ends, track units
 .equ E_SUBON,                    E_SUBEND + 8 ; w: a cue is shown
-.equ E_NOWMS,                    E_SUBON + 4 ; w: the clock at net_tick's last tick or a seek, ms (media queue)
-.equ E_CCT,                      E_NOWMS + 4 ; the CC1 caption track, made when picked
+.equ E_M4A,                      E_SUBON + 4 ; w: 1 while AudioFileStream tries an M4A, 2 once it could not
+.equ E_CCT,                      E_SUBON + 4 + 4 ; the CC1 caption track, made when picked
 .equ E_CC,                       E_CCT + 8 ; its CEA-608 decoder and the captions waiting for presentation order (CC_*)
 .equ CC_MODE,                    0        ; w: 0 pop-on, 1 roll-up, 2 paint-on
 .equ CC_ROWS,                    4        ; w: roll-up's rows
@@ -1576,10 +1488,7 @@ _\name:
 .equ B_TIMEB,                    B_AFF + 48 ; show_time's text (main)
 .equ B_MNEXT,                    B_TIMEB + 32 ; media_next's line after the one found
 .equ B_UJ,                       B_MNEXT + 8 ; char[4096], url_join's URI (media queue)
-.equ B_WIX,                      B_UJ + 4096 ; short[128], where each registry word starts (main, at launch)
-.equ B_GLX,                      B_WIX + 256 ; double[13]: where each glyph of "0123456789:-" starts in the glyph picture, then where the last ends (main)
-.equ B_GLL,                      B_GLX + 13 * 8 ; the times' glyph layers: 8 for the time played, 8 for the time left (main)
-.equ B_SIZE,                     B_GLL + 16 * 8
+.equ B_SIZE,                     B_UJ + 4096
 .equ GB_SIZE,                    ((G_SIZE + 15) & ~15) + B_SIZE ; G, then B, in one zeroed block from main
 
 	.text
@@ -2054,9 +1963,7 @@ Ls_https:	.asciz	"https://"
 Ls_notweb:	.asciz	"this is not a web address"
 	.popsection
 resolve_web:
-	VM	Lp_rweb
-	.pushsection __DATA,__data
-Lp_rweb:
+	VMT
 	IMM	KIND_WEB
 	STW	0, JOB_KIND
 	GL	0
@@ -2066,10 +1973,10 @@ Lp_rweb:
 	ADDH	JOB_URL
 	SL	2                         ; c: where its URL goes
 	CALL	F_strstr, "=bP"
-	.short	Ls_sep - Ldbase
+	.long	Ls_sep - Lvm_base
 	JNZ	Lrw_copy
 	CALL	F_strlcpy, "cPH"          ; no scheme: https
-	.short	Ls_https - Ldbase
+	.long	Ls_https - Lvm_base
 	.short	4096
 	GL	2
 	ADDI	8
@@ -2099,7 +2006,7 @@ Lp_rweb:
 	STX	0, JOB_ERR
 	IMM	PLAY_FAILED
 	OP_END
-	.popsection
+	.p2align 2
 
 ; url_title(url, job) -> PLAY_OK, with the URL's last path component, without its extension, as the job's title.
 url_title:
@@ -2134,18 +2041,13 @@ Lp_utitle:
 ; api(endpoint, client, tail, frame) — POST to InnerTube as a client, into resolve's RS_BUF; w0 = 1 on success.
 	.equ AP_NUM,	64                ; the name's number
 	.equ AP_BODY,	72
-	.equ AP_URL,	80
 api:
-	FRAME	4, 96
+	FRAME	4, 80
 	mov	x21, x0
 	mov	x20, x1
 	mov	x22, x2
 	add	x23, x3, #RS_BUF
 	add	x24, x3, #RS_VIS
-	str	x21, [sp]                 ; the endpoint's URL, from its name
-	add	x0, sp, #AP_URL
-	CSTR	x1, "https://www.youtube.com/youtubei/v1/%s?prettyPrint=false"
-	bl	_asprintf
 	mov	x0, x20                   ; the client's fields: name, version (also a header), OS, its version, others, the name's number
 	bl	nextstr
 	str	x0, [sp]
@@ -2168,11 +2070,9 @@ api:
 	mov	w22, #0
 	ldr	x9, [sp, #AP_BODY]
 	cbz	x9, Lapi_free
-	ldr	x9, [sp, #AP_URL]
-	cbz	x9, Lapi_free
 	mov	w25, #2                   ; attempts: a kept-alive connection may have been dropped
 Lapi_try:
-	ldr	x0, [sp, #AP_URL]
+	mov	x0, x21
 	bl	mkreq
 	cbz	x0, Lapi_free
 	mov	x19, x0
@@ -2221,8 +2121,6 @@ Lapi_try:
 	subs	w25, w25, #1
 	b.ne	Lapi_try
 Lapi_free:
-	ldr	x0, [sp, #AP_URL]
-	bl	_free
 	ldr	x0, [sp, #AP_BODY]
 	bl	_free
 	mov	w0, w22
@@ -2755,7 +2653,7 @@ frame_rect:
 	.equ OP_JMP,	14
 	.equ OP_IMM,	17
 	.equ OP_MSGR,	64
-	.equ OP_LDX,	74
+	.equ OP_LDX,	68
 	.equ OP_SL,	23
 ui_run:
 	mov	x9, x0
@@ -2975,15 +2873,8 @@ Lop_lea:
 	adr	x20, Lvm_base
 	add	x20, x20, x10
 	b	Lvm_op
-Lop_native0:
-	ldrsh	x10, [x19], #2            ; the same with no kinds
-	adr	x24, Lvm_base
-	add	x24, x24, x10
-	adr	x21, Lk_short + 6
-	mov	x22, #0
-	b	Lvm_fixed
 Lop_native:
-	ldrsh	x10, [x19], #2            ; a function here, in bytes from Lvm_base
+	ldrsw	x10, [x19], #4            ; a function here, in bytes from Lvm_base
 	adr	x24, Lvm_base
 	add	x24, x24, x10
 Lop_call:
@@ -3000,7 +2891,7 @@ Lop_item:
 	adr	x21, Lk_item
 	b	Lvm_recv
 Lop_msgk:
-	adr	x21, Lk_short - 2 * OP_MSGR ; short kinds
+	adr	x21, Lk_short - 2 * OP_MSGR ; kinds "=", "I", "O" or none
 	add	x21, x21, x9, lsl #1
 	b	1f
 Lop_msg:
@@ -3112,14 +3003,10 @@ Lk_field:
 	ldrh	w9, [x19], #2             ; a B field's value
 	ldr	x0, [x27, x9]
 	b	Lvm_i
-Lk_near:
-	ldrsh	x9, [x19], #2             ; a function here, two bytes off
-	adr	x0, Lvm_base
-	b	1f
 Lk_code:
-	ldrh	w9, [x19], #2             ; data here, two bytes past Ldbase
-	ADDR	x0, Ldbase
-1:	add	x0, x0, x9
+	ldrsw	x9, [x19], #4             ; a function here
+	adr	x0, Lvm_base
+	add	x0, x0, x9
 	b	Lvm_i
 Lk_ldbl:
 	ldrb	w9, [x19], #1             ; a local: a double (Z) or a float (W)
@@ -3219,7 +3106,7 @@ Lk_table:
 	KIND	Lk_dbl                    ; D
 	KIND	Lk_field                  ; E
 	KIND	Lk_ext                    ; F
-	KIND	Lk_near                   ; G
+	KIND	Lk_skip
 	KIND	Lk_half                   ; H
 	KIND	Lk_byte                   ; I
 	KIND	Lk_sbyte                  ; J
@@ -3267,17 +3154,16 @@ Lop_table:
 	OP	Lop_imm, 6                ; 17 IMM, 18 ADDI, 19 EQ, 20 LT, 21 BIT, 22 SHL
 	OP	Lop_local, 40             ; 23 SL, 31 GL, 39 EQL, 47 ADDL, 55 SUBL, of a-h
 	OP	Lop_slotc                 ; 63 EQS
-	OP	Lop_msgk, 10              ; 64-73: MSG with kinds "=", "I", "O", none, "S", "^", "D", "b", ">", "N"
-	OP	Lop_mem, 11               ; 74 LDX, 75 LDW, 76 LDB at current + offset, 77 ADDH, 78 MULH, 79 DIVH, 80 ANDH, 81 LEAB, 82 LDBE, 83 STX, 84 STW into a local + offset
-	OP	Lop_wfield, 2             ; 85 LDEW, 86 STEW
-	OP	Lop_lea                   ; 87 LEA
-	OP	Lop_fls, 2                ; 88 FL, 89 FS
-	OP	Lop_fk                    ; 90 FK
-	OP	Lop_fi, 2                 ; 91 FI, 92 FT
-	OP	Lop_fop, 2                ; 93 FOP, 94 FOPK
-	OP	Lop_native0               ; 95 NCALL with no kinds
-Lk_short:	.ascii	"=\0I\0O\0\0\0S\0^\0D\0b\0>\0N\0"
-Lk_method:	.asciz	"VYGT"                    ; class_addMethod(class, sel, imp, types)
+	OP	Lop_msgk, 4               ; 64-67: MSG with kinds "=", "I", "O", none
+	OP	Lop_mem, 11               ; 68 LDX, 69 LDW, 70 LDB at current + offset, 71 ADDH, 72 MULH, 73 DIVH, 74 ANDH, 75 LEAB, 76 LDBE, 77 STX, 78 STW into a local + offset
+	OP	Lop_wfield, 2             ; 79 LDEW, 80 STEW
+	OP	Lop_lea                   ; 81 LEA
+	OP	Lop_fls, 2                ; 82 FL, 83 FS
+	OP	Lop_fk                    ; 84 FK
+	OP	Lop_fi, 2                 ; 85 FI, 86 FT
+	OP	Lop_fop, 2                ; 87 FOP, 88 FOPK
+Lk_short:	.ascii	"=\0I\0O\0\0\0"
+Lk_method:	.asciz	"VYPT"                    ; class_addMethod(class, sel, imp, types)
 Lk_item:	.asciz	"=SYS"                      ; addItemWithTitle:action:keyEquivalent:
 Lk_action:	.asciz	"v@:@"
 	.p2align 2
@@ -3372,9 +3258,9 @@ Lp_art:
 	SL	5
 	CALL	F_memcpy, "fBc"
 	.short	B_UIART
-	CALL	F_dispatch_async_f, "OeG"
+	CALL	F_dispatch_async_f, "OeP"
 	.byte	G_WORKQ >> 3
-	.short	art_fetch - Lvm_base
+	.long	art_fetch - Lvm_base
 	OP_END
 	HERE	Lp_art_hide
 	NCALL	art_show, "II"
@@ -3399,8 +3285,8 @@ Lp_fetch:
 	NCALL	fetch, "cV"
 	HERE	Lp_fetch_done
 	CALL	F_objc_autoreleasePoolPop, "b"
-	NCALL	post_main, "Ga"
-	.short	art_apply - Lvm_base
+	NCALL	post_main, "Pa"
+	.long	art_apply - Lvm_base
 	OP_END
 	.popsection
 
@@ -3539,12 +3425,6 @@ Lp_lstage:
 	NCALL	center_box, "HHV"
 	.short	URL_W, URL_H
 	NCALL	pic_layout
-	IMM	0                         ; the position bar, redrawn for its new width
-	STO	G_DRAWN
-	LD	G_LTDUR
-	SL	1
-	LD	G_SHOWPOS
-	NCALL	show_time, "Vb"
 	OP_END
 	.popsection
 
@@ -3776,15 +3656,6 @@ bar_show:
 	ldr	w9, [x28, #G_BARHID]
 	cbz	w9, Lbs_ret
 	str	wzr, [x28, #G_BARHID]
-	FRAME	0
-	ldr	x0, [x28, #G_SHOWPOS]     ; what was not drawn while it was away
-	ldr	x1, [x28, #G_LTDUR]
-	bl	show_time
-	ldr	x0, [x28, #G_VOL]
-	ldr	w1, [x28, #G_VOLPCT]
-	mov	w2, #100
-	bl	bar_draw
-	ldp	x29, x30, [sp], #16
 	fmov	d0, #1.0
 ; bar_alpha(alpha) — fade the control bar to an opacity.
 bar_alpha:
@@ -3886,6 +3757,8 @@ Lp_refresh:
 	MSG	S_setEnabled_, "e"
 	LD	G_FWD
 	MSG	S_setEnabled_, "e"
+	LD	G_POS
+	MSG	S_setEnabled_, "e"
 	LW	G_SEEKDRAG
 	JNZ	Lp_refresh_volume         ; the user is dragging it
 	LD	G_SEEKH
@@ -3896,8 +3769,6 @@ Lp_refresh:
 	JNZ	Lp_refresh_volume         ; a seek is still settling
 	NCALL	show_time, "bf"
 	HERE	Lp_refresh_volume
-	LW	G_BARHID                  ; away: drawn as it comes back
-	JNZ	Lp_refresh_mute
 	LW	G_VOLDRAG
 	JNZ	Lp_refresh_mute
 	LD	G_VOLH
@@ -3907,8 +3778,8 @@ Lp_refresh:
 	LT	0
 	JNZ	Lp_refresh_mute           ; a volume change is still settling
 	LD	G_VOL
-	NCALL	bar_draw, "VcI"
-	.byte	100
+	MSG	S_setDoubleValue_, "U"
+	.byte	2
 	HERE	Lp_refresh_mute
 	LW	G_MUTESHOWN
 	EQL	3
@@ -3925,10 +3796,7 @@ Lp_refresh:
 	LD	G_MUTE
 	MSG	S_setImage_, "e"
 	HERE	Lp_refresh_status
-	LW	G_BARHID
-	JNZ	Lp_refresh_stage
 	NCALL	render_status
-	HERE	Lp_refresh_stage
 	NCALL	stage_update
 	OP_END
 	.popsection
@@ -3958,76 +3826,9 @@ Lft_print:
 	bl	_snprintf
 	b	Lret1
 
-; glyph_row(layers, text) — the text in a time's 8 glyph layers, each showing its glyph's part of the glyph picture (B_GLX), at the half points nearest its place there; a time left ("-...") ends at the row's right.
-glyph_row:
-	FRAME	3, 0, 1
-	stp	d8, d9, [sp, #-16]!
-	stp	d10, d11, [sp, #-16]!
-	BADDR	x21, B_GLX
-	ldr	d11, [x21, #(12 * 8)]
-	frintp	d11, d11                  ; the picture's width
-	fcmp	d11, #0.0
-	b.eq	1f                        ; none measured: nothing to cut
-	movi	d8, #0                    ; where the next glyph goes
-	ldrb	w9, [x20]
-	cmp	w9, #'-'
-	cset	w22, eq                   ; flush right: laid out again from TIME_W less its width
-Lgr_row:
-	mov	x23, #0
-	mov	x24, x20
-Lgr_next:
-	ldrb	w9, [x24]
-	cmp	w9, #0
-	cinc	x24, x24, ne              ; on, but not past the end
-	subs	w10, w9, #'0'             ; a digit, or ':' as 10
-	mov	w11, #11                  ; or '-'
-	csel	w10, w10, w11, ge
-	add	x10, x21, x10, lsl #3
-	ldp	d0, d1, [x10]
-	fsub	d9, d1, d0                ; its width
-	fmov	d2, xzr
-	cmp	w9, #0
-	fcsel	d9, d9, d2, ne            ; none past the end
-	fsub	d2, d8, d0
-	fadd	d2, d2, d2
-	frintn	d2, d2
-	fmov	d3, #0.5
-	fmul	d2, d2, d3
-	fadd	d10, d2, d0               ; its place, on the picture's pixels
-	fadd	d8, d8, d9
-	fdiv	d0, d0, d11               ; its part of the picture
-	fmov	d1, xzr
-	fdiv	d2, d9, d11
-	fmov	d3, #1.0
-	ldr	x0, [x19, x23, lsl #3]
-	SEND	S_setContentsRect_
-	fmov	d0, d10
-	fmov	d1, xzr
-	fmov	d2, d9
-	.if	LABEL_H != 16
-	.error	"glyph_row's layers are LABEL_H high"
-	.endif
-	fmov	d3, #16.0
-	ldr	x0, [x19, x23, lsl #3]
-	SEND	S_setFrame_
-	add	x23, x23, #1
-	cmp	x23, #8
-	b.lo	Lgr_next
-	cbz	w22, 1f
-	mov	w22, #0
-	mov	w9, #TIME_W
-	ucvtf	d0, w9
-	fsub	d8, d0, d8
-	b	Lgr_row
-1:	ldp	d10, d11, [sp], #16
-	ldp	d8, d9, [sp], #16
-	b	Lret3
-
-; show_time(pos, dur) — position bar, elapsed time and time left.
+; show_time(pos, dur) — position slider, elapsed time and time left.
 show_time:
-	VM	Lp_time
-	.pushsection __DATA,__data
-Lp_time:
+	VMT
 	GL	0
 	STO	G_SHOWPOS
 	IMM	1                         ; the range: the duration, 1 when unknown
@@ -4038,24 +3839,15 @@ Lp_time:
 	GL	1
 	SL	2
 	HERE	Lp_time_range
+	LD	G_POS
+	MSG	S_setMaxValue_, "U"
+	.byte	2
 	LD	G_WIN
 	MSG	S_occlusionState, "="
 	BIT	1
-	JZ	Lp_time_away
-	LW	G_BARHID
-	JZ	Lp_time_seen
-	HERE	Lp_time_away
-	OP_END                            ; out of sight, or the bar away: the position and times are not redrawn
+	JNZ	Lp_time_seen
+	OP_END                            ; out of sight: the position and times are not redrawn
 	HERE	Lp_time_seen
-	GL	0                         ; as drawn already: nothing to redraw
-	SHL	16
-	ADDL	1
-	SL	4
-	LD	G_DRAWN
-	SUBL	4
-	JZ	Lp_time_away
-	GL	4
-	STO	G_DRAWN
 	GL	0                         ; within the track
 	SL	3
 	SUBL	1
@@ -4071,7 +3863,8 @@ Lp_time:
 	SL	3
 	HERE	Lp_time_known
 	LD	G_POS
-	NCALL	bar_draw, "Vdc"
+	MSG	S_setDoubleValue_, "U"
+	.byte	3
 	LEAB	B_TIMEB
 	SL	4
 	NCALL	fmt_time, "aeI"
@@ -4085,8 +3878,8 @@ Lp_time:
 	IMM	0
 	STW	4, 0
 	HERE	Lp_time_now
-	NCALL	glyph_row, "Be"
-	.short	B_GLL
+	LD	G_CUR
+	NCALL	setstr, "Ve"
 	IMM	0
 	STW	4, 0
 	GL	1
@@ -4103,10 +3896,10 @@ Lp_time:
 	NCALL	fmt_time, "fgI"
 	.byte	0
 	HERE	Lp_time_left
-	NCALL	glyph_row, "Be"
-	.short	B_GLL + 64
+	LD	G_DUR
+	NCALL	setstr, "Ve"
 	OP_END
-	.popsection
+	.p2align 2
 
 ; ui_play_done(job) — end loading, report the result, free the job.
 	VMENTRY	ui_play_done, Lp_done
@@ -4228,8 +4021,8 @@ Lp_lplay:
 	SL	2
 	CALL	F_strdup, "=c"
 	STX	5, YT_A
-	NCALL	eng_cmd, "Gf"
-	.short	eng_tube - Lvm_base
+	NCALL	eng_cmd, "Pf"
+	.long	eng_tube - Lvm_base
 	NCALL	local_poll
 	HERE	Lp_lplay_none
 	OP_END
@@ -4268,12 +4061,12 @@ Lp_lplay:
 	GL	3
 	EQ	KIND_FILE
 	JZ	Lp_lplay_web
-	NCALL	eng_cmd, "Gf"
-	.short	eng_open - Lvm_base
+	NCALL	eng_cmd, "Pf"
+	.long	eng_open - Lvm_base
 	JMP	Lp_lplay_poll
 	HERE	Lp_lplay_web
-	NCALL	eng_cmd, "Gf"
-	.short	eng_web - Lvm_base
+	NCALL	eng_cmd, "Pf"
+	.long	eng_web - Lvm_base
 	HERE	Lp_lplay_poll
 	NCALL	local_poll
 	HERE	Lp_lplay_end
@@ -4500,8 +4293,8 @@ Lp_toggle:
 	.byte	0
 	OP_END
 	HERE	Lp_toggle_rate
-	NCALL	eng_cmd, "GI"
-	.short	eng_play - Lvm_base
+	NCALL	eng_cmd, "PI"
+	.long	eng_rate - Lvm_base
 	.byte	0
 	NCALL	local_poll
 	OP_END
@@ -4604,9 +4397,7 @@ vol_apply:
 
 ; vol_to(player) — an AVPlayer or the sound renderer takes G's volume and mute.
 vol_to:
-	VM	Lp_volto
-	.pushsection __DATA,__data
-Lp_volto:
+	VMT
 	LW	G_VOLPCT
 	FI
 	FOPK	3, 1600
@@ -4619,7 +4410,7 @@ Lp_volto:
 	GL	0
 	MSG	S_setMuted_, "b"
 	OP_END
-	.popsection
+	.p2align 2
 
 ; air_prepare(self, _cmd, picker) — AirPlay's routes are shown: the dormant AVPlayer gets This Mac's media, paused, so that a picked TV takes it.
 	VMENTRY	air_prepare, Lp_air
@@ -4907,12 +4698,10 @@ st_pump:
 	orr	w9, w9, w10
 	orr	w9, w9, w11
 	cbnz	w9, Lret2
-	bl	now_ms
-	mov	x20, x0                   ; the clock, for ahead_ms
-	add	x22, x19, #ST_TR
+	add	x20, x19, #ST_TR
 	mov	w21, #2
 Lpu_full:
-	ldr	x9, [x22], #8
+	ldr	x9, [x20], #8
 	cbz	x9, 1f
 	ldr	w10, [x28, #G_AONLY]
 	ldr	x11, [x27, #E_VT]
@@ -4922,20 +4711,15 @@ Lpu_full:
 	ldp	w10, w11, [x9, #TR_FH]
 	sub	w10, w11, w10
 	ldr	w11, [x9, #TR_KIND]
-	cmp	w11, #'a'
-	b.eq	Lpu_sound
 	mov	w12, #AHEAD_V
 	cmp	w11, #'v'
-	mov	w13, #AHEAD_S
+	mov	w13, #AHEAD_A
 	csel	w12, w12, w13, eq
+	cmp	w11, #'s'
+	mov	w13, #AHEAD_S
+	csel	w12, w13, w12, eq
 	cmp	w10, w12
 	b.hs	Lret2                     ; enough ahead
-	b	1f
-Lpu_sound:
-	mov	x0, x9
-	bl	ahead_ms
-	cmp	x0, #(AHEAD_A >> 12), lsl #12
-	b.ge	Lret2
 1:	subs	w21, w21, #1
 	b.ne	Lpu_full
 	ldr	w9, [x19, #ST_KIND]
@@ -5714,7 +5498,7 @@ st_keep:
 
 ; emit(stream) — every sample whose bytes are all in goes to its track's queue: listed by moof boxes, or a whole file's cursors in file order.
 emit:
-	FRAME	2, 8 << ABATCH
+	FRAME	2
 	mov	x20, x0
 	ldr	w9, [x20, #ST_FRAG]
 	cbz	w9, Lem_whole
@@ -5753,59 +5537,8 @@ Lem_sample:
 	add	x4, x3, x9
 	ubfx	w6, w6, #16, #1
 	eor	w6, w6, #1                ; sample_is_non_sync_sample clear: sync
-	mov	x8, sp                    ; sound: the samples right after it, all in and as long, join it, up to 2^ABATCH (sizes on the stack)
-	str	x2, [x8]
-	mov	w7, #1
-	ldr	w9, [x19, #TR_KIND]
-	cmp	w9, #'a'
-	b.ne	Lem_make
-Lem_join:
-	ldp	w9, w10, [x19, #TR_FN]
-	cmp	w10, w9
-	b.hs	Lem_make
-	tbnz	w7, #ABATCH, Lem_make
-	ldr	x11, [x19, #TR_FL]
-	mov	w13, #24
-	umaddl	x11, w10, w13, x11
-	ldr	x13, [x11]
-	ldp	w16, w17, [x11, #8]       ; its size and duration
-	add	x9, x12, x2
-	cmp	x13, x9
-	ccmp	w17, w5, #0, eq
-	b.ne	Lem_make
-	add	x9, x9, x16
-	sub	x9, x9, x14
-	cmp	x9, x15
-	b.hi	Lem_part
-	str	x16, [x8, w7, uxtw #3]
-	add	x2, x2, x16
-	add	w7, w7, #1
-	add	w10, w10, #1
-	str	w10, [x19, #TR_FI]
-	ldr	x9, [x19, #TR_FDTS]
-	add	x9, x9, x5
-	str	x9, [x19, #TR_FDTS]
-	b	Lem_join
-Lem_part:
-	ldr	x9, [x19, #TR_LAST]       ; not all in: with AWAIT_MS made past the clock, the buffer waits to be whole
-	mov	x13, #1000
-	mul	x9, x9, x13
-	ldr	w13, [x19, #TR_TS]
-	sdiv	x9, x9, x13
-	ldr	w13, [x27, #E_NOWMS]
-	sub	x9, x9, x13
-	cmp	x9, #AWAIT_MS
-	b.lt	Lem_make
-	ldr	w9, [x19, #TR_FI]         ; its samples wait for the rest
-	sub	w9, w9, w7
-	str	w9, [x19, #TR_FI]
-	ldr	x9, [x19, #TR_FDTS]
-	msub	x9, x7, x5, x9
-	str	x9, [x19, #TR_FDTS]
-	b	Lem_next
-Lem_make:
 	ldr	x0, [x20, #ST_ARBB]
-	bl	Lmk_samples
+	bl	mk_sample
 	cbz	x0, Lem_sample
 	bl	q_push
 	b	Lem_sample
@@ -6628,14 +6361,14 @@ Lp_hpick:
 	LDE	E_MASTER
 	SL	0                         ; a: the line
 	CALL	F_strstr, "=aP"
-	.short	Ls_aac - Ldbase
+	.long	Ls_aac - Lvm_base
 	SL	6                         ; g: the master lists AAC-LC
 	HERE	Lp_hpk_line
 	GL	0
 	LDB	0
 	JZ	Lp_hpk_done
 	CALL	F_strncmp, ">aPI"
-	.short	Ls_xstream - Ldbase
+	.long	Ls_xstream - Lvm_base
 	.byte	18
 	JNZ	Lp_hpk_next
 	GL	6
@@ -6644,7 +6377,7 @@ Lp_hpick:
 	SUBL	0
 	SL	7
 	CALL	F_strnstr, "=aPh"
-	.short	Ls_aac - Ldbase
+	.long	Ls_aac - Lvm_base
 	JZ	Lp_hpk_next
 	HERE	Lp_hpk_any
 	NCALL	attr_num, "=aC"
@@ -6736,7 +6469,7 @@ Lp_hpick:
 	SL	0
 	HERE	Lp_hpk_media
 	NCALL	media_next, "?aP"
-	.short	Ls_taudio - Ldbase
+	.long	Ls_taudio - Lvm_base
 	JZ	Lp_hpk_found
 	SL	5                         ; f: the line, b: its end
 	GL	7
@@ -6744,7 +6477,7 @@ Lp_hpick:
 	LDE	B_MNEXT
 	SL	0
 	NCALL	attr, "?fbP"
-	.short	Ls_group - Ldbase
+	.long	Ls_group - Lvm_base
 	JZ	Lp_hpk_media
 	SL	6
 	GL	7
@@ -6754,7 +6487,7 @@ Lp_hpick:
 	CALL	F_strncmp, ">gcd"
 	JNZ	Lp_hpk_media
 	NCALL	attr, "=fbP"
-	.short	Ls_uri - Ldbase
+	.long	Ls_uri - Lvm_base
 	JZ	Lp_hpk_media              ; in the variant's own segments
 	GL	4
 	JNZ	Lp_hpk_def
@@ -6775,7 +6508,7 @@ Lp_hpick:
 	NCALL	line_end, "=V"
 	SL	7
 	NCALL	attr, "?ehP"
-	.short	Ls_uri - Ldbase
+	.long	Ls_uri - Lvm_base
 	SL	6
 	LDE	E_MURL
 	NCALL	url_join, "=Vgh"
@@ -8932,7 +8665,7 @@ afs_feed:
 	udiv	x23, x9, x10
 	add	x9, x22, x23
 	str	x9, [x19, #TR_APTS]
-	str	x9, [x19, #TR_LAST]
+	str	x22, [x19, #TR_LAST]
 	ldr	x9, [x19, #TR_TGT]
 	subs	x1, x9, x22
 	b.le	2f
@@ -9198,8 +8931,8 @@ Lp_init:
 	.byte	4, 0
 	.short	B_VTW + 48
 	NCALL	vt_warm, "V"
-	NCALL	post_main, "GI"
-	.short	ui_attach - Lvm_base
+	NCALL	post_main, "PI"
+	.long	ui_attach - Lvm_base
 	.byte	0
 	OP_END
 Lvt_sps:	.byte	0x67, 0x42, 0xc0, 0x0a, 0xd9, 0x07, 0x3c, 0xc0, 0x44, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0x08, 0x3c, 0x48, 0x99, 0x20
@@ -9361,7 +9094,22 @@ Leo_read:
 	bl	mp4_open
 	cbnz	w0, 1f
 	bl	afs_file                  ; not MP4: a sound file AudioFileStream reads
-	cbz	w0, Leo_fail
+	cbnz	w0, 1f
+	ldr	w9, [x27, #E_M4A]
+	cmp	w9, #1
+	b.ne	Leo_fail
+	BADDR	x20, E_TR                 ; an M4A it could not read (its index last): its track goes, the boxes are read instead
+	ldr	x0, [x20, #TR_AFS]
+	CALLF	AudioFileStreamClose
+	ldr	x0, [x20, #TR_FQ]
+	bl	_free
+	mov	x0, x20
+	mov	x1, #TR_SIZE
+	bl	_bzero
+	mov	w9, #2
+	str	w9, [x27, #E_M4A]
+	str	wzr, [x27, #E_NTR]
+	b	Leo_read
 1:	ldr	w0, [x19]
 	str	w0, [x27, #E_GEN]
 	ldr	x9, [x27, #E_VT]
@@ -9400,8 +9148,8 @@ Lp_fallback:
 	JZ	Lp_fallback_end
 	IMM	1
 	SW	G_MODE
-	NCALL	eng_cmd, "GI"
-	.short	eng_close - Lvm_base
+	NCALL	eng_cmd, "PI"
+	.long	eng_close - Lvm_base
 	.byte	0
 	LDE	B_LTPATH
 	ANDH	255
@@ -9449,12 +9197,24 @@ mp4_open:
 	cmp	w9, w10
 	cset	w9, ne
 	str	w9, [x27, #E_ISO]
+	ldr	w9, [x0]
+	TYPE	w10, 'M','4','A',' '
+	ldr	w11, [x27, #E_M4A]
+	cmp	w9, w10
+	ccmp	w11, #0, #0, eq
+	b.eq	Lmo_m4a
 Lmo_moov:
 	mov	x0, x19
 	mov	x1, x20
 	TYPE	w2, 'm','o','o','v'
 	bl	box_find
 	cbz	x0, Lnil4
+	b	Lmo_go
+Lmo_m4a:
+	mov	w9, #1                    ; sound alone: AudioFileStream packs its packets (one per sample costs the renderer more)
+	str	w9, [x27, #E_M4A]
+	b	Lnil4
+Lmo_go:
 	mov	x21, x0
 	mov	x22, x1
 	TYPE	w2, 'm','v','h','d'
@@ -9508,9 +9268,6 @@ Lmo_each:
 2:	add	x9, x9, #TR_SIZE
 	cmp	x9, x10
 	b.lo	Lmo_each
-	mov	x0, x21
-	mov	x1, x22
-	bl	Lm4a_prime
 	ldr	x9, [x27, #E_VT]
 	ldr	x0, [x27, #E_AT]
 	cbnz	x9, 3f
@@ -9524,78 +9281,6 @@ Lmo_each:
 	cmp	x9, #0
 	cset	w0, ne
 	b	Lret4
-
-; m4a_prime(moov, end) — sound without an edit list: an iTunSMPB tag's encoder priming is cut from its start instead, if under a second and in frames of its time scale.
-Lm4a_prime:
-	VM	Lp_prime
-	.pushsection __DATA,__data
-Lp_prime:
-	LDE	E_AT
-	SL	2                         ; c: the sound track
-	JZ	Lp_prime_end
-	LDX	TR_SHIFT
-	JNZ	Lp_prime_end              ; an edit list's start
-	NCALL	box_find, "?abX"          ; the user data, to its end in h
-	.long	'u' | 'd' << 8 | 't' << 16 | 'a' << 24
-	JZ	Lp_prime_end
-	SL	0                         ; a: where the tag is looked for, in its first 4 KB (an artwork past them is not read)
-	ADDH	4096
-	SL	6
-	GL	7
-	ADDI	-42                       ; room for the tag's name, its data box's header, its text up to the priming's 8 hex digits
-	SL	7
-	SUBL	6
-	LT	0
-	JNZ	Lp_prime_from
-	GL	6
-	SL	7
-	HERE	Lp_prime_from
-	GL	0
-	ADDI	-1
-	SL	0
-	HERE	Lp_prime_scan
-	GL	0
-	ADDI	1
-	SL	0
-	SUBL	7
-	LT	1
-	JZ	Lp_prime_end
-	GL	0
-	CALL	F_memcmp, "=aPI"
-	.short	Ls_smpb - Ldbase
-	.byte	8
-	JNZ	Lp_prime_scan
-	GL	0
-	LDB	33
-	EQ	' '
-	JZ	Lp_prime_end              ; " 00000000 00000840 ...": the second field is the priming
-	GL	0
-	ADDI	34
-	SL	4
-	CALL	F_strtol, "=eII"
-	.byte	0, 16
-	SL	4                         ; e: the priming, frames
-	GL	2
-	LDW	TR_TS
-	SL	5                         ; f: the time scale
-	GL	4
-	SUBL	5
-	LT	0
-	JZ	Lp_prime_end              ; under a second
-	GL	2
-	LDX	TR_STSD
-	LDBE	32
-	SL	6                         ; g: the sample rate, 16.16
-	GL	5
-	SHL	16
-	EQL	6
-	JZ	Lp_prime_end              ; frames of the time scale
-	GL	4
-	STX	2, TR_SHIFT
-	HERE	Lp_prime_end
-	OP_END
-Ls_smpb:	.ascii	"iTunSMPB"
-	.popsection
 
 ; snd_fd(track) -> x0 = its sound format, from its sample description the first time; 0 if CoreMedia cannot read it. A file's is made as it first plays: the first one costs ~12 ms, after the picture's first samples.
 snd_fd:
@@ -10131,11 +9816,6 @@ Lcs_step:
 	bl	cur_step
 	bl	cur_sync
 	cbz	w0, Lcs_step
-	bl	cur_cts                   ; a sync sample shown after the target is no start: its leading pictures need the one before
-	ldr	x9, [x19, #TR_DTS]
-	add	x9, x9, x0
-	cmp	x9, x20
-	b.gt	Lcs_step
 	bl	snap
 	b	Lcs_step
 Lcs_done:
@@ -10150,17 +9830,12 @@ setflag:
 	JUMPF	CFDictionarySetValue
 
 ; mk_sample(bb, offset, size, dts, pts, duration, sync) -> a ready CMSampleBuffer (retained) over bb's bytes, marked for the track's target; 0 if it could not be made (x19 = track).
-; Lmk_samples: the same for w7 samples in a row, as long each, their sizes at x8 when more than one.
 	.equ MS_TIME,	16                ; CMSampleTimingInfo: duration, presentation and decode times
 	.equ MS_LEN,	88
 	.equ MS_BB,	96
 	.equ MS_SB,	104
 mk_sample:
-	mov	w7, #1
-Lmk_samples:
-	FRAME	4, 112
-	mov	w25, w7
-	mov	x26, x8
+	FRAME	3, 112
 	ldr	w9, [x19, #TR_KIND]       ; CC1 shown: a picture's SEI carries its captions
 	ldr	x10, [x27, #E_SUBT]
 	ldr	x11, [x27, #E_CCT]
@@ -10182,8 +9857,7 @@ Lmk_samples:
 	ldp	x2, x3, [sp, #32]
 	ldp	x4, x5, [sp, #48]
 	ldr	x6, [sp, #64]
-1:	madd	x9, x25, x5, x4
-	str	x9, [x19, #TR_LAST]
+1:	str	x4, [x19, #TR_LAST]
 	mov	x20, x4
 	mov	x21, x5
 	mov	w22, w6
@@ -10196,7 +9870,7 @@ Lmk_samples:
 	mov	w4, #0
 	add	x5, sp, #MS_BB
 	CALLF	CMBlockBufferCreateWithBufferReference
-	cbnz	w0, Lnil4
+	cbnz	w0, Lms_none
 	ldr	w24, [x19, #TR_TS]
 	orr	x24, x24, #(1 << 32)      ; timescale, kCMTimeFlags_Valid
 	stp	x21, x24, [sp, #MS_TIME]
@@ -10210,18 +9884,16 @@ Lmk_samples:
 	mov	x0, #0
 	ldr	x1, [sp, #MS_BB]
 	ldr	x2, [x19, #TR_FD]
-	mov	x3, x25
+	mov	x3, #1
 	mov	x4, #1
 	add	x5, sp, #MS_TIME
-	mov	x6, x25
+	mov	x6, #1
 	add	x7, sp, #MS_LEN
-	cmp	w25, #1
-	csel	x7, x7, x26, eq
 	CALLF	CMSampleBufferCreateReady
 	mov	w23, w0
 	ldr	x0, [sp, #MS_BB]
 	bl	_CFRelease                ; the sample keeps it
-	cbnz	w23, Lnil4
+	cbnz	w23, Lms_none
 	ldr	x23, [sp, #MS_SB]
 	mov	x0, x23
 	mov	w1, #1
@@ -10246,7 +9918,7 @@ Lmk_samples:
 	cbnz	w0, 2f
 	mov	x0, x23
 	bl	_CFRelease
-	b	Lnil4
+	b	Lms_none
 2:	ldr	w9, [x27, #E_NET]         ; a stream's first picture after a seek is shown at once, while the rest comes
 	ldr	w10, [x27, #E_PREV]
 	cmp	w9, #0
@@ -10277,11 +9949,14 @@ Lms_shown:
 Lms_trim:
 	mov	x0, x23                   ; sound before it: decoded, cut
 	mov	x1, x9
-	mul	x2, x21, x25
+	mov	x2, x21
 	bl	trim
 Lms_ok:
 	mov	x0, x23
-	b	Lret4
+	b	Lret3
+Lms_none:
+	mov	x0, #0
+	b	Lret3
 
 ; pic_ref(sample) -> w0 = 0 for an H.264 or HEVC picture no other refers to (nal_ref_idc 0, or a sub-layer non-reference type), else 1 (x19 = track).
 pic_ref:
@@ -10343,68 +10018,36 @@ Lpr_end:
 	b	Lret1
 
 ; cur_sample(bb, base) -> the cursor's sample as a CMSampleBuffer over bb (holding the file from offset base), then the cursor moves on; 0 at the end (x19 = track).
-; Sound from the mapped file takes in the samples right after it that last as long, up to 2^ABATCH.
 cur_sample:
-	FRAME	4, 8 << ABATCH
+	FRAME	4
 	mov	x25, x0
 	mov	x26, x1
 	ldr	w9, [x19, #TR_I]
 	ldr	w10, [x19, #TR_N]
 	cmp	w9, w10
 	b.hs	Lnil4
+	bl	cur_size
+	mov	x20, x0
 	bl	cur_delta
 	mov	x21, x0
 	bl	cur_cts
 	mov	x22, x0
 	bl	cur_sync
 	mov	w23, w0
-	ldr	x9, [x19, #TR_OFF]
-	sub	x26, x9, x26              ; where it starts in bb
-	mov	x20, #0                   ; the bytes, their sizes on the stack
-	mov	x24, sp
-	bl	cur_size
-Lcs_add:
-	str	x0, [x24], #8
-	add	x20, x20, x0
-	bl	cur_step
-	ldr	w9, [x19, #TR_KIND]
-	ldr	x10, [x27, #E_PARENT]
-	cmp	w9, #'a'
-	ccmp	x25, x10, #0, eq
-	b.ne	Lcs_make
-	ldr	w9, [x19, #TR_I]
-	ldr	w10, [x19, #TR_N]
-	cmp	w9, w10
-	b.hs	Lcs_make
-	bl	cur_delta
-	cmp	x0, x21
-	b.ne	Lcs_make
-	bl	cur_size
-	ldr	x9, [x19, #TR_OFF]
-	add	x10, x26, x20
-	cmp	x9, x10                   ; right after
-	add	x9, x9, x0
-	ldr	x10, [x27, #E_LEN]
-	ccmp	x9, x10, #2, eq           ; and in the file
-	b.hi	Lcs_make
-	add	x9, sp, #(8 << ABATCH)
-	cmp	x24, x9
-	b.lo	Lcs_add                   ; room
-Lcs_make:
-	mov	x8, sp
-	sub	x7, x24, x8
-	lsr	x7, x7, #3                ; how many
+	ldr	x1, [x19, #TR_OFF]
+	sub	x1, x1, x26
 	mov	x0, x25
-	mov	x1, x26
 	mov	x2, x20
 	ldr	x3, [x19, #TR_DTS]
-	msub	x3, x7, x21, x3           ; the first one's decode time
 	ldr	x9, [x19, #TR_SHIFT]
-	sub	x3, x3, x9                ; after the edit
+	sub	x3, x3, x9                ; decode time, after the edit
 	add	x4, x3, x22
 	mov	x5, x21
 	mov	w6, w23
-	bl	Lmk_samples
+	bl	mk_sample
+	mov	x20, x0
+	bl	cur_step
+	mov	x0, x20
 	b	Lret4
 ; produce() -> the track's next sample (retained): from the mapped file, or from its stream's queue; 0 when there is none now (x19 = track).
 produce:
@@ -10416,18 +10059,13 @@ Lpd_file:
 	ldr	w10, [x19, #TR_N]
 	cmp	w9, w10
 	b.hs	Lpd_none
-	ldr	w9, [x19, #TR_KIND]       ; a picture at most LEAD_MS ahead of the clock (a seek's flush costs ~1 ms per queued sample), but freely from a resume to the next tick
+	ldr	w9, [x19, #TR_KIND]       ; a playing picture at most LEAD_MS ahead of the clock: a seek's flush costs ~1 ms per queued sample
 	ldr	w10, [x27, #E_SLOW]
 	cmp	w9, #'v'
 	ccmp	w10, #0, #0, eq
 	b.ne	1f
 	bl	now_ms
-	ldr	w11, [x28, #G_PLAYING]
-	mov	x12, #LEAD_MS
-	mov	x13, #PAUSE_LEAD_MS
-	cmp	w11, #0
-	csel	x12, x12, x13, ne
-	add	x0, x0, x12
+	add	x0, x0, #LEAD_MS
 	ldr	w9, [x19, #TR_TS]
 	mul	x0, x0, x9
 	mov	x9, #1000
@@ -10584,7 +10222,6 @@ trk_play:
 	SEND	S_stopRequestingMediaData
 	mov	x0, x20
 	SEND	S_flush
-	str	xzr, [x19, #TR_LAST]      ; nothing made past the clock now
 	ldr	w9, [x19, #TR_TS]
 	mul	x0, x22, x9
 	mov	x9, #1000
@@ -10614,8 +10251,6 @@ trk_play:
 	.pushsection __DATA,__data
 Lp_seek:
 	GL	0
-	STEW	E_NOWMS
-	GL	0
 	STE	E_TGTMS
 	IMM	0
 	STE	E_FIRSTMS
@@ -10635,14 +10270,14 @@ Lp_seek:
 	NCALL	hold_async, "a"
 	NCALL	trk_play, "bEPa"
 	.short	E_VR
-	.short	Lblk_v - Ldbase
+	.long	Lblk_v - Lvm_base
 	GL	2
 	JZ	Lp_seek_wait
 	LDE	E_AR                      ; the old sound stops now, the new comes after the first pictures
 	MSG	S_stopRequestingMediaData
-	CALL	F_dispatch_async_f, "OaG"
+	CALL	F_dispatch_async_f, "OaP"
 	.byte	G_MEDIAQ >> 3
-	.short	seek_sound - Lvm_base
+	.long	seek_sound - Lvm_base
 	JMP	Lp_seek_wait
 	HERE	Lp_seek_sound             ; no picture: the clock and the sound at once
 	NCALL	hold, "a"
@@ -10650,7 +10285,7 @@ Lp_seek:
 	JZ	Lp_seek_wait
 	NCALL	trk_play, "cEPa"
 	.short	E_AR
-	.short	Lblk_a - Ldbase
+	.long	Lblk_a - Lvm_base
 	HERE	Lp_seek_wait
 	NCALL	sub_seek, "a"
 	NCALL	await
@@ -10708,9 +10343,9 @@ Lp_holda:
 	SHL	48
 	ADDL	0
 	SL	3                         ; d: it with the moment
-	CALL	F_dispatch_async_f, "OdG"
+	CALL	F_dispatch_async_f, "OdP"
 	.byte	G_CLOCKQ >> 3
-	.short	hold_job - Lvm_base
+	.long	hold_job - Lvm_base
 	IMM	0
 	SL	1                         ; b: tries, ~30 ms of them at most
 	HERE	Lp_holda_wait
@@ -10750,7 +10385,7 @@ Lp_ssound:
 	JZ	Lp_ssound_end
 	NCALL	trk_play, "bEPa"
 	.short	E_AR
-	.short	Lblk_a - Ldbase
+	.long	Lblk_a - Lvm_base
 	HERE	Lp_ssound_end
 	OP_END
 	.popsection
@@ -10840,16 +10475,6 @@ Lew_go:
 	fcsel	s0, s0, s1, ne
 	SENDT	S_setRate_
 1:	ret
-
-; eng_play — play or pause: a resume feeds the picture at once (paused, it was held to its lead), and freely until the next tick.
-	ENTRY	eng_play
-	ldr	w9, [x28, #G_PLAYING]
-	str	w9, [x27, #E_SLOW]
-	FRAME	1
-	ldr	x19, [x27, #E_VT]
-	bl	trk_request
-	bl	Leng_rate
-	b	Lret1
 
 ; now_ms -> x0 = the clock, ms.
 now_ms:
@@ -11113,7 +10738,7 @@ Lp_subobs:
 	.long	30, 1
 	.quad	0
 	.byte	G_MEDIAQ >> 3
-	.short	Lblk_s - Ldbase
+	.long	Lblk_s - Lvm_base
 	MSG	S_retain, "="
 	STE	E_SUBOBS
 	OP_END
@@ -11131,9 +10756,7 @@ Lp_subobs:
 	.popsection
 
 ; sub_show(text) — the subtitle layer over the picture shows the text (released), centered near the bottom; 0 clears it.
-	VMENTRY	sub_show, Lp_subshow
-	.pushsection __DATA,__data
-Lp_subshow:
+	VMTENTRY	sub_show
 	LDE	B_SUBL
 	JNZ	Lp_subshow_made
 	CLS	CATextLayer
@@ -11214,7 +10837,7 @@ Lp_subshow:
 	GL	0
 	MSG	S_release
 	OP_END
-	.popsection
+	.p2align 2
 
 ; eng_vol — the sound renderer takes G's volume and mute.
 	ENTRY	eng_vol
@@ -11244,7 +10867,7 @@ Lp_eaonly:
 	LDE	E_VT
 	NCALL	trk_play, "VEPa"
 	.short	E_VR
-	.short	Lblk_v - Ldbase
+	.long	Lblk_v - Lvm_base
 	HERE	Lp_eaonly_end
 	OP_END
 	HERE	Lp_eaonly_net
@@ -11318,7 +10941,6 @@ Lp_eaonly:
 	b.ne	Lret2                     ; other media now: no more ticks
 	bl	now_ms
 	mov	x20, x0                   ; the clock, ms
-	str	w0, [x27, #E_NOWMS]
 	mov	x21, #0x7fffffffffffffff
 	ldr	w9, [x28, #G_AONLY]
 	cbnz	w9, 1f
@@ -11353,8 +10975,8 @@ Lnt_dry:
 Lnt_again:
 	ldr	w9, [x28, #G_PLAYING]
 	cmp	w9, #0
-	cset	w1, eq                    ; paused: a tick a second
-	str	wzr, [x27, #E_SLOW]       ; a resume's free feeding ends
+	cset	w1, eq                    ; paused: a tick a second, the picture fed freely until a playing tick
+	str	w1, [x27, #E_SLOW]
 	add	w1, w1, w1, lsl #1
 	mov	w0, w19
 	bl	Ltick_shift
@@ -11363,7 +10985,7 @@ Lnt_again:
 	bl	trk_request
 	b	Lret2
 
-; tick_later(generation) — net_tick in a quarter second of media (Ltick_shift: shifted left by w1).
+; tick_later(generation) — net_tick in an eighth of a second (Ltick_shift: shifted left by w1).
 tick_later:
 	mov	w1, #0
 Ltick_shift:
@@ -11371,10 +10993,6 @@ Ltick_shift:
 	mov	w19, w0
 	mov	w9, #(TICK_NS & 0xffff)
 	movk	w9, #(TICK_NS >> 16), lsl #16
-	ucvtf	s0, w9
-	ldr	s1, [x28, #G_RATE]
-	fdiv	s0, s0, s1                ; the same media at any speed
-	fcvtzu	w9, s0
 	lsl	w1, w9, w1
 	mov	x0, #0
 	bl	_dispatch_time
@@ -11455,8 +11073,8 @@ Lp_tube:
 	NCALL	await                     ; the clock held at 0 until the picture is ready
 	LDEW	E_GEN
 	NCALL	tick_later, "V"
-	NCALL	post_main, "GI"
-	.short	ui_poll - Lvm_base
+	NCALL	post_main, "PI"
+	.long	ui_poll - Lvm_base
 	.byte	0
 	OP_END
 	.popsection
@@ -11490,8 +11108,8 @@ Lp_web:
 	NCALL	await
 	LDEW	E_GEN
 	NCALL	tick_later, "V"
-	NCALL	post_main, "GI"
-	.short	ui_poll - Lvm_base
+	NCALL	post_main, "PI"
+	.long	ui_poll - Lvm_base
 	.byte	0
 	HERE	Lp_web_end
 	OP_END
@@ -11519,9 +11137,9 @@ skip:
 	VM	Lp_skip
 	.pushsection __DATA,__data
 Lp_skip:
-	LD	G_LTDUR
-	LT	1
-	JNZ	Lp_skip_end               ; unknown duration: nowhere to skip to
+	LD	G_POS
+	MSG	S_isEnabled, ">"
+	JZ	Lp_skip_end               ; unknown duration: nowhere to skip to
 	LD	G_LTDUR
 	SL	1
 	LD	G_SHOWPOS
@@ -11632,9 +11250,9 @@ Lp_text:
 	NCALL	ui_play_done, "b"         ; already on main: no turn of the run loop to wait
 	OP_END
 	HERE	Lp_text_later
-	CALL	F_dispatch_async_f, "ObG"
+	CALL	F_dispatch_async_f, "ObP"
 	.byte	G_WORKQ >> 3
-	.short	play_resolve - Lvm_base
+	.long	play_resolve - Lvm_base
 	OP_END
 	HERE	Lp_text_drop
 	CALL	F_free, "b"
@@ -11774,11 +11392,9 @@ Lp_drop:
 	IMM	1
 	OP_END
 	HERE	Lp_drop_1
-	NCALL	mkstr, "=P"
-	.short	Ls_plain - Ldbase
-	SL	3
 	GL	2
-	MSG	S_stringForType_, "=d"
+	MSG	S_stringForType_, "=S"
+	.asciz	"public.utf8-plain-text"
 	MSG	S_UTF8String, "="
 	JZ	Lp_drop_2
 	NCALL	play_text, "V"
@@ -11837,233 +11453,62 @@ Lp_aonly:
 	HERE	Lp_aonly_1
 	LD	G_AOBTN
 	MSG	S_setContentTintColor_, "b"
-	NCALL	eng_cmd, "GI"
-	.short	eng_aonly - Lvm_base
+	NCALL	eng_cmd, "PI"
+	.long	eng_aonly - Lvm_base
 	.byte	0
 	NCALL	local_poll
 	OP_END
 	.popsection
 
-; bar_mouse(bar, _cmd, event) — a click or drag on a bar sets it from the pointer; This Mac's position follows the drag frame by frame.
-	VMENTRY	bar_mouse, Lp_barm
+; act_vol — the volume slider.
+	VMENTRY	act_vol, Lp_vol
 	.pushsection __DATA,__data
-Lp_barm:
-	GL	2
-	MSG	S_locationInWindow, "^"   ; e, f: the pointer in the window
-	GL	0
-	MSG	S_convertPoint_fromView_, "^ZZI" ; e: and in the bar
-	.byte	4, 5, 0
-	FL	4
-	FS	1
-	GL	0
-	MSG	S_bounds, "^"             ; g: the bar's width
-	FL	1
-	FOP	3, 6
-	FOPK	4, 16
-	FOPK	5, 0
-	FS	1                         ; b: the fraction under the pointer, 0..1
-	NCALL	dragging, "="
-	SL	2                         ; c: the button is still down
+Lp_vol:
 	LD	G_VOL
-	EQL	0
-	JZ	Lp_barm_pos
-	GL	2
+	MSG	S_intValue, ">"
+	SL	0
+	NCALL	dragging, "="
 	SW	G_VOLDRAG
 	LD	G_TICK
 	ADDI	HOLD_TICKS
 	STO	G_VOLH
-	FL	1
-	FOPK	2, 100 * 16
-	FT
-	SL	0
 	NCALL	local_setvol, "a"
-	LD	G_VOL
-	NCALL	bar_draw, "VaI"           ; shown at once, while its change settles
-	.byte	100
 	OP_END
-	HERE	Lp_barm_pos
-	LD	G_LTDUR
-	SL	3                         ; d: the duration
-	LT	1
-	JNZ	Lp_barm_end               ; unknown: nowhere to go
-	GL	3
-	FI
-	FOP	2, 1
-	FOPK	2, 1000 * 16              ; the moment, ms
+	.popsection
+
+; act_seek — the position slider: This Mac follows the drag frame by frame.
+	VMENTRY	act_seek, Lp_aseek
+	.pushsection __DATA,__data
+Lp_aseek:
+	LD	G_POS
+	MSG	S_doubleValue, "^"
+	FL	4
+	FOPK	2, 16000                  ; to the millisecond
 	FT
 	SL	0
+	LD	G_POS
+	MSG	S_maxValue, "@"
+	SL	1
+	GL	0
 	DIVH	1000
-	NCALL	show_time, "Vd"
-	GL	2
+	NCALL	show_time, "Vb"
+	NCALL	dragging, "="
 	SW	G_SEEKDRAG
-	JZ	Lp_barm_rel
+	JZ	Lp_aseek_rel
 	NCALL	local_seekms, "a"
 	OP_END
-	HERE	Lp_barm_rel
+	HERE	Lp_aseek_rel
 	NCALL	seek_route, "a"
-	HERE	Lp_barm_end
 	OP_END
 	.popsection
 
-; bar_ax(bar, _cmd) -> YES — VoiceOver's increment and decrement: the 10-second skips on the position, a volume step on the volume.
-	VMENTRY	bar_ax, Lp_barax
-	.pushsection __DATA,__data
-Lp_barax:
-	LDE	S_accessibilityPerformIncrement
-	EQL	1
-	SL	2                         ; c: up
-	LD	G_VOL
-	EQL	0
-	JZ	Lp_barax_pos
-	GL	2
-	JZ	Lp_barax_vdown
-	NCALL	Lact_volup
-	JMP	Lp_barax_yes
-	HERE	Lp_barax_vdown
-	NCALL	Lact_voldown
-	JMP	Lp_barax_yes
-	HERE	Lp_barax_pos
-	GL	2
-	JZ	Lp_barax_back
-	NCALL	Lact_fwd
-	JMP	Lp_barax_yes
-	HERE	Lp_barax_back
-	NCALL	Lact_back
-	HERE	Lp_barax_yes
-	IMM	1
-	OP_END
-	.popsection
-
-; bar_axval(bar) -> its value for VoiceOver: the position in seconds, or the volume.
-	VMENTRY	bar_axval, Lp_baraxv
-	.pushsection __DATA,__data
-Lp_baraxv:
-	LD	G_SHOWPOS
-	SL	1
-	LD	G_VOL
-	EQL	0
-	JZ	Lp_baraxv_num
-	LW	G_VOLPCT
-	SL	1
-	HERE	Lp_baraxv_num
-	CLS	NSNumber
-	MSG	S_numberWithInt_, "=b"
-	OP_END
-	.popsection
-
-; layer_in(parent, y, color, mask) -> a TRACK_H-high layer of that color in the parent layer at y, not animated by changes: with a mask a capsule as wide as the parent, else empty.
-layer_in:
-	VM	Lp_layin
-	.pushsection __DATA,__data
-Lp_layin:
-	GL	0
-	MSG	S_bounds, "^"             ; e-h: the parent's bounds
-	GL	3
-	JNZ	Lp_layin_wide
-	FK	0
-	FS	6
-	HERE	Lp_layin_wide
-	GL	1
-	FI
-	FS	5
-	FK	TRACK_H * 16
-	FS	7
-	CLS	CALayer
-	MSG	S_new, "="
-	SL	1                         ; b: the layer
-	MSG	S_setFrame_, "ZZZZ"
-	.byte	4, 5, 6, 7
-	MSG	S_setAutoresizingMask_, "d"
-	MSG	S_setDelegate_, "O"       ; a view: no implicit animations
-	.byte	G_CONTENT >> 3
-	GL	3
-	JZ	Lp_layin_fill             ; a track: round, its fill cut to it
-	GL	1
-	MSG	S_setCornerRadius_, "D"
-	.short	TRACK_H * 2
-	MSG	S_setMasksToBounds_, "I"
-	.byte	1
-	HERE	Lp_layin_fill
-	GL	2
-	MSG	S_CGColor, "="
-	SL	2
-	GL	1
-	MSG	S_setBackgroundColor_, "c"
-	GL	0
-	MSG	S_addSublayer_, "b"
-	GL	1
-	OP_END
-	.popsection
-
-; bar_draw(bar, value, max) — the bar's fill takes value / max of its track.
-bar_draw:
-	VM	Lp_bard
-	.pushsection __DATA,__data
-Lp_bard:
-	GL	0
-	MSG	S_layer, "="
-	MSG	S_sublayers, "="
-	MSG	S_firstObject, "="        ; the track
-	SL	0
-	MSG	S_bounds, "^"             ; g: its width
-	GL	2
-	FI
-	FS	3
-	GL	1
-	FI
-	FOP	3, 3
-	FOP	2, 6
-	FS	6
-	GL	0
-	MSG	S_sublayers, "="
-	MSG	S_firstObject, "="        ; the fill
-	MSG	S_setFrame_, "ZZZZ"
-	.byte	4, 5, 6, 7
-	OP_END
-	.popsection
-
-; act_tick — the 1 Hz timer: the AirPlay button once something plays, the controls' idle fade; This Mac renders itself.
+; act_tick — the 1 Hz timer: the controls' idle fade; This Mac renders itself.
 	VMENTRY	act_tick, Lp_tick
 	.pushsection __DATA,__data
 Lp_tick:
 	LD	G_TICK
 	ADDI	1
 	STO	G_TICK
-	LW	G_AIRUP                   ; AirPlay (This Mac's picture and sound to an Apple TV, AirPlay TV or speaker; lit while it does), made late: its route detection costs ~1.7 MB
-	JNZ	Lp_airmake_end
-	LW	G_PLAYGEN                 ; on a tick after something was asked to play, not in the way of its opening
-	JZ	Lp_airmake_end
-	IMM	1
-	SW	G_AIRUP
-	LD	G_BAR
-	MSG	S_bounds, "^"             ; g: the bar's width now
-	FL	6
-	FOPK	1, (16 + AIR_W) * 16
-	FS	4
-	FK	(ROW2_C - AIR_W / 2) * 16
-	FS	5
-	FK	AIR_W * 16
-	FS	6
-	FS	7
-	CLS	AVRoutePickerView
-	MSG	S_alloc, "="
-	MSG	S_initWithFrame_, "=ZZZZ" ; at the bar's right end
-	.byte	4, 5, 6, 7
-	MSG	S_setPlayer_, "O"
-	.byte	G_PLAYER >> 3
-	MSG	S_setDelegate_, "O"           ; air_prepare as it opens
-	.byte	G_CTRL >> 3
-	MSG	S_setRoutePickerButtonBordered_, "I"
-	.byte	0
-	MSG	S_setRoutePickerButtonColor_forState_, "OI"
-	.byte	G_SECOND >> 3, 0          ; normal
-	MSG	S_setRoutePickerButtonColor_forState_, "OI"
-	.byte	G_YEL >> 3, 2             ; active
-	MSG	S_setToolTip_, "S"
-	.asciz	"AirPlay"
-	MASKV	AR_LEFT
-	ADDIN	G_BAR
-	HERE	Lp_airmake_end
 	NCALL	idle_tick
 	NCALL	local_poll
 	OP_END
@@ -12248,8 +11693,8 @@ Lp_options:
 	JNZ	Lp_options_av
 	LD	G_MEDIAQ                  ; the engine's own, read while its queue waits
 	SL	0
-	CALL	F_dispatch_sync_f, "acG"
-	.short	eng_options - Lvm_base
+	CALL	F_dispatch_sync_f, "acP"
+	.long	eng_options - Lvm_base
 	OP_END
 	HERE	Lp_options_av
 	GL	2
@@ -12340,9 +11785,7 @@ Ls_trackn:	.asciz	"Track "
 Ls_tcc:	.asciz	"TYPE=CLOSED-CAPTIONS"
 Ls_cc1:	.asciz	"\"CC1\""
 	.popsection
-	VMENTRY	eng_options, Lp_engopts
-	.pushsection __DATA,__data
-Lp_engopts:
+	VMTENTRY	eng_options
 	IMM	'a'
 	SL	2                         ; c: the kind listed
 	LDE	E_AT
@@ -12357,7 +11800,7 @@ Lp_engopts:
 	EQ	0
 	SL	7
 	NCALL	opt_item, "aPJh"          ; subtitles can be off
-	.short	Ls_off - Ldbase
+	.long	Ls_off - Lvm_base
 	.byte	0xff
 	HERE	Leo_kind
 	LDE	E_MASTER
@@ -12399,7 +11842,7 @@ Lp_engopts:
 	LEAB	B_UJ                      ; no language: its number, in the media queue's scratch (it waits); one digit (TRACKS 8)
 	SL	6
 	CALL	F_strlcpy, "gPI"
-	.short	Ls_trackn - Ldbase
+	.long	Ls_trackn - Lvm_base
 	.byte	16
 	GL	4
 	ADDI	'0'
@@ -12436,7 +11879,7 @@ Lp_engopts:
 	LDE	E_MASTER
 	HERE	Leo_find
 	NCALL	media_next, "?VP"
-	.short	Ls_taudio - Ldbase
+	.long	Ls_taudio - Lvm_base
 	JZ	Leo_end2                  ; none playing: nothing to choose
 	SL	6                         ; g, h: its line
 	NCALL	uri_is, "ghIb"
@@ -12446,7 +11889,7 @@ Lp_engopts:
 	JMP	Leo_find
 	HERE	Leo_grp
 	NCALL	attr, "?ghP"
-	.short	Ls_group - Ldbase
+	.long	Ls_group - Lvm_base
 	SL	4                         ; e, f: its group
 	GL	7
 	SL	5
@@ -12462,14 +11905,14 @@ Lp_engopts:
 	JZ	Leo_ra
 	GL	6
 	NCALL	media_next, "?VP"
-	.short	Ls_tsubs - Ldbase
+	.long	Ls_tsubs - Lvm_base
 	JMP	Leo_rgot
 	HERE	Leo_end2
 	OP_END
 	HERE	Leo_ra
 	GL	6
 	NCALL	media_next, "?VP"
-	.short	Ls_taudio - Ldbase
+	.long	Ls_taudio - Lvm_base
 	HERE	Leo_rgot
 	JZ	Leo_ccj
 	SL	6                         ; g, h: the line
@@ -12480,7 +11923,7 @@ Lp_engopts:
 	GL	7
 	STE	B_UJ + 64
 	NCALL	attr, "?ghP"
-	.short	Ls_group - Ldbase
+	.long	Ls_group - Lvm_base
 	JZ	Leo_rskip
 	SL	6
 	GL	7
@@ -12516,14 +11959,14 @@ Lp_engopts:
 	LDE	E_MASTER
 	HERE	Leo_ccn
 	NCALL	media_next, "?VP"
-	.short	Ls_tcc - Ldbase
+	.long	Ls_tcc - Lvm_base
 	JZ	Leo_end3
 	SL	6
 	GL	7
 	SUBL	6
 	SL	5
 	CALL	F_strnstr, "=gPf"
-	.short	Ls_cc1 - Ldbase
+	.long	Ls_cc1 - Lvm_base
 	JZ	Leo_ccskip
 	LDE	E_CCT
 	SL	4
@@ -12540,18 +11983,16 @@ Lp_engopts:
 	JMP	Leo_ccn
 	HERE	Leo_end3
 	OP_END
-	.popsection
+	.p2align 2
 
 ; opt_named(line, end, menu, tag, on) — an option titled by the line's NAME (none: no option).
 	.pushsection __DATA,__data
 Ls_name:	.asciz	"NAME="
 	.popsection
 opt_named:
-	VM	Lp_optnamed
-	.pushsection __DATA,__data
-Lp_optnamed:
+	VMT
 	NCALL	attr, "?abP"
-	.short	Ls_name - Ldbase
+	.long	Ls_name - Lvm_base
 	JZ	Lon_end
 	SL	5                         ; f: the name, h: its end
 	GL	7
@@ -12573,7 +12014,7 @@ Lp_optnamed:
 	NCALL	opt_item, "chde"
 	HERE	Lon_end
 	OP_END
-	.popsection
+	.p2align 2
 
 ; txt_fd(track) — the track's format: tx3g text cues.
 txt_fd:
@@ -12808,8 +12249,8 @@ Lp_option:
 	SHL	32
 	ADDL	4
 	SL	5
-	NCALL	eng_cmd, "Gf"
-	.short	eng_pick - Lvm_base
+	NCALL	eng_cmd, "Pf"
+	.long	eng_pick - Lvm_base
 	OP_END
 	HERE	Lp_option_av
 	NCALL	media_group, "=d"
@@ -12957,36 +12398,20 @@ _main:
 	ADDR	x0, Ls_avkit              ; with AVFoundation and AppKit
 	mov	w1, #9                    ; RTLD_LAZY | RTLD_GLOBAL
 	blr	x9
-	ADDR	x23, Lreg_words           ; the 128 words, then the names
-	ADDR	x26, Lreg_syms
-	mov	x19, #0                   ; the bit
-	BADDR	x24, B_WIX
-	mov	w25, #0
-Lmn_index:
-	strh	w19, [x24, x25, lsl #1]   ; where word n starts
-1:	bl	Lmn_get
-	cbz	w9, 2f
-	cmp	w9, #1
-	b.ne	1b
-	bl	Lmn_raw7                  ; a word's number
-	b	1b
-2:	add	w25, w25, #1
-	cmp	w25, #128
-	b.lo	Lmn_index
+	ADDR	x19, Lreg_names
 	BADDR	x20, B_REG
 	mov	x22, sp
 Lmn_reg:
+	ldrb	w9, [x19]
+	cbz	w9, Lmn_regged
 	mov	x10, sp
 Lmn_char:
-	bl	Lmn_get
-	cmp	w9, #1
-	b.eq	Lmn_word
+	ldrb	w9, [x19], #1
+	tbnz	w9, #7, Lmn_word
 	strb	w9, [x10], #1
 	cbnz	w9, Lmn_char
 	cmp	sp, x22                   ; a word's end: on after it
 	b.ne	Lmn_back
-	ldrb	w9, [sp]
-	cbz	w9, Lmn_regged            ; an empty name ends them
 	mov	x0, sp
 	BADDR	x9, B_SEL
 	cmp	x20, x9
@@ -13007,46 +12432,18 @@ Lmn_store:
 	str	x0, [x20], #8
 	b	Lmn_reg
 Lmn_word:
-	bl	Lmn_raw7
-	str	x19, [sp, #-16]!          ; the word, itself spelled with words, then on after it
-	ldrh	w19, [x24, x9, lsl #1]
-	b	Lmn_char
+	str	x19, [sp, #-16]!          ; past n words, then the word, itself spelled with words
+	ADDR	x19, Lreg_words
+	and	w9, w9, #0x7f
+1:	cbz	w9, Lmn_char
+	ldrb	w12, [x19], #1
+	cbnz	w12, 1b
+	sub	w9, w9, #1
+	b	1b
 Lmn_back:
 	sub	x10, x10, #1
 	ldr	x19, [sp], #16
 	b	Lmn_char
-; Lmn_get -> w9 = the symbol whose code starts at bit x19 of the registry (x23), read a bit at a time: its byte in Lreg_syms (x26); x19 moves past it.
-Lmn_get:
-	mov	w9, #0                    ; the code so far
-	mov	w16, #0                   ; the first code this long
-	mov	x11, x26                  ; and its symbol
-	sub	x12, x26, #(Lreg_syms - Lreg_lens)
-1:	lsr	x13, x19, #3
-	ldrb	w13, [x23, x13]
-	and	w14, w19, #7
-	lsr	w13, w13, w14
-	and	w13, w13, #1
-	add	x19, x19, #1
-	orr	w9, w13, w9, lsl #1
-	ldrb	w14, [x12], #1            ; codes this long
-	sub	w15, w9, w16
-	cmp	w15, w14
-	b.lo	2f
-	add	x11, x11, x14
-	add	w16, w16, w14
-	lsl	w16, w16, #1
-	b	1b
-2:	ldrb	w9, [x11, x15]
-	ret
-; Lmn_raw7 -> w9 = the 7 bits at bit x19 of the registry (x23), a word's number; x19 moves past them.
-Lmn_raw7:
-	lsr	x11, x19, #3
-	ldrh	w9, [x23, x11]
-	and	x12, x19, #7
-	lsr	w9, w9, w12
-	and	w9, w9, #127
-	add	x19, x19, #7
-	ret
 Lmn_regged:
 	ldr	x9, [x27, #F__NSConcreteGlobalBlock]
 	ADDR	x10, Lblk_v
@@ -13090,9 +12487,9 @@ Lprog_build:
 	CALL	F_dispatch_get_global_queue, "=II"
 	.byte	QOS_CLASS_USER_INITIATED, 0
 	STO	G_WORKQ
-	CALL	F_dispatch_async_f, "OIG"
+	CALL	F_dispatch_async_f, "OIP"
 	.byte	G_WORKQ >> 3, 0
-	.short	av1_check - Lvm_base
+	.long	av1_check - Lvm_base
 	CALL	F_dispatch_queue_attr_make_with_autorelease_frequency, "=II"
 	.byte	0, 1                      ; serial, a pool per work item
 	CALL	F_dispatch_queue_attr_make_with_qos_class, "=VII"
@@ -13109,7 +12506,6 @@ Lprog_build:
 	COLOR	G_BGC, 21, 21, 21, 255
 	COLOR	G_SURF, 28, 28, 28, 240
 	COLOR	G_SURF2, 39, 39, 39, 255
-	COLOR	G_TRACK, 255, 255, 255, 26
 	COLOR	G_YEL, 244, 253, 55, 255
 	COLOR	G_TEXT, 229, 229, 229, 255
 	COLOR	G_SECOND, 160, 160, 160, 255
@@ -13125,9 +12521,11 @@ Lprog_build:
 	METHOD	S_act_stop_, act_stop
 	METHOD	S_act_back_, act_back
 	METHOD	S_act_fwd_, act_fwd
+	METHOD	S_act_vol_, act_vol
 	METHOD	S_act_volup_, act_volup
 	METHOD	S_act_voldown_, act_voldown
 	METHOD	S_act_mute_, act_mute
+	METHOD	S_act_seek_, act_seek
 	METHOD	S_act_tick_, act_tick
 	METHOD	S_act_focus_, act_focus
 	METHOD	S_act_open_, act_open
@@ -13173,21 +12571,6 @@ Lprog_build:
 	MSG	S_initWithFrame_, "=R"
 	RC	0, 0, WIN_W, WIN_H
 	STO	G_CONTENT
-
-	; A bar (position, volume): a VoiceOver slider drawn by two layers, set by the pointer.
-	CLS	NSView
-	CALL	F_objc_allocateClassPair, "=VCI"
-	.asciz	"BeamBar"
-	.byte	0
-	STO	G_BARCLS
-	METHOD	S_mouseDown_, bar_mouse
-	METHOD	S_mouseDragged_, bar_mouse
-	METHOD	S_mouseUp_, bar_mouse
-	METHOD	S_accessibilityPerformIncrement, bar_ax, "B@:"
-	METHOD	S_accessibilityPerformDecrement, bar_ax, "B@:"
-	METHOD	S_accessibilityValue, bar_axval, "@@:"
-	CALL	F_objc_registerClassPair, "O"
-	.byte	G_BARCLS >> 3
 
 	CLS	NSApplication
 	MSG	S_sharedApplication, "="
@@ -13252,8 +12635,7 @@ Lprog_stage:
 	STO	G_PLAYER
 	CLS	NSString                  ; drops: files, links and text
 	MSG	S_stringWithUTF8String_, "=C"
-	.ascii	"public.file-url public.url "
-Ls_plain:	.asciz	"public.utf8-plain-text"   ; also what a text drop is read as
+	.asciz	"public.file-url public.url public.utf8-plain-text"
 	MSG	S_componentsSeparatedByString_, "=S"
 	.asciz	" "
 	STO	G_T1
@@ -13424,101 +12806,9 @@ Ls_plain:	.asciz	"public.utf8-plain-text"   ; also what a text drop is read as
 	MASKV	AR_WIDTH | AR_TOP
 	LAYERBG	G_SURF, 16
 	FONT	S_monospacedDigitSystemFontOfSize_weight_, 11, X_MEDIUM
-	; The times: glyph layers, each showing its part of one picture of "0123456789:-" drawn once, so no text is laid out as they change.
-	CLS	NSTextField
-	MSG	S_labelWithString_, "=S"
-	.asciz	"0123456789:-"
-	MSG	S_setFont_, "O"
-	.byte	G_T0 >> 3
-	MSG	S_setTextColor_, "O"
-	.byte	G_SECOND >> 3
-	MSG	S_attributedStringValue, "="
-	SL	1                         ; b: the glyphs, in the times' font and color
-	LEAB	B_GLX + 12 * 8            ; where each glyph starts: the width of the text before it
-	SL	0
-	IMM	12
-	SL	2
-	HERE	Lp_glx
-	GL	1
-	MSG	S_attributedSubstringFromRange_, "=Ic"
-	.byte	0
-	MSG	S_size, "^"
-	GL	4
-	STX	0, 0
-	GL	0
-	ADDI	-8
-	SL	0
-	GL	2
-	ADDI	-1
-	SL	2
-	JNZ	Lp_glx
-	LEAB	B_GLX + 12 * 8
-	LDX	0
-	SL	6
-	FL	6
-	FOP	7, 6
-	FS	6                         ; g: the picture's width, in whole points
-	FOPK	2, 32
-	FT
-	SL	7                         ; h: in pixels, at twice the size
-	CLS	CATextLayer
-	MSG	S_new, "="
-	SL	2                         ; c: a text layer drawing them, at the screen's scale (at 1 it draws light text thinner)
-	MSG	S_setString_, "b"
-	MSG	S_setFrame_, "DDZD"
-	.short	0, 0
-	.byte	6
-	.short	LABEL_H * 4
-	MSG	S_setContentsScale_, "D"
-	.short	2 * 4
-	LD	G_SECOND
-	MSG	S_CGColor, "="
-	CALL	F_CGColorGetColorSpace, "=V"
-	CALL	F_CGBitmapContextCreate, "=IhIIIVI"
-	.byte	0
-	.byte	2 * LABEL_H, 8, 0, 1      ; premultiplied RGBA at twice the size
-	SL	3                         ; d: the picture's pixels
-	CALL	F_CGContextScaleCTM, "dDD"
-	.short	8, 8
-	GL	2
-	MSG	S_renderInContext_, "d"
-	MSG	S_release
-	CALL	F_CGBitmapContextCreateImage, "=d"
-	STO	G_T1                      ; the picture
-	GL	3
-	MSG	S_release
-	ROWIN	G_CUR, 16, ROW1_Y + 2, AR_RIGHT
-	ROWIN	G_DUR, BAR_W - 16 - TIME_W, ROW1_Y + 2, AR_LEFT
-	LEAB	B_GLL                     ; the glyph layers, kept in order: 8 in each row, showing the picture
-	SL	0
-	IMM	16
-	SL	1
-	HERE	Lp_gll
-	CLS	CALayer
-	MSG	S_new, "="
-	STX	0, 0
-	MSG	S_setContents_, "O"
-	.byte	G_T1 >> 3
-	MSG	S_setDelegate_, "O"       ; a view: no implicit animations
-	.byte	G_CONTENT >> 3
-	SL	2
-	GL	1
-	LT	9
-	JNZ	Lp_gll_left
-	LD	G_CUR
-	JMP	Lp_gll_row
-	HERE	Lp_gll_left
-	LD	G_DUR                     ; the last 8: the time left
-	HERE	Lp_gll_row
-	MSG	S_addSublayer_, "c"
-	GL	0
-	ADDI	8
-	SL	0
-	GL	1
-	ADDI	-1
-	SL	1
-	JNZ	Lp_gll
-	BARIN	G_POS, 24 + TIME_W, ROW1_Y, BAR_W - 2 * (24 + TIME_W), AR_WIDTH
+	LABELIN	G_CUR, G_BAR, "", 16, ROW1_Y + 2, TIME_W, LABEL_H, 0, G_SECOND, AR_RIGHT
+	LABELIN	G_DUR, G_BAR, "", BAR_W - 16 - TIME_W, ROW1_Y + 2, TIME_W, LABEL_H, 2, G_SECOND, AR_LEFT
+	SLIDERIN	G_POS, G_BAR, S_act_seek_, 24 + TIME_W, ROW1_Y, BAR_W - 2 * (24 + TIME_W), 1, AR_WIDTH
 	FONT	S_systemFontOfSize_weight_, 13, X_SEMIBOLD
 	LABELIN	G_TITLE, G_BAR, "", 16, ROW2_C - 9, TEXT_W, 18, 0, G_TEXT, AR_WIDTH | AR_RIGHT
 	FONT	S_systemFontOfSize_weight_, 12, X_REGULAR
@@ -13529,7 +12819,27 @@ Ls_plain:	.asciz	"public.utf8-plain-text"   ; also what a text drop is read as
 	BTN	G_FWD, G_BAR, "goforward.10", "Forward 10 seconds", S_act_fwd_, "Forward 10 seconds (\342\214\230\342\206\222)", FWD_X, ROW2_C - BTN_S / 2, BTN_S, 16, AR_LEFT | AR_RIGHT, G_TEXT
 	BTN	G_AOBTN, G_BAR, "headphones", "Audio only", S_act_aonly_, "Audio Only (\342\214\245\342\214\230A)", AO_X, ROW2_C - ICON_S / 2, ICON_S, 13, AR_LEFT, G_SECOND
 	BTN	G_MUTE, G_BAR, "speaker.wave.2.fill", "Mute", S_act_mute_, "Mute (\342\214\245\342\214\230\342\206\223)", MUTE_X, ROW2_C - ICON_S / 2, ICON_S, 13, AR_LEFT, G_SECOND
-	BARIN	G_VOL, VOL_X, ROW2_C - SLIDER_H / 2, VOL_W, AR_LEFT
+	SLIDERIN	G_VOL, G_BAR, S_act_vol_, VOL_X, ROW2_C - SLIDER_H / 2, VOL_W, 100, AR_LEFT
+
+	; AirPlay: This Mac's picture and sound to an Apple TV or an AirPlay TV or speaker; lit while it does.
+	CLS	AVRoutePickerView
+	MSG	S_alloc, "="
+	MSG	S_initWithFrame_, "=N"
+	RN	AIR_X, ROW2_C - AIR_W / 2, AIR_W, AIR_W
+	MSG	S_setPlayer_, "O"
+	.byte	G_PLAYER >> 3
+	MSG	S_setDelegate_, "O"           ; air_prepare as it opens
+	.byte	G_CTRL >> 3
+	MSG	S_setRoutePickerButtonBordered_, "I"
+	.byte	0
+	MSG	S_setRoutePickerButtonColor_forState_, "OI"
+	.byte	G_SECOND >> 3, 0          ; normal
+	MSG	S_setRoutePickerButtonColor_forState_, "OI"
+	.byte	G_YEL >> 3, 2             ; active
+	MSG	S_setToolTip_, "S"
+	.asciz	"AirPlay"
+	MASKV	AR_LEFT
+	ADDIN	G_BAR
 
 	; Open from URL: a field floating in the middle of the stage (placed by layout_stage).
 	NEWV	NSView, 0, 0, URL_W, URL_H
@@ -13641,10 +12951,10 @@ Lprog_run:
 	MSG	S_run
 	OP_END
 
-; InnerTube endpoints: name, then the field mask (it cuts a player response from ~183 KB to ~69 KB).
-Lep_guide:	.asciz	"guide", "X-Goog-FieldMask", "responseContext.visitorData", ""
-Lep_search:	.asciz	"search", "X-Goog-FieldMask", "contents,responseContext.visitorData", ""
-Lep_player:	.asciz	"player", "X-Goog-FieldMask", "streamingData,videoDetails,playabilityStatus,responseContext.visitorData", ""
+; InnerTube endpoints: URL, then the field mask (it cuts a player response from ~183 KB to ~69 KB).
+Lep_guide:	.asciz	"https://www.youtube.com/youtubei/v1/guide?prettyPrint=false", "X-Goog-FieldMask", "responseContext.visitorData", ""
+Lep_search:	.asciz	"https://www.youtube.com/youtubei/v1/search?prettyPrint=false", "X-Goog-FieldMask", "contents,responseContext.visitorData", ""
+Lep_player:	.asciz	"https://www.youtube.com/youtubei/v1/player?prettyPrint=false", "X-Goog-FieldMask", "streamingData,videoDetails,playabilityStatus,responseContext.visitorData", ""
 
 ; Headers of every InnerTube request.
 Lapi_headers:
@@ -13749,7 +13059,7 @@ Lc_web:	                                  ; the visitorData client
 	\m	\p, Audio
 	\m	\p, Block, B, loc, k
 	\m	\p, Description, Descrip, tion
-	\m	\p, InPictureController, In, Picture, C, ont, roller
+	\m	\p, InPictureController, In, Picture, C, ontrol, ler
 	\m	\p, Player, P, lay, er
 	\m	\p, Session, Ses, sion
 	\m	\p, ime
@@ -13798,7 +13108,7 @@ Lc_web:	                                  ; the visitorData client
 	\m	\p, RoutePicker
 	\m	\p, Symbol
 	\m	\p, length
-	\m	\p, ccessibility
+	\m	\p, ontrol, ont, rol
 	\m	\p, semaphore_
 	\m	\p, weight:
 	\m	\p, Flavor_ISOFamily
@@ -13815,16 +13125,14 @@ Lc_web:	                                  ; the visitorData client
 .endm
 .macro WMATCH p, w, parts:vararg
 	.ifc	\p, _\w
-	.set	Lwi, Lwn
+	.byte	Lwn
 	.set	Lwf, 1
 	.endif
 	.set	Lwn, Lwn + 1
 .endm
 .macro WEMIT p, w, a, b, c, d, e, f, g, h ; a word, whole or in words of its own that spell it
 	.ifb	\a
-	.set	Lwhole, 1
-	NAME	\w
-	.set	Lwhole, 0
+	.asciz	"\w"
 	.else
 	.ifnc	\w, \a\b\c\d\e\f\g\h
 	.error	"the pieces do not spell the word"
@@ -13832,95 +13140,19 @@ Lc_web:	                                  ; the visitorData client
 	NAME	\a, \b, \c, \d, \e, \f, \g, \h
 	.endif
 .endm
-.macro EBIT b                               ; one bit, low bits of each byte first
-	.set	Lbacc, Lbacc | ((\b) << Lbn)
-	.set	Lbn, Lbn + 1
-	.if	Lbn == 8
-	.byte	Lbacc
-	.set	Lbacc, 0
-	.set	Lbn, 0
-	.endif
-.endm
-.macro EHUF i                               ; symbol i of Lreg_syms: its canonical code, first bit first
-	.set	Lhl, 0
-	.irp	n, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11
-	.if	(\i) >= Lhf\n && (\i) < Lhf\n + Lhc\n
-	.set	Lhl, \n
-	.set	Lhk, Lhk\n + (\i) - Lhf\n
-	.endif
-	.endr
-	.if	Lhl == 0
-	.error	"a symbol without a code"
-	.endif
-	.rept	Lhl
-	.set	Lhl, Lhl - 1
-	EBIT	(Lhk >> Lhl) & 1
-	.endr
-.endm
-.macro HLEN n, c                            ; c codes n bits long: where they start, as codes and as symbols
-	.byte	\c
-	.set	Lhc\n, \c
-	.set	Lhf\n, Lhf
-	.set	Lhk\n, Lhk
-	.set	Lhf, Lhf + \c
-	.set	Lhk, (Lhk + \c) << 1
-.endm
-.macro NAME parts:vararg                   ; each piece a word (the escape, then its number in 7 bits), else its characters, then the end
+.macro NAME parts:vararg                   ; each piece a word's byte, else as it is
 	.irp	p, \parts
 	.ifnb	\p
-	.set	Lwn, 0
+	.set	Lwn, 0x80
 	.set	Lwf, 0
-	.if	Lwhole == 0
 	WORDS	WMATCH, _\p
-	.endif
-	.if	Lwf
-	EHUF	0
-	.set	Lr, Lwi
-	.rept	7
-	EBIT	Lr & 1
-	.set	Lr, Lr >> 1
-	.endr
-	.else
-	.irpc	c, "\p"
-	.set	Lcc, -1
-	.set	Lci, 0
-	.irpc	t, "-+e:ailorstACScdgmnpuyBDFMPRT_bfhkENOVvwGHILUWqxJKQjz23468Z"
-	.ifc	"\c", "\t"
-	.set	Lcc, Lci
-	.endif
-	.set	Lci, Lci + 1
-	.endr
-	.if	Lcc < 2
-	.error	"a character outside the registry's alphabet"
-	.endif
-	EHUF	Lcc
-	.endr
+	.if	Lwf == 0
+	.ascii	"\p"
 	.endif
 	.endif
 	.endr
-	EHUF	1
+	.byte	0
 .endm
-; The registry's names as canonical Huffman codes (Lreg_lens: how many of each length from 1 bit; Lreg_syms: their symbols in code order, 0 ending a name, 1 a word whose number follows in 7 bits).
-	.set	Lhf, 0
-	.set	Lhk, 0
-Lreg_lens:
-	HLEN	1, 0
-	HLEN	2, 1
-	HLEN	3, 1
-	HLEN	4, 1
-	HLEN	5, 8
-	HLEN	6, 11
-	HLEN	7, 12
-	HLEN	8, 6
-	HLEN	9, 8
-	HLEN	10, 5
-	HLEN	11, 6
-Lreg_syms:
-	.byte	1, 0
-	.ascii	"e:ailorstACScdgmnpuyBDFMPRT_bfhkENOVvwGHILUWqxJKQjz23468Z"
-	.set	Lbacc, 0
-	.set	Lbn, 0
-	.set	Lwhole, 0
 Lreg_words:
 	WORDS	WEMIT
 
@@ -13937,15 +13169,12 @@ Lreg_words:
 .macro FN name, a, b, c, d, e, f, g, h, i, j, k, l, m
 	SPELL	F_\name, \name, \a, \b, \c, \d, \e, \f, \g, \h, \i, \j, \k, \l, \m
 .endm
+Lreg_names:
 	REGISTRY
-	EHUF	1                         ; an empty name: the end
-	.if	Lbn
-	.byte	Lbacc
-	.endif
+	.byte	0
 Ls_avkit:	.asciz	"/System/Library/Frameworks/AVKit.framework/AVKit"
 Ls_calloc:	.asciz	"calloc"
 Ls_dlopen:	.asciz	"dlopen"
 	.p2align 3
 Ldl:	.quad	_dlsym, 0, 0              ; then G and B, for callbacks
-
 

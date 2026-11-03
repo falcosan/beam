@@ -15,7 +15,7 @@ A native macOS media player, written entirely in arm64 assembly. It plays audio 
 ## Where it plays
 
 - **This Mac**: the current macOS output: built-in, wired, Bluetooth or AirPlay speakers and headphones.
-- **AirPlay** (the AirPlay button, once something plays): picture and sound to an Apple TV or an AirPlay TV or speaker.
+- **AirPlay** (the AirPlay button): picture and sound to an Apple TV or an AirPlay TV or speaker.
 
 ## Build and run
 
@@ -28,7 +28,7 @@ open Beam.app
 
 Nothing gets installed: no cache, no preferences.
 
-Beam reads the media itself (MP4, fragmented MP4, MPEG-TS, HLS, YouTube's DASH, and sound files through AudioFileStream) and hands the compressed samples to the chip's decoders. A sound file starts in about 30 ms and a 4K file shows its first picture in about 35 ms; seeks land on the exact frame in about 20 ms (1080p) to 50 ms (4K at 60 fps). A YouTube link shows its picture in about 0.45 s and seeks in about 0.7 s.
+Beam reads the media itself (MP4, fragmented MP4, MPEG-TS, HLS, YouTube's DASH, and sound files through AudioFileStream) and hands the compressed samples to the chip's decoders. A sound file starts in about 30 ms and a 4K file shows its first picture in about 45 ms; seeks land on the exact frame in about 50 ms (1080p) to 0.2 s (4K at 60 fps). A YouTube link shows its picture in about 0.45 s and seeks in about 0.7 s.
 
 ## Keyboard shortcuts
 
