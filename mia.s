@@ -3214,7 +3214,7 @@ Lp_track:
 	JNZ	Lp_track_named
 	LD	G_WIN
 	MSG	S_setTitle_, "S"
-	.asciz	"Beam"
+	.asciz	"MIA"
 	OP_END
 	HERE	Lp_track_named
 	NCALL	mkstr, "=a"
@@ -11359,7 +11359,7 @@ Lp_open:
 	OP_END
 	.popsection
 
-; act_openurls(app, urls) — files opened with Beam from the Finder or the Dock.
+; act_openurls(app, urls) — files opened with MIA from the Finder or the Dock.
 	VMENTRY	act_openurls, Lp_openurls
 	.pushsection __DATA,__data
 Lp_openurls:
@@ -12495,10 +12495,10 @@ Lprog_build:
 	CALL	F_dispatch_queue_attr_make_with_qos_class, "=VII"
 	.byte	QOS_CLASS_USER_INTERACTIVE, 0
 	CALL	F_dispatch_queue_create, "=CV"
-	.asciz	"beam.media"
+	.asciz	"mia.media"
 	STO	G_MEDIAQ
 	CALL	F_dispatch_queue_create, "=CI"
-	.asciz	"beam.clock"
+	.asciz	"mia.clock"
 	.byte	0
 	STO	G_CLOCKQ
 
@@ -12513,7 +12513,7 @@ Lprog_build:
 
 	CLS	NSObject
 	CALL	F_objc_allocateClassPair, "=VCI"
-	.asciz	"BeamController"
+	.asciz	"MIAController"
 	.byte	0
 	STO	G_T0
 	METHOD	S_act_play_, act_play
@@ -12555,7 +12555,7 @@ Lprog_build:
 	; The canvas: the window's content; it takes the keyboard, drops and the mouse.
 	CLS	NSView
 	CALL	F_objc_allocateClassPair, "=VCI"
-	.asciz	"BeamView"
+	.asciz	"MIAView"
 	.byte	0
 	STO	G_T0
 	METHOD	S_acceptsFirstResponder, imp_yes, "B@:"
@@ -12588,7 +12588,7 @@ Lprog_build:
 	.byte	2, 0                      ; buffered, not deferred
 	STO	G_WIN
 	MSG	S_setTitle_, "S"          ; for the Window menu and Mission Control
-	.asciz	"Beam"
+	.asciz	"MIA"
 	MSG	S_setTitlebarAppearsTransparent_, "I" ; content flows under it
 	.byte	1
 	MSG	S_setMovableByWindowBackground_, "I"
@@ -12648,17 +12648,17 @@ Lprog_stage:
 	LD	G_APP
 	MSG	S_setMainMenu_, "O"
 	.byte	G_T0 >> 3
-	SUBMENU	"Beam"
-	ITEM	"About Beam", S_orderFrontStandardAboutPanel_, ""
+	SUBMENU	"MIA"
+	ITEM	"About MIA", S_orderFrontStandardAboutPanel_, ""
 	MASK	0
 	SEP
-	ITEM	"Hide Beam", S_hide_, "h"
+	ITEM	"Hide MIA", S_hide_, "h"
 	ITEM	"Hide Others", S_hideOtherApplications_, "h"
 	MASK	0x180000
 	ITEM	"Show All", S_unhideAllApplications_, ""
 	MASK	0
 	SEP
-	ITEM	"Quit Beam", S_terminate_, "q"
+	ITEM	"Quit MIA", S_terminate_, "q"
 	SUBMENU	"File"
 	ITEM	"Open\342\200\246", S_act_open_, "o"
 	ITEM	"Open from URL\342\200\246", S_act_focus_, "l"

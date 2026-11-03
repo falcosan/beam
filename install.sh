@@ -2,20 +2,20 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-app=Beam.app
+app=MIA.app
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
 
-cc -o "$app/Contents/MacOS/Beam" beam.s \
+cc -o "$app/Contents/MacOS/MIA" mia.s \
   -Wl,-objc_stubs_small,-no_data_const,-x,-no_function_starts,-no_data_in_code_info,-no_source_version
 
-icons=$app/Contents/Resources/Beam.iconset
+icons=$app/Contents/Resources/MIA.iconset
 mkdir -p "$icons"
 for s in 16 32 128 256 512; do
   sips -s format png -z $s $s icon.svg --out "$icons/icon_${s}x$s.png" >/dev/null
   sips -s format png -z $((s * 2)) $((s * 2)) icon.svg --out "$icons/icon_${s}x$s@2x.png" >/dev/null
 done
-iconutil -c icns "$icons" -o "$app/Contents/Resources/Beam.icns"
+iconutil -c icns "$icons" -o "$app/Contents/Resources/MIA.icns"
 rm -r "$icons"
 
 cat > "$app/Contents/Info.plist" <<'EOF'
@@ -39,13 +39,13 @@ cat > "$app/Contents/Info.plist" <<'EOF'
 		</dict>
 	</array>
 	<key>CFBundleExecutable</key>
-	<string>Beam</string>
+	<string>MIA</string>
 	<key>CFBundleIconFile</key>
-	<string>Beam</string>
+	<string>MIA</string>
 	<key>CFBundleIdentifier</key>
-	<string>local.beam</string>
+	<string>local.mia</string>
 	<key>CFBundleName</key>
-	<string>Beam</string>
+	<string>MIA</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

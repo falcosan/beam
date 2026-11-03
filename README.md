@@ -1,6 +1,6 @@
-# Beam
+# MIA
 
-<img src="icon.svg" alt="Beam icon" width="128">
+<img src="icon.svg" alt="MIA icon" width="128">
 
 A native macOS media player, written entirely in arm64 assembly. It plays audio and video from your Mac or the web, on your Mac or on AirPlay.
 
@@ -23,12 +23,12 @@ Needs an Apple silicon Mac with macOS 26 or later.
 
 ```sh
 ./install.sh
-open Beam.app
+open MIA.app
 ```
 
 Nothing gets installed: no cache, no preferences.
 
-Beam reads the media itself (MP4, fragmented MP4, MPEG-TS, HLS, YouTube's DASH, and sound files through AudioFileStream) and hands the compressed samples to the chip's decoders. A sound file starts in about 30 ms and a 4K file shows its first picture in about 45 ms; seeks land on the exact frame in about 50 ms (1080p) to 0.2 s (4K at 60 fps). A YouTube link shows its picture in about 0.45 s and seeks in about 0.7 s.
+MIA reads the media itself (MP4, fragmented MP4, MPEG-TS, HLS, YouTube's DASH, and sound files through AudioFileStream) and hands the compressed samples to the chip's decoders. A sound file starts in about 30 ms and a 4K file shows its first picture in about 45 ms; seeks land on the exact frame in about 50 ms (1080p) to 0.2 s (4K at 60 fps). A YouTube link shows its picture in about 0.45 s and seeks in about 0.7 s.
 
 ## Keyboard shortcuts
 
