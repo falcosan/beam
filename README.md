@@ -6,7 +6,7 @@ A native macOS media player, written entirely in arm64 assembly. It plays audio 
 
 ## What it plays
 
-- **Files**: any audio or video macOS plays. Open one from the File menu (⌘O), drop it on the window, or use Open With in the Finder.
+- **Files**: any audio or video macOS plays, and MKV, WebM and FLV with the codecs the Mac decodes (H.264, HEVC, AV1, VP9, ProRes; AAC, MP3, Opus, Vorbis, FLAC, ALAC, AC-3, E-AC-3, PCM) and their text subtitles. Open one from the File menu (⌘O), drop it on the window, or use Open With in the Finder.
 - **From a URL** (File > Open from URL, ⌘L): a YouTube link, or words to search YouTube for; any other web address of a media file or HLS stream plays as it is.
 - **YouTube** plays up to 4K, in AV1 where the chip decodes it in hardware and H.264 otherwise, with the original sound rather than a dub; live streams play with their picture.
 - **Audio Only** (⌥⌘A, or the headphones): the picture is neither downloaded nor decoded.
@@ -28,7 +28,7 @@ open MIA.app
 
 Nothing gets installed: no cache, no preferences.
 
-MIA reads the media itself (MP4, fragmented MP4, MPEG-TS, HLS, YouTube's DASH, and sound files through AudioFileStream) and hands the compressed samples to the chip's decoders. A sound file starts in about 30 ms and a 4K file shows its first picture in about 45 ms; seeks land on the exact frame in about 50 ms (1080p) to 0.2 s (4K at 60 fps). A YouTube link shows its picture in about 0.45 s and seeks in about 0.7 s.
+MIA reads the media itself (MP4, fragmented MP4, MPEG-TS, HLS, YouTube's DASH, Matroska, WebM, FLV, and sound files through AudioFileStream) and hands the compressed samples to the chip's decoders. A sound file starts in about 30 ms and a 4K file shows its first picture in about 45 ms; seeks land on the exact frame in about 50 ms (1080p) to 0.2 s (4K at 60 fps). A YouTube link shows its picture in about 0.45 s and seeks in about 0.7 s.
 
 ## Keyboard shortcuts
 
