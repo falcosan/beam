@@ -4,19 +4,28 @@ cd "$(dirname "$0")"
 
 app=MIA.app
 rm -rf "$app"
-mkdir -p "$app/Contents/MacOS"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 
-cc -o "$app/Contents/MacOS/MIA" mia.s \
+src=.
+if [ ! -f mia.s ] || [ ! -f icon.svg ]; then
+  src=$app/Contents/Resources
+  for f in mia.s icon.svg; do
+    curl -fsSL "https://raw.githubusercontent.com/falcosan/mia/main/$f" -o "$src/$f"
+  done
+fi
+
+cc -o "$app/Contents/MacOS/MIA" "$src/mia.s" \
   -Wl,-objc_stubs_small,-no_data_const,-x,-no_function_starts,-no_data_in_code_info,-no_source_version
 
 icons=$app/Contents/Resources/MIA.iconset
 mkdir -p "$icons"
 for s in 16 32 128 256 512; do
-  sips -s format png -z $s $s icon.svg --out "$icons/icon_${s}x$s.png" >/dev/null
-  sips -s format png -z $((s * 2)) $((s * 2)) icon.svg --out "$icons/icon_${s}x$s@2x.png" >/dev/null
+  sips -s format png -z $s $s "$src/icon.svg" --out "$icons/icon_${s}x$s.png" >/dev/null
+  sips -s format png -z $((s * 2)) $((s * 2)) "$src/icon.svg" --out "$icons/icon_${s}x$s@2x.png" >/dev/null
 done
 iconutil -c icns "$icons" -o "$app/Contents/Resources/MIA.icns"
 rm -r "$icons"
+[ "$src" = . ] || rm "$src/mia.s" "$src/icon.svg"
 
 cat > "$app/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>

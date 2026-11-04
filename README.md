@@ -23,12 +23,14 @@ The whole thing lives in one file, mia.s. I know I’m supposed to split the cod
 
 ## Build and run
 
-Needs an Apple silicon Mac with macOS 26 or later.
+Needs an Apple silicon Mac with macOS 26 or later and the Xcode command line tools (`xcode-select --install`).
 
 ```sh
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/falcosan/mia/main/install.sh | bash
 open MIA.app
 ```
+
+In a clone, `./install.sh` does the same.
 
 Nothing gets installed: no cache, no preferences.
 
