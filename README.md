@@ -19,7 +19,7 @@ The whole thing lives in one file, mia.s. I know I’m supposed to split the cod
 ## Where it plays
 
 - **This Mac**: the current macOS output: built-in, wired, Bluetooth or AirPlay speakers and headphones.
-- **AirPlay** (the AirPlay button): picture and sound to an Apple TV or an AirPlay TV or speaker.
+- **AirPlay** (the AirPlay button): picture and sound to an Apple TV or an AirPlay TV or speaker. While AirPlay plays, the TV or speaker sets the volume, so MIA's volume slider and keys are locked.
 
 ## Download
 

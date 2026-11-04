@@ -4191,6 +4191,10 @@ Llq_time:
 	sdiv	x21, x9, x10
 Llq_show:
 	str	w25, [x28, #G_HASVIDEO]
+	bl	air_on
+	eor	w2, w0, #1
+	ldr	x0, [x28, #G_VOL]
+	SEND	S_setEnabled_
 	mov	w0, w20
 	mov	x1, x21
 	ldr	w2, [x28, #G_VOLPCT]
@@ -4198,19 +4202,8 @@ Llq_show:
 	bl	ui_refresh
 	b	Lret4
 Llq_engine:
-	ldr	x0, [x28, #G_PLAYER]      ; AirPlay took the dormant AVPlayer to a TV: it plays on from here
-	SEND	S_isExternalPlaybackActive
-	cbnz	w0, 2f
-	ldr	x0, [x28, #G_PLAYER]
-	ldr	x2, [x27, #S__isBufferedAirPlayActive]
-	SEND	S_respondsToSelector_
+	bl	air_on                    ; AirPlay took the dormant AVPlayer to a TV: it plays on from here
 	cbz	w0, 1f
-	ldr	x0, [x28, #G_PLAYER]
-	SEND	S__isBufferedAirPlayActive
-	cbz	w0, 1f
-2:	ldr	x0, [x28, #G_PLAYER]
-	SEND	S_currentItem
-	cbz	x0, 1f
 	bl	air_handoff
 	ldr	x19, [x28, #G_PLAYER]
 	b	Llq_poll
@@ -4421,9 +4414,13 @@ local_stop:
 
 ; local_setvol(level) — This Mac's volume, 0..100; unmutes.
 local_setvol:
-	str	w0, [x28, #G_VOLPCT]
+	FRAME	1, 0, 1
+	bl	air_on
+	cbnz	w0, Lret1
+	str	w19, [x28, #G_VOLPCT]
 	str	wzr, [x28, #G_MUTED]
-	b	vol_apply
+	bl	vol_apply
+	b	Lret1
 
 ; local_volstep(delta) — change This Mac's volume by delta, within 0..100.
 local_volstep:
@@ -4540,6 +4537,22 @@ air_handoff:
 	SEND	S_setRate_
 1:	bl	stage_update
 	b	Lret1
+
+air_on:
+	FRAME	0
+	ldr	x0, [x28, #G_PLAYER]
+	SEND	S_currentItem
+	cbz	x0, Lret0
+	ldr	x0, [x28, #G_PLAYER]
+	SEND	S_isExternalPlaybackActive
+	cbnz	w0, Lret0
+	ldr	x0, [x28, #G_PLAYER]
+	ldr	x2, [x27, #S__isBufferedAirPlayActive]
+	SEND	S_respondsToSelector_
+	cbz	w0, Lret0
+	ldr	x0, [x28, #G_PLAYER]
+	SEND	S__isBufferedAirPlayActive
+	b	Lret0
 
 ; ---- Network: one NSURLSession; its delegate (the controller) runs on the media queue ----
 
