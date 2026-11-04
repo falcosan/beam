@@ -2,7 +2,11 @@
 
 <img src="icon.svg" alt="MIA icon" width="128">
 
+A full-featured media player in just 66 KB. Plays MP4, MKV, WebM, FLV, HLS, and YouTube.
+
 A native macOS media player, written entirely in arm64 assembly. It plays audio and video from your Mac or the web, on your Mac or on AirPlay.
+
+The whole thing lives in one file, mia.s. I know I’m supposed to split the code up, but screw it. It was fun.
 
 ## What it plays
 

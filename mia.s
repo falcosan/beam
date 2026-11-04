@@ -874,7 +874,7 @@ Lc\@:	.asciz	"\text"
 .equ STATUS_T,                   36
 .equ LABEL_H,                    16
 .equ SLIDER_H,                   20
-.equ TIME_W,                     52
+.equ TIME_W,                     60
 .equ ROW1_Y,                     BAR_H - 12 - SLIDER_H ; position slider
 .equ ROW2_C,                     34       ; middle of the second row
 .equ PLAY_S,                     44
@@ -11479,14 +11479,11 @@ Lp_skip:
 	LD	G_SHOWPOS
 	ADDL	0
 	SL	2
-	GL	1
-	ADDI	-1                        ; at most the last second
-	SL	3
 	GL	2
-	SUBL	3
+	SUBL	1
 	LT	0
 	JNZ	Lp_skip_low
-	GL	3
+	GL	1
 	SL	2
 	HERE	Lp_skip_low
 	GL	2
