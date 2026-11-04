@@ -1205,6 +1205,7 @@ Lc\@:	.asciz	"\text"
 	REG	S_isEnabled, is,En,able,d
 	REG	S_isEqualToString_, is,EqualTo,String,:
 	REG	S_isExternalPlaybackActive, is,Ex,ter,nalP,lay,b,ack,A,ctiv,e
+	REG	S__isBufferedAirPlayActive, _,is,Buffer,ed,Air,P,lay,A,ctiv,e
 	REG	S_isFileURL, is,File,URL
 	REG	S_labelWithString_, label,With,String,:
 	REG	S_lastPathComponent, lastPathCompon,ent
@@ -1226,6 +1227,7 @@ Lc\@:	.asciz	"\text"
 	REG	S_readObjectsForClasses_options_, rea,d,Object,s,For,C,lass,es:op,tion,s:
 	REG	S_registerForDraggedTypes_, register,For,Dragged,Type,s:
 	REG	S_release, r,elease
+	REG	S_respondsToSelector_, res,ponds,To,S,ele,c,tor,:
 	REG	S_replaceCurrentItemWithPlayerItem_, replaceCurr,ent,Item,With,Player,Item,:
 	REG	S_retain, reta,in
 	REG	S_run, run
@@ -4198,8 +4200,15 @@ Llq_show:
 Llq_engine:
 	ldr	x0, [x28, #G_PLAYER]      ; AirPlay took the dormant AVPlayer to a TV: it plays on from here
 	SEND	S_isExternalPlaybackActive
+	cbnz	w0, 2f
+	ldr	x0, [x28, #G_PLAYER]
+	ldr	x2, [x27, #S__isBufferedAirPlayActive]
+	SEND	S_respondsToSelector_
 	cbz	w0, 1f
 	ldr	x0, [x28, #G_PLAYER]
+	SEND	S__isBufferedAirPlayActive
+	cbz	w0, 1f
+2:	ldr	x0, [x28, #G_PLAYER]
 	SEND	S_currentItem
 	cbz	x0, 1f
 	bl	air_handoff
