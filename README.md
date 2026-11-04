@@ -2,7 +2,7 @@
 
 <img src="icon.svg" alt="MIA icon" width="128">
 
-A full-featured media player in just 66 KB. Plays MP4, MKV, WebM, FLV, HLS, and YouTube.
+The lightest full-featured media player. Plays MP4, MKV, WebM, FLV, HLS, and YouTube. Just 66 KB.
 
 A native macOS media player, written entirely in arm64 assembly. It plays audio and video from your Mac or the web, on your Mac or on AirPlay.
 
@@ -21,18 +21,27 @@ The whole thing lives in one file, mia.s. I know I’m supposed to split the cod
 - **This Mac**: the current macOS output: built-in, wired, Bluetooth or AirPlay speakers and headphones.
 - **AirPlay** (the AirPlay button): picture and sound to an Apple TV or an AirPlay TV or speaker.
 
+## Download
+
+Needs an Apple silicon Mac with macOS 26 or later.
+
+Download `MIA.dmg` from the [latest release](https://github.com/falcosan/mia/releases/latest), open it and drag MIA to Applications.
+
+MIA isn't notarized by Apple, so macOS blocks it the first time:
+
+1. Open MIA. When macOS says it can't verify it, click Done.
+2. Open System Settings > Privacy & Security, scroll down and click Open Anyway next to MIA, then confirm.
+
+From then on it opens normally. Nothing gets installed: no cache, no preferences.
+
 ## Build and run
 
-Needs an Apple silicon Mac with macOS 26 or later and the Xcode command line tools (`xcode-select --install`).
+Needs the Xcode command line tools (`xcode-select --install`).
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/falcosan/mia/main/install.sh | bash
+./install.sh
 open MIA.app
 ```
-
-In a clone, `./install.sh` does the same.
-
-Nothing gets installed: no cache, no preferences.
 
 MIA reads the media itself (MP4, fragmented MP4, MPEG-TS, HLS, YouTube's DASH, Matroska, WebM, FLV, and sound files through AudioFileStream) and hands the compressed samples to the chip's decoders. A sound file starts in about 30 ms and a 4K file shows its first picture in about 45 ms; seeks land on the exact frame in about 50 ms (1080p) to 0.2 s (4K at 60 fps). A YouTube link shows its picture in about 0.45 s and seeks in about 0.7 s.
 
